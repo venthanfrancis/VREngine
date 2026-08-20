@@ -18,9 +18,13 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**Milestone M0 (repository + CMake scaffolding).** Only stub files exist.
-No engine functionality (math, logging, rendering, scene, input, etc.)
-has been implemented yet. See `docs/ROADMAP.md` for the full plan.
+**M0 and M1 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
+logging, assertions, the `Event` base type) and `Frame`
+(`FrameTiming`/`ViewInfo`/`FrameDriver`) are implemented. Everything else
+(`Platform`, `Rendering`, `Scene`, `Assets`, `Input`, `XR`, `Runtime`,
+`Editor`, `Sandbox`) is still an M0-style stub with no functionality.
+Next up is M2 (`Platform`, Windows). See `docs/ROADMAP.md` for the full
+plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 

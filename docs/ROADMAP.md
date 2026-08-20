@@ -15,8 +15,8 @@ all come after that chain is proven.
 
 | # | Milestone | Status | Notes |
 |---|---|---|---|
-| M0 | Repository structure + CMake scaffolding | **In progress** | Stub targets only, no functionality |
-| M1 | `Core`: math (built to the world conventions), logging, assertions, `Frame`'s `FrameDriver`/`FrameTiming`/`ViewInfo` types. `std::` containers throughout. | Not started | |
+| M0 | Repository structure + CMake scaffolding | **Complete** | Stub targets only, no functionality |
+| M1 | `Core`: math (built to the world conventions), logging, assertions, `Frame`'s `FrameDriver`/`FrameTiming`/`ViewInfo` types. `std::` containers throughout. | **Complete** | See `docs/ARCHITECTURE.md` Section 9 |
 | M2 | `Platform` (Windows): window, raw keyboard/mouse, timing, file I/O | Not started | |
 | M3 | Minimal `Runtime`: main loop written against `FrameDriver`, backed by `DesktopFrameDriver`. Opens a window, prints FPS. | Not started | Proves the loop doesn't hard-code desktop timing assumptions |
 | M4 | `Rendering`: minimal RHI (create buffer/texture/pipeline, draw) + a "null" backend that logs calls | Not started | RHI kept deliberately small; no `Present()` yet — see ARCHITECTURE.md |

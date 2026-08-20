@@ -155,3 +155,29 @@ implementation onward.
 ## 8. Roadmap
 
 See `docs/ROADMAP.md` for the milestone plan and current status.
+
+## 9. M1 Implementation Notes
+
+M1 implemented `Core`'s math/logging/assertions/events and `Frame`'s
+data/interface types. Two concrete decisions worth recording:
+
+- **`Mat4` storage**: 16 floats, `element(row, col)` at `m[col * 4 + row]`.
+
+  `Mat4` uses column-major storage as an AREngine convention.
+
+  This convention must remain consistent between engine math code,
+  shader data layouts, transformation code, and future rendering
+  backends.
+
+  Vulkan itself does not require the engine to use column-major
+  matrices — matrix interpretation depends on how we lay out data and
+  how our shaders read it. Column-major is simply the convention this
+  engine has chosen; it is not a Vulkan requirement.
+- **`Quaternion` storage**: Hamilton `(w, x, y, z)` order; identity is
+  `(1, 0, 0, 0)`.
+
+`Core`'s math, logging, assertions, and `Event` base type, and `Frame`'s
+`FrameTiming`/`ViewInfo`/`FrameDriver`, are now implemented as designed
+in Sections 2–4 above — this section only records decisions not already
+covered there (e.g. exact memory layout). See `docs/WORLD_CONVENTIONS.md`
+for the cross-product handedness note the math library's tests rely on.
