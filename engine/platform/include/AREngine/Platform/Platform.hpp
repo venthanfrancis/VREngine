@@ -1,21 +1,27 @@
 #pragma once
 
-// AREngine::Platform
+// AREngine::Platform — convenience umbrella header.
 //
-// Depends only on Core. The only module allowed to call OS-specific APIs.
-// Intended eventual contents (not implemented yet — see docs/ROADMAP.md):
-//   - Window creation
-//   - Raw input polling (keyboard/mouse now; more later)
-//   - Timing / clock
-//   - File I/O
-//   - Dynamic library loading
+// Depends only on Core. The only module allowed to call OS-specific
+// APIs — see docs/ARCHITECTURE.md. Public headers here never expose
+// Win32 (or other OS) types; Win32 implementation details live entirely
+// under src/windows/ and are never included by anything outside this
+// module.
 //
-// Windows is the only backend for now; Android/Linux backends will live
-// alongside it under src/ without changing this public interface.
+// Includes:
+//   - WindowDesc.hpp         window configuration
+//   - Window.hpp              the generic Window interface + CreateAppWindow
+//   - WindowCloseEvent.hpp
+//   - WindowResizeEvent.hpp
+//   - Clock.hpp               SteadyClock
+//
+// File I/O is deliberately NOT implemented in M2 — nothing in this
+// milestone actually needs it (the window demo reads no files). It will
+// be added once a real consumer exists (Assets, M6, or earlier if one
+// comes up sooner) rather than speculatively now.
 
-namespace AREngine::Platform
-{
-    // Placeholder only, to prove this module compiles, links, and can be
-    // consumed by other modules. Remove once real Platform systems land.
-    [[nodiscard]] const char* ModuleName();
-}
+#include "AREngine/Platform/WindowDesc.hpp"
+#include "AREngine/Platform/Window.hpp"
+#include "AREngine/Platform/WindowCloseEvent.hpp"
+#include "AREngine/Platform/WindowResizeEvent.hpp"
+#include "AREngine/Platform/Clock.hpp"

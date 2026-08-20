@@ -181,3 +181,98 @@ data/interface types. Two concrete decisions worth recording:
 in Sections 2–4 above — this section only records decisions not already
 covered there (e.g. exact memory layout). See `docs/WORLD_CONVENTIONS.md`
 for the cross-product handedness note the math library's tests rely on.
+
+## 10. M2 Implementation Notes
+
+M2 implemented `Platform`'s `Window` abstraction and its Windows/Win32
+backend, plus `SteadyClock`. Concrete decisions worth recording:
+
+- **Public/private boundary**: `Window`, `WindowDesc`, `WindowCloseEvent`,
+  `WindowResizeEvent`, and `Clock` (all under `engine/platform/include/`)
+  expose zero Win32 types. `Windows.h` is included in exactly two files,
+  both private implementation: `engine/platform/src/windows/
+  WindowsWindow.hpp` and `.cpp`. Neither is ever included from outside
+  that folder. `WIN32_LEAN_AND_MEAN`, `NOMINMAX`, `UNICODE`, and
+  `_UNICODE` are defined immediately before that single `#include
+  <Windows.h>` — `NOMINMAX` specifically so Windows.h's `min`/`max`
+  macros can never contaminate engine code that includes a Platform
+  header transitively.
+- **`CreateAppWindow`, not `CreateWindow`**: `Windows.h` `#define`s
+  `CreateWindow` as a macro to `CreateWindowA`/`CreateWindowW`. A
+  function named `CreateWindow` in `Window.hpp` would get silently
+  rewritten by that macro in any translation unit where both the header
+  and `Windows.h` are visible. Naming it `CreateAppWindow` sidesteps the
+  collision entirely rather than working around it with `#undef`.
+- **`WindowDesc::width`/`height` mean the client (renderable) area**,
+  not the OS window's outer size. `CreateWindowExW`'s `nWidth`/`nHeight`
+  are the outer size (title bar and borders included), so
+  `WindowsWindow`'s constructor calls `AdjustWindowRect` to convert the
+  requested client size into the outer size `CreateWindowExW` actually
+  needs. This was caught by `tests/platform_tests.cpp`'s
+  `TestWindowLifecycle` check, which failed until this conversion was
+  added — worth keeping in mind as an example of what that test is
+  actually for.
+- **No Win32 lifecycle/singleton for Platform itself**: there is no
+  `Platform::Init()`/`Shutdown()`. The one piece of process-wide Win32
+  setup M2 needs — `RegisterClassExW` for the window class — happens
+  lazily, once, via a function-local `static bool` inside
+  `WindowsWindow.cpp`. This is scoped implementation detail of "how do I
+  make a window," not shared engine state, so it doesn't count as the
+  "giant Platform singleton" the project wants to avoid. A real
+  lifecycle abstraction can be introduced later if something (multiple
+  windows with different classes, XR) actually needs shared init order.
+
+  **Window-class registration lifecycle**, spelled out for when
+  `Runtime` starts depending on `Platform` and possibly creates more
+  than one `Window`:
+
+  - Every `WindowsWindow` — regardless of how many exist — shares the
+    *same* registered class, `"AREngineWindowClass"`. This is safe and
+    standard: the class only supplies `WndProc` and a couple of static
+    properties (cursor, style); all of a window's actual state
+    (`m_hwnd`, `m_width`, callbacks, ...) lives in the per-instance
+    `WindowsWindow` object, reached via `GWLP_USERDATA`, not in the
+    class. One class describing many window instances is the normal
+    Win32 pattern, not a shortcut specific to having only one window
+    today.
+  - `EnsureWindowClassRegistered()`'s `static bool registered` guard
+    means a second (or third, ...) `WindowsWindow` never attempts to
+    register the class again — `RegisterClassExW` on an
+    already-registered class name would fail, so this guard isn't just
+    an optimization, it's required correctness. **Window A registers,
+    Window B reuses — never re-registers.**
+  - The class is **never unregistered** — there is no
+    `UnregisterClassW` call anywhere. Destroying a `WindowsWindow` only
+    ever destroys *that window's HWND*; it has no effect on the shared
+    class. This sidesteps the "Window A destroyed, unregisters the
+    class, Window B still needs it" hazard entirely, by design: nothing
+    ever unregisters the class while the process is running. The OS
+    automatically cleans up all of a process's registered window
+    classes when the process exits, so there's no leak to manage by
+    hand.
+  - Net effect: registration is a one-time, per-process, lazily-paid
+    cost with no teardown to get wrong. This holds regardless of how
+    many `Window`s `Runtime` creates or destroys, in what order.
+- **File I/O was not implemented.** Nothing in M2 needs it — the window
+  demo reads no files. Per `docs/ROADMAP.md`'s rule against speculative
+  code, this is deferred to whichever milestone has an actual consumer
+  (`Assets`, M6, or earlier if one comes up sooner).
+- **Window close/destroy lifetime**: `WM_CLOSE` only sets an internal
+  `m_shouldClose` flag and fires `WindowCloseEvent` — it does not call
+  `DestroyWindow`. The `WindowsWindow` destructor is the single place
+  `DestroyWindow` is ever called; `WM_DESTROY` (sent synchronously by
+  that call) does no teardown of its own, since teardown is underway
+  but not yet final. `m_hwnd` is cleared to `nullptr` in the
+  `WM_NCDESTROY` handler, not in the destructor and not in
+  `WM_DESTROY` — `WM_NCDESTROY` is the last message a window ever
+  receives, sent once Win32 has *definitively* finished tearing it
+  down, so it's the one point that can say for certain "the HWND is
+  gone," regardless of what triggered destruction. This keeps exactly
+  one owner of "when does the OS window actually get destroyed" and
+  gives `m_hwnd` an accurate view of the native object's lifetime — see
+  the destructor's and the `WM_CLOSE`/`WM_DESTROY`/`WM_NCDESTROY`
+  handlers' comments in `WindowsWindow.cpp` for the full reasoning.
+  `PostQuitMessage`/`WM_QUIT` are deliberately not used: the demo loop
+  checks `Window::ShouldClose()` directly rather than waiting on
+  `WM_QUIT` via a blocking `GetMessage` loop, so there is only one
+  "should the app end" signal, not two that could disagree.

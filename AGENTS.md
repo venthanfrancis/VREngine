@@ -18,13 +18,16 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 and M1 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
-logging, assertions, the `Event` base type) and `Frame`
-(`FrameTiming`/`ViewInfo`/`FrameDriver`) are implemented. Everything else
-(`Platform`, `Rendering`, `Scene`, `Assets`, `Input`, `XR`, `Runtime`,
-`Editor`, `Sandbox`) is still an M0-style stub with no functionality.
-Next up is M2 (`Platform`, Windows). See `docs/ROADMAP.md` for the full
-plan.
+**M0, M1, and M2 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
+logging, assertions, the `Event` base type), `Frame`
+(`FrameTiming`/`ViewInfo`/`FrameDriver`), and `Platform`'s `Window`
+abstraction + Windows/Win32 backend + `SteadyClock` are implemented.
+Raw keyboard/mouse input and file I/O were deliberately NOT added in M2
+— see `docs/ARCHITECTURE.md` Section 10 for why. Everything else
+(`Rendering`, `Scene`, `Assets`, `Input`, `XR`, `Runtime`, `Editor`,
+`Sandbox`) is still an M0-style stub with no functionality. Next up is
+M3 (`Runtime`'s main loop, backed by `DesktopFrameDriver`). See
+`docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
