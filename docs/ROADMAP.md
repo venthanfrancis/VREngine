@@ -20,7 +20,7 @@ all come after that chain is proven.
 | M2 | `Platform` (Windows): window, raw keyboard/mouse, timing, file I/O | **Complete** | Window + SteadyClock done; raw keyboard/mouse deferred to M7 (Input); file I/O deferred to a milestone with a real consumer — see `docs/ARCHITECTURE.md` Section 10 |
 | M3 | Minimal `Runtime`: main loop written against `FrameDriver`, backed by `DesktopFrameDriver`. Opens a window, prints FPS. | **Complete** | Proves the loop doesn't hard-code desktop timing assumptions — see `docs/ARCHITECTURE.md` Section 11 |
 | M4 | `Rendering`: minimal RHI (create buffer/texture, draw) + a "null" backend | **Complete** | RHI kept deliberately small; no pipeline/shader API and no `Present()` yet — see `docs/ARCHITECTURE.md` Section 12 |
-| M5 | `Scene`: entities, transforms, hierarchy; Sandbox draws through the null renderer | Not started | Confirms world-convention math end-to-end |
+| M5 | `Scene`: entities, transforms, hierarchy | **Complete** | Confirms world-convention math end-to-end; not yet wired into Runtime/Rendering — see `docs/ARCHITECTURE.md` Section 13 |
 | M6 | `Assets`: minimal file-based mesh/texture loading | Not started | |
 | M7 | `Input`: simple action-mapping over raw Platform input | Not started | Desktop-only for now |
 | M8 | **Vulkan backend** implementing the RHI: triangle, then a textured mesh | Not started | First external dependency, isolated to `Rendering` |

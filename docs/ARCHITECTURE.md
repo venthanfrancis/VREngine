@@ -438,3 +438,127 @@ Concrete decisions worth recording:
   against a placeholder vertex buffer created at startup, purely to
   prove `CreateBuffer` → `SubmitDraw` works end to end — both are
   removed once `Scene` (M5) provides real geometry.
+
+## 13. M5 Implementation Notes
+
+M5 implemented `Scene`: entity identity, `Transform`, parent/child
+hierarchy, and world-matrix composition, plus the minimal additional
+`Core::Math` needed to support it. Concrete decisions worth recording:
+
+- **`EntityId` strategy**: a bare `std::uint64_t` with 0 as the invalid
+  sentinel, handed out by a monotonically increasing counter that never
+  resets and never reuses a value — the same minimal-handle philosophy
+  as `Rendering::BufferHandle`/`TextureHandle`. No generation counter.
+  This is deliberately weaker than a full generational-index scheme (it
+  can't distinguish "this exact id was reused by something else" —
+  impossible here, since ids are never reused — from "this id was never
+  reused"), but nothing in M5 needs that distinction. A future ECS
+  might introduce generational indices if dense storage/reuse ever
+  becomes necessary for performance; not needed while `Scene` stores
+  entities in a `std::unordered_map`.
+- **`Scene` ownership**: no singleton, no global "current scene." An
+  application owns a `Scene` instance (or several) explicitly, the same
+  ownership philosophy used everywhere else in the engine so far. **M5
+  does not add `Scene` to `Runtime`.** Nothing in M5's validation needs
+  it — `Scene`'s correctness (entity/transform/hierarchy/world-matrix
+  behavior) is fully provable through headless automated tests alone,
+  and there is still nothing that would *consume* a `Runtime`-owned
+  `Scene` (no `SceneRenderer` bridging `Scene` and `Rendering` exists
+  yet). Adding an unused `std::unique_ptr<Scene::Scene>` member now
+  would be scope creep with no payoff. `Runtime` gains a `Scene` once
+  something is actually built to read one — most plausibly whichever
+  milestone introduces that `Scene`→`Rendering` bridge.
+- **Transform representation**: `position`/`rotation`/`scale` as
+  `Vec3`/`Quaternion`/`Vec3`, defaulting to `(0,0,0)` /
+  identity / `(1,1,1)` — exactly the M5 requirements, nothing more (no
+  Euler angles; `Quaternion::FromAxisAngle` is enough to construct
+  meaningful rotations for tests without them).
+- **Local vs. world transform**: every entity stores only a LOCAL
+  `Transform` (relative to its parent, or to the world if it has no
+  parent). There is no stored "world transform" field anywhere — world
+  matrices are always *derived*, via `Scene::GetWorldMatrix`, by
+  walking up the parent chain and composing each ancestor's local
+  matrix: `world(E) = local(root) * ... * local(parent) * local(E)`.
+  Not cached; recomputed on every call. This keeps invalidation logic
+  (the hard part of caching) out of scope for M5, at the cost of
+  repeated work if something calls `GetWorldMatrix` in a hot loop — an
+  acceptable trade for a milestone whose job is proving the *shape* of
+  this API, not its performance.
+- **TRS composition order**: `TRS = Translation * Rotation * Scale`,
+  applied to a column-vector point `p` as `TRS * p` — meaning `p` is
+  scaled first, then rotated, then translated. This is `Mat4::TRS`
+  (Core, not Scene-specific), and `Transform::ToMatrix()` just calls it.
+  Proven with tests, not assumed: `core_tests.cpp`'s
+  `TestMat4TransformFactories` checks translate-then-scale and
+  scale-then-translate give *different*, specific results for the same
+  input point.
+- **Hierarchy rules**: `SetParent(child, parent)` rejects (returns
+  `false`, makes no change) three cases — either id invalid/unknown,
+  `child == parent`, or `parent` already a descendant of `child` (which
+  would close a cycle). Cycle detection walks `child`'s subtree looking
+  for `parent`, bounded by `entity count + 1` steps so it can't loop
+  forever even in principle. `Scene::GetWorldMatrix`'s parent-chain walk
+  carries the same bound, purely as defense in depth — `SetParent` is
+  what's actually responsible for cycles never existing in the first
+  place.
+- **Reparenting behavior**: `SetParent` changes only the hierarchy
+  edge. The child's LOCAL transform is left untouched, so its WORLD
+  transform can (and usually will) change as a side effect — this is
+  the simpler of the two possible designs (the alternative, "keep world
+  transform," would require solving for a new local transform that
+  reproduces the old world transform under the new parent — not
+  implemented; deferred, per the M5 brief, to if/when something
+  actually needs it).
+- **Entity destruction**: destroying an entity recursively destroys all
+  of its descendants first (so no child is ever left pointing at a
+  destroyed parent), then detaches itself from its own parent's
+  children list. `DestroyEntity` on an invalid/unknown/already-destroyed
+  id is a no-op — the same "predictable, not an error" philosophy
+  `Rendering::NullRenderDevice::DestroyBuffer` already established.
+- **Two failure philosophies for invalid `EntityId`s, deliberately
+  different, matching precedent from M4**: `SetParent`/`ClearParent`/
+  `DestroyEntity` (commands that mutate state using an id that could
+  plausibly be stale) reject predictably — return `false` or silently
+  no-op, never crash. `GetTransform`/`GetName`/`GetParent`/
+  `GetChildren`/`GetWorldMatrix` (queries that must return real data)
+  instead assert (`AR_ASSERT_MSG`) on an invalid/unknown id, since there
+  is no safe fallback value that wouldn't risk silently masking a bug —
+  `IsValid()` is the sanctioned way to check first. This mirrors exactly
+  the split M4 made between `SubmitDraw` (predictable rejection) and
+  `CreateBuffer`'s descriptor validation (assert).
+- **Why `Scene` does not depend on `Rendering`**: `Scene` represents
+  world *data* — what exists, where it is, how it's related — and has
+  no notion of GPU resources, draw calls, or even that `Rendering`
+  exists. This is the same seam established in Section 4/12: a future,
+  higher-level system (not built yet) will read `Scene` data and
+  translate it into `Rendering` submissions, so neither module needs to
+  know about the other. Confirmed structurally, not just by convention:
+  `engine/scene/CMakeLists.txt` links only `AREngine::Core`.
+- **What's deferred to a future ECS/component system**: everything an
+  ECS would normally provide beyond identity + transform + hierarchy —
+  components, archetypes/chunks, a component registry, reflection,
+  serialization, scene files, prefabs, a renderable/camera/light
+  component, multithreaded updates. M5 is deliberately just enough to
+  prove `Scene` can represent a small 3D world; a real
+  component/gameplay model is a later, larger design decision.
+- **New `Core::Math` added, and why each piece was genuinely needed**:
+  `Quaternion::FromAxisAngle` (the only new way to construct a
+  meaningful, testable rotation); `Mat4::Translation`/`Scale`/`Rotation`
+  (the three pieces `TRS` composes); `Mat4::TRS` (the composition
+  itself); free function `TransformPoint(Mat4, Vec3)` (turns "where did
+  this point end up" into one readable call instead of manual matrix
+  indexing in every test). **Not added, because M5 never needed them**:
+  quaternion-quaternion multiplication and quaternion-vector rotation —
+  all of `Scene`'s composition happens through `Mat4`, never by
+  combining quaternions directly, so neither was genuinely required (see
+  the note in `Quaternion.hpp`). All new `Mat4`/`Quaternion` operations
+  have direct Core-level tests in `core_tests.cpp`, not just indirect
+  coverage through `Scene`'s tests.
+
+No architectural issues were discovered. One implementation-only note:
+`Mat4::TRS` is declared inside the `Mat4` struct but *defined* after the
+free `operator*(Mat4, Mat4)`, because its body calls that operator — a
+free function outside the class must already be declared at the point
+of use (unlike a class member, which benefits from "complete-class
+context" and can refer to members declared later in the same class).
+This is a compile-order detail, not a design change.

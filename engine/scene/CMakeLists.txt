@@ -3,6 +3,13 @@ add_library(arengine_scene STATIC
 )
 add_library(AREngine::Scene ALIAS arengine_scene)
 
+target_sources(arengine_scene
+    PRIVATE
+        include/AREngine/Scene/Scene.hpp
+        include/AREngine/Scene/EntityId.hpp
+        include/AREngine/Scene/Transform.hpp
+)
+
 target_include_directories(arengine_scene
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include

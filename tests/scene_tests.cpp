@@ -1,0 +1,331 @@
+// M5 automated tests for AREngine::Scene: entity identity, Transform,
+// parent/child hierarchy, and world-matrix composition. No human
+// interaction, no window, no Rendering involved at all — proving Scene
+// and Rendering stay fully decoupled.
+
+#include "AREngine/Core/Math/MathUtil.hpp"
+#include "AREngine/Scene/Scene.hpp"
+
+#include <cstdio>
+#include <numbers>
+
+namespace
+{
+    int g_failureCount = 0;
+
+    void Check(bool condition, const char* description)
+    {
+        if (!condition)
+        {
+            std::fprintf(stderr, "FAILED: %s\n", description);
+            ++g_failureCount;
+        }
+    }
+
+    void CheckNearlyEqual(float actual, float expected, const char* description)
+    {
+        Check(AREngine::Core::Math::NearlyEqual(actual, expected), description);
+    }
+
+    using namespace AREngine::Scene;
+    using namespace AREngine::Core::Math;
+
+    void TestEntityCreation()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity("Cube");
+
+        Check(entity.IsValid(), "CreateEntity returns a valid EntityId");
+        Check(scene.IsValid(entity), "Scene::IsValid agrees the new entity is valid");
+        Check(scene.GetName(entity) == "Cube", "GetName returns the name passed to CreateEntity");
+    }
+
+    void TestDistinctIds()
+    {
+        Scene scene;
+        const EntityId a = scene.CreateEntity("A");
+        const EntityId b = scene.CreateEntity("B");
+        const EntityId c = scene.CreateEntity("C");
+
+        Check(!(a == b), "Two entities get distinguishable ids (a != b)");
+        Check(!(a == c), "Two entities get distinguishable ids (a != c)");
+        Check(!(b == c), "Two entities get distinguishable ids (b != c)");
+    }
+
+    void TestDestroyedEntityBecomesInvalid()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity("Temp");
+        Check(scene.IsValid(entity), "Entity is valid before destruction");
+
+        scene.DestroyEntity(entity);
+        Check(!scene.IsValid(entity), "Entity is invalid after DestroyEntity");
+    }
+
+    void TestDefaultTransform()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        const Transform& transform = scene.GetTransform(entity);
+
+        Check(transform.position == Vec3(0.0f, 0.0f, 0.0f), "Default Transform position is (0,0,0)");
+        Check(transform.rotation == Quaternion::Identity(), "Default Transform rotation is identity");
+        Check(transform.scale == Vec3(1.0f, 1.0f, 1.0f), "Default Transform scale is (1,1,1)");
+    }
+
+    void TestTransformStorage()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+
+        Transform& mutableTransform = scene.GetTransform(entity);
+        mutableTransform.position = Vec3(1.0f, 2.0f, 3.0f);
+        mutableTransform.rotation = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f);
+        mutableTransform.scale = Vec3(2.0f, 2.0f, 2.0f);
+
+        const Transform& readBack = scene.GetTransform(entity);
+        Check(readBack.position == Vec3(1.0f, 2.0f, 3.0f), "Position written through the mutable accessor is read back correctly");
+        Check(readBack.scale == Vec3(2.0f, 2.0f, 2.0f), "Scale written through the mutable accessor is read back correctly");
+        Check(readBack.rotation == mutableTransform.rotation, "Rotation written through the mutable accessor is read back correctly");
+    }
+
+    void TestTransformToMatrixMatchesMat4TRS()
+    {
+        Transform transform;
+        transform.position = Vec3(1.0f, 2.0f, 3.0f);
+        transform.rotation = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f);
+        transform.scale = Vec3(2.0f, 1.0f, 1.0f);
+
+        const Mat4 expected = Mat4::TRS(transform.position, transform.rotation, transform.scale);
+        Check(transform.ToMatrix() == expected, "Transform::ToMatrix delegates to Mat4::TRS with its own fields");
+    }
+
+    void TestRootWorldMatrixEqualsLocal()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        scene.GetTransform(entity).position = Vec3(5.0f, 0.0f, -3.0f);
+
+        Check(scene.GetWorldMatrix(entity) == scene.GetTransform(entity).ToMatrix(),
+              "A root entity's world matrix equals its own local matrix");
+    }
+
+    void TestParentChildComposition()
+    {
+        // Pure translation on both, so the expected result is exact
+        // (no trig rounding to account for).
+        Scene scene;
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+
+        scene.GetTransform(parent).position = Vec3(10.0f, 0.0f, 0.0f);
+        scene.GetTransform(child).position = Vec3(0.0f, 5.0f, 0.0f);
+
+        Check(scene.SetParent(child, parent), "SetParent succeeds for a valid, non-cyclic pair");
+
+        const Mat4 expected = Mat4::Translation(Vec3(10.0f, 0.0f, 0.0f)) * Mat4::Translation(Vec3(0.0f, 5.0f, 0.0f));
+        Check(scene.GetWorldMatrix(child) == expected,
+              "Child world matrix == parent local matrix * child local matrix");
+
+        const Vec3 childWorldOrigin = TransformPoint(scene.GetWorldMatrix(child), Vec3(0.0f, 0.0f, 0.0f));
+        Check(childWorldOrigin == Vec3(10.0f, 5.0f, 0.0f), "Child's world position combines both translations");
+    }
+
+    void TestThreeLevelHierarchy()
+    {
+        Scene scene;
+        const EntityId grandparent = scene.CreateEntity("Grandparent");
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+
+        scene.GetTransform(grandparent).position = Vec3(20.0f, 0.0f, 0.0f);
+        scene.GetTransform(parent).position = Vec3(0.0f, 3.0f, 0.0f);
+        scene.GetTransform(child).position = Vec3(0.0f, 0.0f, 7.0f);
+
+        Check(scene.SetParent(parent, grandparent), "SetParent(parent, grandparent) succeeds");
+        Check(scene.SetParent(child, parent), "SetParent(child, parent) succeeds");
+
+        const Vec3 childWorldOrigin = TransformPoint(scene.GetWorldMatrix(child), Vec3(0.0f, 0.0f, 0.0f));
+        Check(childWorldOrigin == Vec3(20.0f, 3.0f, 7.0f),
+              "Three-level hierarchy composes all three translations");
+    }
+
+    void TestParentChildMultiplicationOrderObvious()
+    {
+        // The important, easy-to-get-backwards case: a parent's
+        // ROTATION applied to a child's LOCAL POSITION. If Mat4
+        // multiplication order (or TRS order) were wrong, this would
+        // silently produce a plausible-looking but incorrect result
+        // instead of an obviously broken one — see
+        // docs/WORLD_CONVENTIONS.md for the underlying handedness fact
+        // this relies on.
+        Scene scene;
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+
+        // Parent faces 90 degrees around world Up (+Y).
+        scene.GetTransform(parent).rotation = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f);
+        // Child sits 1 meter along the parent's local +X (Right).
+        scene.GetTransform(child).position = Vec3(1.0f, 0.0f, 0.0f);
+
+        Check(scene.SetParent(child, parent), "SetParent succeeds");
+
+        const Vec3 childWorldOrigin = TransformPoint(scene.GetWorldMatrix(child), Vec3(0.0f, 0.0f, 0.0f));
+
+        // Rotating Right (+X) by 90 degrees around Up (+Y) lands on
+        // Forward (-Z) — see the matching Core-level proof in
+        // core_tests.cpp's TestMat4TransformFactories.
+        CheckNearlyEqual(childWorldOrigin.x, 0.0f, "Rotated child world position: x");
+        CheckNearlyEqual(childWorldOrigin.y, 0.0f, "Rotated child world position: y");
+        CheckNearlyEqual(childWorldOrigin.z, -1.0f, "Rotated child world position: z (ends up 1m Forward)");
+    }
+
+    void TestSetParentAndClearParent()
+    {
+        Scene scene;
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+
+        Check(scene.SetParent(child, parent), "SetParent succeeds");
+        Check(scene.GetParent(child) == parent, "GetParent reports the new parent");
+        Check(scene.GetChildren(parent).size() == 1 && scene.GetChildren(parent)[0] == child,
+              "GetChildren reports the new child");
+
+        scene.ClearParent(child);
+        Check(!scene.GetParent(child).IsValid(), "GetParent is invalid after ClearParent (child is now a root)");
+        Check(scene.GetChildren(parent).empty(), "Former parent's children list no longer contains the child");
+    }
+
+    void TestReparentingLeavesLocalTransformUnchanged()
+    {
+        Scene scene;
+        const EntityId oldParent = scene.CreateEntity("OldParent");
+        const EntityId newParent = scene.CreateEntity("NewParent");
+        const EntityId child = scene.CreateEntity("Child");
+
+        scene.GetTransform(newParent).position = Vec3(100.0f, 0.0f, 0.0f);
+        scene.GetTransform(child).position = Vec3(1.0f, 0.0f, 0.0f);
+
+        scene.SetParent(child, oldParent);
+        const Vec3 localBefore = scene.GetTransform(child).position;
+
+        scene.SetParent(child, newParent); // reparent
+        const Vec3 localAfter = scene.GetTransform(child).position;
+
+        Check(localBefore == localAfter, "Reparenting leaves the child's LOCAL transform unchanged");
+
+        // Documented consequence: since the local transform didn't
+        // change but the parent did, the WORLD transform changes.
+        const Vec3 worldAfter = TransformPoint(scene.GetWorldMatrix(child), Vec3(0.0f, 0.0f, 0.0f));
+        Check(worldAfter == Vec3(101.0f, 0.0f, 0.0f), "Reparenting changes the child's WORLD position, as documented");
+    }
+
+    void TestSelfParentingRejected()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        Check(scene.SetParent(entity, entity) == false, "An entity cannot be parented to itself");
+    }
+
+    void TestCycleRejected()
+    {
+        Scene scene;
+        const EntityId a = scene.CreateEntity("A");
+        const EntityId b = scene.CreateEntity("B");
+        const EntityId c = scene.CreateEntity("C");
+
+        // A parent of B, B parent of C: A -> B -> C.
+        Check(scene.SetParent(b, a), "SetParent(B, A): A becomes B's parent");
+        Check(scene.SetParent(c, b), "SetParent(C, B): B becomes C's parent");
+
+        // SetParent(A, C) would make C the parent of A, closing the
+        // loop A -> B -> C -> A. Must be rejected.
+        Check(scene.SetParent(a, c) == false, "SetParent(A, C) is rejected: it would create a cycle");
+
+        // Hierarchy must be unchanged after the rejected attempt.
+        Check(!scene.GetParent(a).IsValid(), "A is still a root after the rejected SetParent");
+        Check(scene.GetParent(b) == a, "B's parent is still A after the rejected SetParent");
+        Check(scene.GetParent(c) == b, "C's parent is still B after the rejected SetParent");
+    }
+
+    void TestDestroyParentDestroysDescendants()
+    {
+        Scene scene;
+        const EntityId grandparent = scene.CreateEntity("Grandparent");
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+
+        scene.SetParent(parent, grandparent);
+        scene.SetParent(child, parent);
+
+        scene.DestroyEntity(grandparent);
+
+        Check(!scene.IsValid(grandparent), "Destroyed entity is invalid");
+        Check(!scene.IsValid(parent), "Destroying a parent also destroys its child");
+        Check(!scene.IsValid(child), "Destroying a grandparent also destroys its grandchild");
+    }
+
+    void TestInvalidEntityAccessIsPredictable()
+    {
+        // Query accessors (GetTransform/GetName/GetParent/GetChildren/
+        // GetWorldMatrix) assert on an invalid/unknown EntityId by
+        // design — see docs/ARCHITECTURE.md — so they are deliberately
+        // NOT exercised here with bad input (that would abort the test
+        // process). Command functions (SetParent/ClearParent/
+        // DestroyEntity), which use predictable rejection instead, are
+        // exactly what this test covers.
+        Scene scene;
+        const EntityId valid = scene.CreateEntity("Valid");
+        const EntityId neverCreated{9999};
+        const EntityId invalid{}; // default-constructed sentinel
+
+        Check(!scene.IsValid(invalid), "A default-constructed EntityId is never valid");
+        Check(!scene.IsValid(neverCreated), "An id that was never returned by CreateEntity is not valid");
+
+        Check(scene.SetParent(invalid, valid) == false, "SetParent rejects an invalid child id");
+        Check(scene.SetParent(valid, invalid) == false, "SetParent rejects an invalid parent id");
+        Check(scene.SetParent(neverCreated, valid) == false, "SetParent rejects an unknown child id");
+
+        // Must not crash, and must not affect the valid entity.
+        scene.ClearParent(invalid);
+        scene.ClearParent(neverCreated);
+        scene.DestroyEntity(invalid);
+        scene.DestroyEntity(neverCreated);
+        Check(scene.IsValid(valid), "Operating on invalid/unknown ids never affects unrelated valid entities");
+
+        // A stale id (valid once, then destroyed) is handled the same
+        // predictable way as one that was never created.
+        const EntityId destroyed = scene.CreateEntity("WillBeDestroyed");
+        scene.DestroyEntity(destroyed);
+        Check(scene.SetParent(destroyed, valid) == false, "SetParent rejects a stale (destroyed) id");
+    }
+}
+
+int main()
+{
+    TestEntityCreation();
+    TestDistinctIds();
+    TestDestroyedEntityBecomesInvalid();
+    TestDefaultTransform();
+    TestTransformStorage();
+    TestTransformToMatrixMatchesMat4TRS();
+    TestRootWorldMatrixEqualsLocal();
+    TestParentChildComposition();
+    TestThreeLevelHierarchy();
+    TestParentChildMultiplicationOrderObvious();
+    TestSetParentAndClearParent();
+    TestReparentingLeavesLocalTransformUnchanged();
+    TestSelfParentingRejected();
+    TestCycleRejected();
+    TestDestroyParentDestroysDescendants();
+    TestInvalidEntityAccessIsPredictable();
+
+    if (g_failureCount == 0)
+    {
+        std::printf("All Scene M5 checks passed\n");
+        return 0;
+    }
+
+    std::fprintf(stderr, "%d check(s) failed\n", g_failureCount);
+    return 1;
+}

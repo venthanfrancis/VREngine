@@ -5,6 +5,7 @@
 #include "AREngine/Core/Core.hpp"
 
 #include <cstdio>
+#include <numbers>
 
 namespace
 {
@@ -82,6 +83,72 @@ namespace
         Check(Quaternion() == Quaternion::Identity(), "Default-constructed Quaternion is identity");
     }
 
+    void TestQuaternionFromAxisAngle()
+    {
+        const Quaternion noRotation = Quaternion::FromAxisAngle(kWorldUp, 0.0f);
+        CheckNearlyEqual(noRotation.w, 1.0f, "FromAxisAngle(axis, 0) has w == 1");
+        CheckNearlyEqual(noRotation.x, 0.0f, "FromAxisAngle(axis, 0) has x == 0");
+        CheckNearlyEqual(noRotation.y, 0.0f, "FromAxisAngle(axis, 0) has y == 0");
+        CheckNearlyEqual(noRotation.z, 0.0f, "FromAxisAngle(axis, 0) has z == 0");
+
+        // 90 degrees around +Y: w = cos(45deg), y = sin(45deg), x = z = 0.
+        const float halfPi = std::numbers::pi_v<float> / 2.0f;
+        const Quaternion quarterTurnAroundY = Quaternion::FromAxisAngle(kWorldUp, halfPi);
+        const float expected = std::numbers::sqrt2_v<float> / 2.0f; // cos(45deg) == sin(45deg)
+        CheckNearlyEqual(quarterTurnAroundY.w, expected, "FromAxisAngle(Up, 90deg) has the expected w");
+        CheckNearlyEqual(quarterTurnAroundY.y, expected, "FromAxisAngle(Up, 90deg) has the expected y");
+        CheckNearlyEqual(quarterTurnAroundY.x, 0.0f, "FromAxisAngle(Up, 90deg) leaves x at 0");
+        CheckNearlyEqual(quarterTurnAroundY.z, 0.0f, "FromAxisAngle(Up, 90deg) leaves z at 0");
+    }
+
+    void TestMat4TransformFactories()
+    {
+        const Mat4 translation = Mat4::Translation(Vec3(2.0f, 3.0f, 4.0f));
+        Check(translation.At(0, 3) == 2.0f && translation.At(1, 3) == 3.0f && translation.At(2, 3) == 4.0f,
+              "Mat4::Translation places its offset in the translation column");
+        Check(translation.At(0, 0) == 1.0f && translation.At(1, 1) == 1.0f && translation.At(2, 2) == 1.0f,
+              "Mat4::Translation leaves the diagonal at 1");
+
+        const Mat4 scale = Mat4::Scale(Vec3(2.0f, 3.0f, 4.0f));
+        Check(scale.At(0, 0) == 2.0f && scale.At(1, 1) == 3.0f && scale.At(2, 2) == 4.0f && scale.At(3, 3) == 1.0f,
+              "Mat4::Scale places its factors on the diagonal");
+        Check(scale.At(0, 1) == 0.0f && scale.At(1, 0) == 0.0f,
+              "Mat4::Scale leaves off-diagonal entries at 0");
+
+        Check(Mat4::Rotation(Quaternion::Identity()) == Mat4::Identity(),
+              "Mat4::Rotation(identity quaternion) == Mat4::Identity()");
+
+        // Core-level proof that Mat4::Rotation respects this engine's
+        // handedness (not just tested indirectly through Scene, per
+        // M5's design guidance): rotating world Right (+X) by 90
+        // degrees around world Up (+Y) should land on -Z, i.e. World
+        // Forward — see docs/WORLD_CONVENTIONS.md.
+        const float halfPi = std::numbers::pi_v<float> / 2.0f;
+        const Quaternion quarterTurnAroundY = Quaternion::FromAxisAngle(kWorldUp, halfPi);
+        const Mat4 rotationMatrix = Mat4::Rotation(quarterTurnAroundY);
+        const Vec3 rotatedRight = TransformPoint(rotationMatrix, kWorldRight);
+        CheckNearlyEqual(rotatedRight.x, kWorldForward.x, "Rotating Right 90deg around Up lands on Forward.x");
+        CheckNearlyEqual(rotatedRight.y, kWorldForward.y, "Rotating Right 90deg around Up lands on Forward.y");
+        CheckNearlyEqual(rotatedRight.z, kWorldForward.z, "Rotating Right 90deg around Up lands on Forward.z");
+
+        // TRS with a pure translation: "2 meters forward" should be
+        // exactly position (0, 0, -2) after composition.
+        const Mat4 trs = Mat4::TRS(Vec3(0.0f, 0.0f, -2.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f));
+        const Vec3 worldOrigin = TransformPoint(trs, Vec3(0.0f, 0.0f, 0.0f));
+        Check(worldOrigin == Vec3(0.0f, 0.0f, -2.0f), "TRS translation of -2 on Z places a point 2 meters forward");
+
+        // Multiplication order genuinely matters — proven, not assumed.
+        // Translate-then-scale and scale-then-translate give different
+        // results for the same point.
+        const Mat4 translateThenScale = Mat4::Translation(Vec3(1.0f, 0.0f, 0.0f)) * Mat4::Scale(Vec3(2.0f, 2.0f, 2.0f));
+        const Mat4 scaleThenTranslate = Mat4::Scale(Vec3(2.0f, 2.0f, 2.0f)) * Mat4::Translation(Vec3(1.0f, 0.0f, 0.0f));
+        const Vec3 pointA = TransformPoint(translateThenScale, Vec3(1.0f, 0.0f, 0.0f));
+        const Vec3 pointB = TransformPoint(scaleThenTranslate, Vec3(1.0f, 0.0f, 0.0f));
+        Check(pointA == Vec3(3.0f, 0.0f, 0.0f), "Translation * Scale applied to (1,0,0) gives (3,0,0)");
+        Check(pointB == Vec3(4.0f, 0.0f, 0.0f), "Scale * Translation applied to (1,0,0) gives (4,0,0) - a different result");
+        Check(!(pointA == pointB), "Matrix multiplication order changes the result, as expected");
+    }
+
     void TestEvent()
     {
         struct DummyEvent : AREngine::Core::Event {};
@@ -98,11 +165,13 @@ int main()
     TestVec3();
     TestMat4();
     TestQuaternion();
+    TestQuaternionFromAxisAngle();
+    TestMat4TransformFactories();
     TestEvent();
 
     if (g_failureCount == 0)
     {
-        AR_LOG_INFO("All Core M1 checks passed");
+        AR_LOG_INFO("All Core checks passed");
         return 0;
     }
 
