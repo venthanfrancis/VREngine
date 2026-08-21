@@ -44,6 +44,19 @@ target_link_libraries(arengine_scene_tests PRIVATE AREngine::Core AREngine::Scen
 target_compile_features(arengine_scene_tests PRIVATE cxx_std_20)
 add_test(NAME SceneTests COMMAND arengine_scene_tests)
 
+add_executable(arengine_asset_tests
+    asset_tests.cpp
+)
+target_link_libraries(arengine_asset_tests PRIVATE AREngine::Core AREngine::Assets)
+target_compile_features(arengine_asset_tests PRIVATE cxx_std_20)
+# Points at the tiny fixture files in tests/data/assets/ via a path
+# CMake computes from this source tree — not a machine-specific
+# hard-coded path, so this works on any checkout.
+target_compile_definitions(arengine_asset_tests PRIVATE
+    AR_TEST_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"
+)
+add_test(NAME AssetTests COMMAND arengine_asset_tests)
+
 # Manual-only: proves M2's Window works end-to-end with real user
 # interaction (opening a window, closing it via the close button). Built
 # by CMake but deliberately NOT registered with add_test — CTest must

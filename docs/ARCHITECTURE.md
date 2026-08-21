@@ -562,3 +562,110 @@ free function outside the class must already be declared at the point
 of use (unlike a class member, which benefits from "complete-class
 context" and can refer to members declared later in the same class).
 This is a compile-order detail, not a design change.
+
+## 14. M6 Implementation Notes
+
+M6 implemented `Assets`: `AssetId`, `TextAsset`/`BinaryAsset`, and
+`AssetManager` (an asset root, path resolution/normalization, caching,
+and predictable failure handling). Concrete decisions worth recording:
+
+- **`AssetId` semantics**: a bare `std::uint64_t`, 0 = invalid, handed
+  out by a per-instance monotonically increasing counter — the same
+  pattern as `Scene::EntityId`. Meaningful only within the
+  `AssetManager` instance that issued it; two different managers both
+  start counting from 1, so ids from different managers must never be
+  compared or mixed. No UUIDs, no cross-instance uniqueness — nothing in
+  M6 needs either.
+- **Why `Assets` does not depend on `Platform`**: `std::filesystem` and
+  `std::ifstream` already provide everything M6 needs — path
+  resolution, normalization, and file reading — as portable standard
+  C++. There is no OS-specific behavior for `Platform` to abstract away
+  here (unlike `Window`, which genuinely needs Win32). Confirmed
+  structurally: `engine/assets/CMakeLists.txt` links only
+  `AREngine::Core` (the `Platform` dependency inherited from the M0
+  scaffold was removed).
+- **Asset root model**: `AssetManager` owns exactly one root directory,
+  canonicalized (and required to already exist — `AR_ASSERT_MSG`s
+  otherwise, a setup-time caller bug, not a runtime condition) at
+  construction. Every `LoadText`/`LoadBinary` call takes a path relative
+  to that root; there is no way to address a file outside it except by
+  escaping (which is rejected — see below). Example: root
+  `C:/Projects/VREngine/TestAssets`, asset path `textures/checker.txt`,
+  resolved path `C:/Projects/VREngine/TestAssets/textures/checker.txt`.
+- **Normalization strategy**: a candidate path is resolved as
+  `weakly_canonical(root / relativePath)` — `weakly_canonical` (not
+  `canonical`) specifically because the target file may not exist yet
+  (that's exactly what the missing-file test exercises), but its
+  directory structure should still resolve `.`/`..` lexically. The
+  resulting absolute path's `generic_string()` (forward slashes,
+  platform-independent) is the cache key, so `textures/test.txt` and
+  `textures/./test.txt` hit the same cache entry. **Documented
+  limitation**: cache keys are case-sensitive strings. On a
+  case-insensitive filesystem (Windows' default), `Test.txt` and
+  `test.txt` may be the same file on disk but are treated as two
+  independent cache entries — no cross-platform case-folding is
+  implemented for M6.
+- **Root traversal handling**: after resolving and normalizing, the
+  candidate path is checked against the root via
+  `std::filesystem::relative(candidate, root)` — if the result's first
+  path component is `".."`, the candidate falls outside the root and is
+  rejected. An absolute input path is rejected outright before any of
+  this, even one that happens to resolve back inside the root (e.g.
+  `root / "hello.txt"` passed directly) — asset paths are relative by
+  construction, not "anything that resolves somewhere valid." This is a
+  containment check, not a security sandbox: it stops accidental/naive
+  `../` traversal, not a determined, deliberately hostile caller with
+  other means of reading files. Tested directly (`../outside.txt`, a
+  deeper `subdir/../../outside.txt`, and an absolute path).
+- **Cache key strategy / same-path-different-type behavior**: text and
+  binary assets are cached in **entirely separate maps**
+  (`m_textPathToId`/`m_textAssets` vs. `m_binaryPathToId`/
+  `m_binaryAssets`), both keyed by the same normalized-path string.
+  `LoadText("data.bin")` and `LoadBinary("data.bin")` therefore succeed
+  independently, each producing its own distinct `AssetId` — this is
+  the "cache separately by {path, type}" option from the M6 brief,
+  chosen because it's simpler than "reject type mismatch" (no need to
+  track or check what type a path was previously loaded as) and there's
+  no genuine conflict to detect: loading the same file's bytes two
+  different ways isn't a contradiction.
+- **Ownership**: `AssetManager` owns every loaded asset for its own
+  lifetime, in `std::unordered_map<AssetId, TextAsset/BinaryAsset>`.
+  Callers hold the lightweight `AssetId` and query `GetText`/`GetBinary`
+  for a `const&` into manager-owned storage — the same "manager owns
+  storage, caller holds a cheap id" model `Scene` already established
+  for `EntityId`/`Transform`. No `shared_ptr`, no generational handles;
+  neither solves a problem M6 actually has.
+- **Failure model, and the same two-philosophy split from M4/M5**:
+  `LoadText`/`LoadBinary` (read real files that could plausibly be
+  missing, unreadable, or path-escaping) return `std::optional<AssetId>`
+  — `std::nullopt` on failure, logged via `AR_LOG_WARNING`, never a
+  crash. `GetText`/`GetBinary` (queries on an id the caller should
+  already know is valid, typically one they just received from a
+  successful `Load*`) instead `AR_ASSERT_MSG` on an unknown id — there's
+  no safe fallback `TextAsset`/`BinaryAsset` to return that wouldn't risk
+  masking a bug; `IsValid()` is the sanctioned way to check first.
+  Exactly the same split `Scene` uses for commands vs. queries.
+- **No common `Asset` base type.** `TextAsset` and `BinaryAsset` are
+  independent, non-polymorphic structs. `LoadText`/`GetText` and
+  `LoadBinary`/`GetBinary` are separate, statically-typed entry points —
+  callers always know at compile time which kind they're asking for, so
+  there is never a need for runtime dispatch across asset kinds. A
+  shared base class (with or without virtual functions) would add a
+  layer of indirection with no caller benefit, and risks inviting
+  exactly the RTTI-heavy/reflection-heavy design the M6 brief warns
+  against. Real future content types (`MeshAsset`, `TextureAsset`) are
+  expected to build on top of `TextAsset`/`BinaryAsset` (e.g. "parse
+  this `BinaryAsset`'s bytes into mesh data"), as their own independent
+  structs, following the same pattern — not by retrofitting a base
+  class in today.
+- **Test fixtures**: `tests/data/assets/` holds three tiny files
+  (`hello.txt`, `second.txt`, `sample.bin`, all a handful of bytes,
+  none copyrighted/downloaded — `sample.bin` was generated locally via
+  a one-line PowerShell `WriteAllBytes` call). `tests/CMakeLists.txt`
+  passes their directory to the test executable via
+  `AR_TEST_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"` — a
+  path CMake computes from the current checkout, not a hard-coded
+  machine-specific path, so this works on any machine that clones and
+  builds the repo.
+
+No architectural issues were discovered.
