@@ -18,37 +18,40 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M6 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion
+**M0 through M7 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion
 (incl. `FromAxisAngle`)/Mat4 (incl. `Translation`/`Scale`/`Rotation`/
-`TRS`), logging, assertions, the `Event` base type), `Frame`
-(`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform`'s `Window`
-abstraction + Windows/Win32 backend + `SteadyClock`, `Runtime` (owns
-`Window` + a `FrameDriver` + a `RenderDevice`, runs the main loop) with
-`DesktopFrameDriver`, `Rendering`'s minimal RHI
+`TRS`), logging, assertions, the `Event` base type, and — new in M7 —
+`KeyCode`/`MouseButton`), `Frame` (`FrameTiming`/`ViewInfo`/
+`FrameDriver`), `Platform`'s `Window` abstraction + Windows/Win32
+backend + `SteadyClock` + (M7) keyboard/mouse/focus events, `Runtime`
+(owns `Window` + a `FrameDriver` + a `RenderDevice` + an `InputSystem`,
+runs the main loop) with `DesktopFrameDriver`, `Rendering`'s minimal RHI
 (`RenderDevice`/`BufferHandle`/`TextureHandle`/`DrawCommand`) with its
 `NullRenderDevice` backend, `Scene` (`EntityId`/`Transform`/parent-child
-hierarchy/`GetWorldMatrix`), and `Assets` (`AssetId`/`TextAsset`/
+hierarchy/`GetWorldMatrix`), `Assets` (`AssetId`/`TextAsset`/
 `BinaryAsset`/`AssetManager` with an asset root, caching, and
-root-traversal protection) are all implemented. `AREngineSandbox.exe`
-opens a window, runs a real frame loop, submits one hard-coded temporary
-dummy draw per frame through the Null backend (nothing visibly renders —
-that's expected, see `docs/ARCHITECTURE.md` Section 12), logs FPS once
-per second, and shuts down cleanly on close. Raw keyboard/mouse input
-and file I/O via `Platform` were deliberately NOT added in M2 — see
-Section 10 (`Assets` reads files itself, via `std::filesystem`/
-`std::ifstream` directly, not through `Platform` — see Section 14).
-**Neither `Scene` nor `Assets` is wired into `Runtime` yet** — nothing
-consumes either of them yet (no `Scene`→`Rendering` bridge, no asset
-content parsers), so both are tested entirely headlessly; see Sections
-13 and 14 for why that's the correct scope, not a gap. There is still no
-real graphics backend, no frame limiting, no pipeline/shader API
-(deferred until Vulkan, M8, per Section 12), no ECS/component system
-(Section 13), and no real mesh/texture/image format parsing (Section
-14) — `DesktopFrameDriver` produces one placeholder identity `ViewInfo`
-per frame and `SubmitFrame()` is a no-op — see Section 11. Everything
-else (`Input`, `XR`, `Editor`) is still an M0-style stub with no
-functionality. Next up is M7 (`Input`). See `docs/ROADMAP.md` for the
-full plan.
+root-traversal protection), and `Input` (`InputSystem`: raw key/mouse
+state with held/pressed/released semantics, a small action-mapping
+layer) are all implemented. `AREngineSandbox.exe` opens a window, runs a
+real frame loop, submits one hard-coded temporary dummy draw per frame
+through the Null backend (nothing visibly renders — that's expected, see
+`docs/ARCHITECTURE.md` Section 12), responds to Space/Left-Mouse and a
+"Select" action bound to both, logs FPS once per second, and shuts down
+cleanly on close. Raw keyboard/mouse input reached `Platform` in M7 (see
+Section 15) — file I/O via `Platform` is still not implemented (`Assets`
+reads files itself via `std::filesystem`/`std::ifstream` directly — see
+Section 14). **Neither `Scene` nor `Assets` is wired into `Runtime`
+beyond what M7 needed** — no `Scene`→`Rendering` bridge, no asset
+content parsers — so both remain tested entirely headlessly; see
+Sections 13 and 14 for why that's the correct scope, not a gap. There is
+still no real graphics backend, no frame limiting, no pipeline/shader
+API (deferred until Vulkan, M8, per Section 12), no ECS/component system
+(Section 13), no real mesh/texture/image format parsing (Section 14),
+and no analog/XR/controller input (Section 15) — `DesktopFrameDriver`
+produces one placeholder identity `ViewInfo` per frame and
+`SubmitFrame()` is a no-op — see Section 11. Everything else (`XR`,
+`Editor`) is still an M0-style stub with no functionality. Next up is M8
+(Vulkan backend). See `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 

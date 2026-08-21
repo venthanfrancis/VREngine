@@ -1,7 +1,13 @@
 #include "WindowsWindow.hpp"
 
 #include "AREngine/Core/Assert.hpp"
+#include "AREngine/Platform/KeyPressedEvent.hpp"
+#include "AREngine/Platform/KeyReleasedEvent.hpp"
+#include "AREngine/Platform/MouseButtonPressedEvent.hpp"
+#include "AREngine/Platform/MouseButtonReleasedEvent.hpp"
+#include "AREngine/Platform/MouseMovedEvent.hpp"
 #include "AREngine/Platform/WindowCloseEvent.hpp"
+#include "AREngine/Platform/WindowFocusLostEvent.hpp"
 #include "AREngine/Platform/WindowResizeEvent.hpp"
 
 #include <cstddef>
@@ -13,6 +19,60 @@ namespace AREngine::Platform
     namespace
     {
         constexpr const wchar_t* kWindowClassName = L"AREngineWindowClass";
+
+        // Translates a Win32 virtual-key code into AREngine's KeyCode.
+        // Only the keys KeyCode.hpp actually defines — not every key a
+        // keyboard has. Returns KeyCode::Unknown for anything else,
+        // rather than asserting: an unmapped key being pressed is a
+        // normal, expected occurrence (this engine just doesn't have an
+        // opinion about it yet), not a programmer error.
+        //
+        // Left/right Shift and Ctrl need special handling: Win32 always
+        // reports WM_KEYDOWN/UP for either Shift key as the generic
+        // VK_SHIFT (and both Ctrl keys as VK_CONTROL) — the only way to
+        // tell left from right is to pull the hardware scan code out of
+        // lParam and ask MapVirtualKeyW to expand it to the specific
+        // extended virtual-key. (Alt/Ctrl also have a simpler
+        // lParam-extended-bit trick, but it doesn't work for Shift, so
+        // the scan-code approach is used uniformly for both here.)
+        Core::KeyCode TranslateVirtualKey(WPARAM vkCode, LPARAM lParam)
+        {
+            if (vkCode >= 'A' && vkCode <= 'Z')
+            {
+                return static_cast<Core::KeyCode>(
+                    static_cast<int>(Core::KeyCode::A) + static_cast<int>(vkCode - 'A'));
+            }
+            if (vkCode >= '0' && vkCode <= '9')
+            {
+                return static_cast<Core::KeyCode>(
+                    static_cast<int>(Core::KeyCode::Num0) + static_cast<int>(vkCode - '0'));
+            }
+
+            if (vkCode == VK_SHIFT || vkCode == VK_CONTROL)
+            {
+                const UINT scanCode = static_cast<UINT>((lParam >> 16) & 0xFF);
+                const UINT extendedVk = MapVirtualKeyW(scanCode, MAPVK_VSC_TO_VK_EX);
+
+                if (vkCode == VK_SHIFT)
+                {
+                    return (extendedVk == VK_RSHIFT) ? Core::KeyCode::RightShift : Core::KeyCode::LeftShift;
+                }
+                return (extendedVk == VK_RCONTROL) ? Core::KeyCode::RightCtrl : Core::KeyCode::LeftCtrl;
+            }
+
+            switch (vkCode)
+            {
+                case VK_ESCAPE: return Core::KeyCode::Escape;
+                case VK_SPACE:  return Core::KeyCode::Space;
+                case VK_RETURN: return Core::KeyCode::Enter;
+                case VK_TAB:    return Core::KeyCode::Tab;
+                case VK_UP:     return Core::KeyCode::Up;
+                case VK_DOWN:   return Core::KeyCode::Down;
+                case VK_LEFT:   return Core::KeyCode::Left;
+                case VK_RIGHT:  return Core::KeyCode::Right;
+                default:        return Core::KeyCode::Unknown;
+            }
+        }
 
         std::wstring ToWide(const std::string& text)
         {
@@ -247,6 +307,95 @@ namespace AREngine::Platform
                     m_eventCallback(event);
                 }
 
+                return 0;
+            }
+
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN:
+            {
+                // Fired on every WM_KEYDOWN, repeats included — see the
+                // comment on KeyPressedEvent for why filtering repeats
+                // into a genuine up->down transition is InputSystem's
+                // job, not this one's.
+                if (m_eventCallback)
+                {
+                    KeyPressedEvent event(TranslateVirtualKey(wParam, lParam));
+                    m_eventCallback(event);
+                }
+                return 0;
+            }
+
+            case WM_KEYUP:
+            case WM_SYSKEYUP:
+            {
+                if (m_eventCallback)
+                {
+                    KeyReleasedEvent event(TranslateVirtualKey(wParam, lParam));
+                    m_eventCallback(event);
+                }
+                return 0;
+            }
+
+            case WM_LBUTTONDOWN:
+            case WM_RBUTTONDOWN:
+            case WM_MBUTTONDOWN:
+            {
+                if (m_eventCallback)
+                {
+                    const Core::MouseButton button = (message == WM_LBUTTONDOWN) ? Core::MouseButton::Left
+                                                    : (message == WM_RBUTTONDOWN) ? Core::MouseButton::Right
+                                                                                   : Core::MouseButton::Middle;
+                    MouseButtonPressedEvent event(button);
+                    m_eventCallback(event);
+                }
+                return 0;
+            }
+
+            case WM_LBUTTONUP:
+            case WM_RBUTTONUP:
+            case WM_MBUTTONUP:
+            {
+                if (m_eventCallback)
+                {
+                    const Core::MouseButton button = (message == WM_LBUTTONUP) ? Core::MouseButton::Left
+                                                    : (message == WM_RBUTTONUP) ? Core::MouseButton::Right
+                                                                                 : Core::MouseButton::Middle;
+                    MouseButtonReleasedEvent event(button);
+                    m_eventCallback(event);
+                }
+                return 0;
+            }
+
+            case WM_MOUSEMOVE:
+            {
+                if (m_eventCallback)
+                {
+                    // Client-area coordinates already match the
+                    // documented convention (top-left origin, +x right,
+                    // +y down) with no conversion needed. Cast through
+                    // SHORT, not plain LOWORD/HIWORD, so coordinates
+                    // that go negative (e.g. while dragging the cursor
+                    // partly off-window) come out correctly signed.
+                    const float x = static_cast<float>(static_cast<short>(LOWORD(lParam)));
+                    const float y = static_cast<float>(static_cast<short>(HIWORD(lParam)));
+                    MouseMovedEvent event(Core::Math::Vec2(x, y));
+                    m_eventCallback(event);
+                }
+                return 0;
+            }
+
+            case WM_KILLFOCUS:
+            {
+                // See WindowFocusLostEvent: this exists so InputSystem
+                // can treat every currently-held key/button as released
+                // rather than leaving it stuck down forever, since the
+                // matching key-up message for a key held when focus is
+                // lost may never arrive at this window.
+                if (m_eventCallback)
+                {
+                    WindowFocusLostEvent event;
+                    m_eventCallback(event);
+                }
                 return 0;
             }
 

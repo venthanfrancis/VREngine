@@ -22,7 +22,7 @@ all come after that chain is proven.
 | M4 | `Rendering`: minimal RHI (create buffer/texture, draw) + a "null" backend | **Complete** | RHI kept deliberately small; no pipeline/shader API and no `Present()` yet — see `docs/ARCHITECTURE.md` Section 12 |
 | M5 | `Scene`: entities, transforms, hierarchy | **Complete** | Confirms world-convention math end-to-end; not yet wired into Runtime/Rendering — see `docs/ARCHITECTURE.md` Section 13 |
 | M6 | `Assets`: asset root, AssetId, TextAsset/BinaryAsset loading, caching | **Complete** | Real mesh/texture formats deferred — see `docs/ARCHITECTURE.md` Section 14 |
-| M7 | `Input`: simple action-mapping over raw Platform input | Not started | Desktop-only for now |
+| M7 | `Input`: desktop keyboard/mouse state + action-mapping over raw Platform input | **Complete** | Desktop-only (no hand/controller/XR input yet) — see `docs/ARCHITECTURE.md` Section 15 |
 | M8 | **Vulkan backend** implementing the RHI: triangle, then a textured mesh | Not started | First external dependency, isolated to `Rendering` |
 | M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | Not started | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |

@@ -57,6 +57,13 @@ target_compile_definitions(arengine_asset_tests PRIVATE
 )
 add_test(NAME AssetTests COMMAND arengine_asset_tests)
 
+add_executable(arengine_input_tests
+    input_tests.cpp
+)
+target_link_libraries(arengine_input_tests PRIVATE AREngine::Core AREngine::Platform AREngine::Input)
+target_compile_features(arengine_input_tests PRIVATE cxx_std_20)
+add_test(NAME InputTests COMMAND arengine_input_tests)
+
 # Manual-only: proves M2's Window works end-to-end with real user
 # interaction (opening a window, closing it via the close button). Built
 # by CMake but deliberately NOT registered with add_test — CTest must

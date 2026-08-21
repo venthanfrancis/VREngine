@@ -19,13 +19,25 @@ namespace AREngine::Runtime
 
         m_window = Platform::CreateAppWindow(windowDesc);
 
-        // Logging only. Window::ShouldClose() — checked directly in
-        // Run() — is the single authoritative signal for ending the
-        // loop; this callback never drives control flow, so there is
+        // Window::ShouldClose() — checked directly in Run() — is the
+        // single authoritative signal for ending the loop; this
+        // callback never drives control flow itself, so there is
         // exactly one source of truth for "should the app end," not two
         // that could disagree.
-        m_window->SetEventCallback([](Core::Event& event)
+        //
+        // Every event is also forwarded to m_inputSystem.OnEvent()
+        // unconditionally — this is the one place Platform's events
+        // reach InputSystem. InputSystem itself never listens to
+        // *m_window directly; Runtime is the "higher layer" the M7
+        // brief describes deciding who consumes each event. OnEvent
+        // silently ignores anything that isn't an input event (Close/
+        // Resize included), so this ordering relative to the logging
+        // below doesn't matter — see docs/ARCHITECTURE.md, "Event
+        // Routing".
+        m_window->SetEventCallback([this](Core::Event& event)
         {
+            m_inputSystem.OnEvent(event);
+
             if (dynamic_cast<Platform::WindowCloseEvent*>(&event) != nullptr)
             {
                 AR_LOG_INFO("Window close requested");
@@ -67,6 +79,14 @@ namespace AREngine::Runtime
         dummyBufferDesc.usage = Rendering::BufferUsage::Vertex;
         m_dummyVertexBuffer = m_renderDevice->CreateBuffer(dummyBufferDesc);
 
+        // M7 validation: one action ("Select") with two independent
+        // bindings, demonstrating that either can trigger the same
+        // query — see docs/ARCHITECTURE.md, "Action Mapping
+        // Semantics". Not gameplay architecture; just proof the seam
+        // works.
+        m_inputSystem.BindActionKey("Select", Core::KeyCode::Space);
+        m_inputSystem.BindActionMouseButton("Select", Core::MouseButton::Left);
+
         AR_LOG_INFO("Runtime initialized");
     }
 
@@ -99,6 +119,18 @@ namespace AREngine::Runtime
 
         while (true)
         {
+            // InputSystem::BeginFrame() clears last frame's transient
+            // Pressed/Released flags. It must run before PollEvents()
+            // delivers this frame's new events — otherwise a flag this
+            // frame's own event just set would be wiped out again
+            // immediately, and nothing would ever observe it. Doing it
+            // here means Pressed/Released set by the events processed
+            // just below remain observable for the rest of this frame's
+            // body (the demo logging, and everything after it), not
+            // cleared until next iteration — see docs/ARCHITECTURE.md,
+            // "Frame Lifecycle for Transient State".
+            m_inputSystem.BeginFrame();
+
             // Process OS messages, then check ShouldClose() immediately
             // afterward — before doing any frame work. If a new frame
             // were started first and ShouldClose() only checked
@@ -110,6 +142,29 @@ namespace AREngine::Runtime
             if (m_window->ShouldClose())
             {
                 break;
+            }
+
+            // M7 validation: minimal, deliberately non-flooding input
+            // logging. WasKeyPressed/WasKeyReleased are true for
+            // exactly one frame per physical transition (OS key-repeat
+            // while holding Space does not retrigger this), which is
+            // exactly what proves the frame lifecycle works — not raw
+            // event logging, which would show repeat spam instead.
+            if (m_inputSystem.WasKeyPressed(Core::KeyCode::Space))
+            {
+                AR_LOG_INFO("Space pressed");
+            }
+            if (m_inputSystem.WasKeyReleased(Core::KeyCode::Space))
+            {
+                AR_LOG_INFO("Space released");
+            }
+            if (m_inputSystem.WasMouseButtonPressed(Core::MouseButton::Left))
+            {
+                AR_LOG_INFO("Left mouse button pressed");
+            }
+            if (m_inputSystem.WasActionPressed("Select"))
+            {
+                AR_LOG_INFO("Select action pressed (Space or Left Mouse)");
             }
 
             const Frame::FrameTiming timing = m_frameDriver->WaitForNextFrame();

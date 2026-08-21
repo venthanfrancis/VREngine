@@ -11,6 +11,12 @@ target_sources(arengine_platform
         include/AREngine/Platform/Window.hpp
         include/AREngine/Platform/WindowCloseEvent.hpp
         include/AREngine/Platform/WindowResizeEvent.hpp
+        include/AREngine/Platform/WindowFocusLostEvent.hpp
+        include/AREngine/Platform/KeyPressedEvent.hpp
+        include/AREngine/Platform/KeyReleasedEvent.hpp
+        include/AREngine/Platform/MouseButtonPressedEvent.hpp
+        include/AREngine/Platform/MouseButtonReleasedEvent.hpp
+        include/AREngine/Platform/MouseMovedEvent.hpp
         include/AREngine/Platform/Clock.hpp
 )
 

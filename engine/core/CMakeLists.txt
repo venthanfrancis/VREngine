@@ -13,6 +13,8 @@ target_sources(arengine_core
         include/AREngine/Core/Log.hpp
         include/AREngine/Core/Assert.hpp
         include/AREngine/Core/Event.hpp
+        include/AREngine/Core/KeyCode.hpp
+        include/AREngine/Core/MouseButton.hpp
         include/AREngine/Core/Math/Math.hpp
         include/AREngine/Core/Math/MathUtil.hpp
         include/AREngine/Core/Math/Vec2.hpp

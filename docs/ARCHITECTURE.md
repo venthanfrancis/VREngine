@@ -669,3 +669,146 @@ and predictable failure handling). Concrete decisions worth recording:
   builds the repo.
 
 No architectural issues were discovered.
+
+## 15. M7 Implementation Notes
+
+M7 implemented `Input`: `InputSystem` (raw key/mouse state, an
+action-mapping layer) fed by new generic events from `Platform`, wired
+into `Runtime`'s existing loop. Concrete decisions worth recording:
+
+- **`KeyCode`/`MouseButton` ownership**: both live in `Core`
+  (`Core/KeyCode.hpp`, `Core/MouseButton.hpp`), not in `Input` or
+  `Platform`. `Platform` needs them to construct its input events;
+  `Input` needs them to represent key/button state — putting them in
+  either module would force the other to depend on it, so they live in
+  the one place both can reach without depending on each other, the
+  same reasoning `Core::Event` already established for event base
+  types.
+- **Why `Input` depends on `Platform`**: this was the established
+  relationship since M0 (`engine/input/CMakeLists.txt` already linked
+  `AREngine::Platform`), and M7 puts it to genuine use —
+  `InputSystem::OnEvent` recognizes Platform's concrete event types
+  (`KeyPressedEvent`, `MouseMovedEvent`, ...) via `dynamic_cast`. This
+  is a downward dependency (`Input` sits above `Platform` in the layer
+  diagram, Section 1), not a violation of any layering rule. Crucially,
+  `InputSystem` never reaches into a `Window` or touches Win32 itself —
+  it only ever receives events handed to it through `OnEvent()`.
+  `Runtime` is what actually calls `Window::PollEvents()` and forwards
+  each resulting event into `InputSystem::OnEvent()` (from the same
+  callback that already logs `WindowCloseEvent`/`WindowResizeEvent`) —
+  matching the brief's preferred shape: Platform receives OS input →
+  Runtime forwards it → Input updates its state.
+- **Win32 → generic input translation boundary**: confined entirely to
+  `WindowsWindow.cpp`'s `TranslateVirtualKey` and the `WM_LBUTTONDOWN`/
+  etc. handlers in `HandleMessage`. No `Windows.h` type or virtual-key
+  constant ever crosses out of `engine/platform/src/windows/` — `Input`
+  and everything above it only ever see `Core::KeyCode`/
+  `Core::MouseButton`. Left/right Shift and Ctrl need special handling
+  here: Win32 reports either Shift key as the generic `VK_SHIFT` (same
+  for `VK_CONTROL`) in `WM_KEYDOWN`/`UP`'s `wParam` — telling left from
+  right requires pulling the hardware scan code out of `lParam` and
+  asking `MapVirtualKeyW` to expand it to the specific extended
+  virtual-key, which `TranslateVirtualKey` does uniformly for both
+  keys.
+- **Held vs. Pressed vs. Released**: `IsKeyDown`/`IsMouseButtonDown`
+  ("held") are true for every frame the key/button stays down,
+  including the frame it was pressed and the frame before release.
+  `WasKeyPressed`/`WasKeyReleased`/their mouse equivalents ("this
+  frame's transition") are true for exactly one frame — the one in
+  which the up→down or down→up transition was observed — never longer.
+- **Frame lifecycle for transient state**: `InputSystem::BeginFrame()`
+  clears every key/button's `wasPressed`/`wasReleased` flags (but not
+  `isDown`, which persists) and snapshots the current mouse position as
+  this frame's delta baseline. `Runtime::Run()` calls it as the very
+  first thing in the loop body, *before* `Window::PollEvents()` —
+  reversing that order would mean a flag this frame's own event just
+  set gets wiped out again immediately, and nothing would ever observe
+  it. With the correct order, `Pressed`/`Released` set by events
+  processed in this iteration remain observable for the rest of the
+  frame's body (the M7 demo logging, and everything after it), and are
+  cleared only at the *next* iteration's `BeginFrame()`.
+- **Key repeat behavior**: `Platform::KeyPressedEvent` fires on every
+  `WM_KEYDOWN`, OS repeats included — Platform does not filter them.
+  `InputSystem::SetKeyDown` is what enforces "Pressed means an up→down
+  transition only": a `KeyPressedEvent` for a key that's already marked
+  `isDown` is a no-op (the key simply stays Down; `wasPressed` is not
+  set again). This was a deliberate choice over filtering in Platform:
+  `InputSystem` already has to track per-key held state to compute
+  `WasKeyPressed` at all, so enforcing the transition there avoids
+  duplicating that bookkeeping in `Platform` too, and keeps the
+  behavior directly testable with synthetic events (no real repeating
+  Win32 message needed) — see `TestRepeatedKeyDownDoesNotRetriggerPressed`
+  in `tests/input_tests.cpp`, and confirmed again manually by holding
+  Space through the real Win32 pipeline (three synthetic `WM_KEYDOWN`
+  messages with no release in between produced exactly one "Space
+  pressed" log line).
+- **Focus-loss behavior**: `Platform::WindowFocusLostEvent` (new, fires
+  on `WM_KILLFOCUS`) causes `InputSystem::HandleFocusLost` to mark every
+  currently-held key and mouse button as released — `isDown = false`
+  *and* `wasReleased = true` (not just silently cleared), so code
+  watching for release transitions still observes one instead of a key
+  quietly vanishing from "held" with no event. Why this matters: the
+  matching key-up for anything held when focus is lost may never arrive
+  at this window (the user could release it while some other window has
+  focus), so without this, a key could stay stuck "held" forever.
+- **Mouse coordinate convention**: `Platform::MouseMovedEvent` and
+  `InputSystem::GetMousePosition` use client-area coordinates — origin
+  top-left, +x right, +y down. This is a 2D desktop-window convention,
+  deliberately separate from (and not to be confused with) the engine's
+  3D world convention in `docs/WORLD_CONVENTIONS.md` (+Y up). Both
+  conventions are documented explicitly, in both places, specifically so
+  neither gets silently assumed to be the other.
+- **Mouse first-movement rule**: the very first `MouseMovedEvent`
+  `InputSystem` ever receives establishes the position baseline and
+  reports a delta of exactly `(0,0)` for the frame it arrives in,
+  rather than a large, meaningless jump from the default `(0,0)`
+  position. After that, `GetMouseDelta()` is the *net* movement since
+  the start of the current frame (`BeginFrame`'s position snapshot),
+  not the delta of the single most recent `WM_MOUSEMOVE` — several of
+  those can arrive per `PollEvents()` call, and only the net result
+  across the whole frame is meaningful.
+- **Action mapping / multiple-binding semantics**: an action is a name
+  (`std::string`) with zero or more key/mouse-button bindings, added via
+  `BindActionKey`/`BindActionMouseButton`. `IsActionDown`/
+  `WasActionPressed`/`WasActionReleased` are true if **any** bound
+  input satisfies the query — implemented as a linear scan over that
+  action's bindings, calling the same `IsKeyDown`/`WasKeyPressed`/etc.
+  used for raw queries. An action name that was never registered (or
+  has no bindings) behaves as "always false," never an error — no
+  `IsValid()`-style check is needed before querying an action, unlike
+  `EntityId`/`AssetId` queries elsewhere in the engine, because there's
+  a sensible, unambiguous "no bindings means nothing can be down" answer
+  here that doesn't risk masking a bug.
+- **What's deferred for XR/analog input**: only digital bindings exist
+  (a key or button is either down or not). No analog axes, controller
+  sticks, gesture values, XR poses, composite vectors, or dead zones.
+  The action system is not designed in a way that rules these out later
+  — `ActionBindings` is a private implementation detail that could grow
+  an `std::vector<AnalogBinding>` alongside its digital lists without
+  changing `IsActionDown`'s public shape — but nothing analog is built
+  now, since M7 has no analog input source to bind. A future hand-pinch
+  or XR-controller-trigger binding would plug into the same
+  `IsActionDown("Select")`-style query gameplay already uses; only the
+  binding *source* changes, not the query API — this is the concrete
+  version of the "gameplay cares about Select, not which device"
+  separation the M7 brief opens with.
+- **A real bug, found and fixed via manual testing, not the automated
+  suite**: `Runtime`'s original member order declared `m_inputSystem`
+  *after* `m_window`, meaning `m_inputSystem` was destroyed *before*
+  `m_window` (C++ destroys members in reverse declaration order). Win32
+  can synchronously fire one last `WM_KILLFOCUS` *during* `DestroyWindow`
+  (called from `~WindowsWindow`, reached via `~m_window`'s implicit
+  destruction) — which the event callback forwarded straight into
+  `m_inputSystem.OnEvent()`, calling a method on an already-destroyed
+  object. This produced a genuine, reproducible access-violation crash
+  on every clean window close, confirmed via the Windows Application
+  Error event log (exception code `0xC0000005`) — the crash happened
+  *after* `WM_CLOSE`/`Runtime::Run()` had already returned normally, so
+  nothing in the headless `arengine_*_tests` suite could have caught it
+  (all of it runs without ever destroying a real `Window` and
+  `InputSystem` together in the same object graph). Fixed by declaring
+  `m_inputSystem` *first* in `Runtime` (see the ordering comment in
+  `Runtime.hpp`), so it is destroyed *last* — guaranteed to still be
+  alive for anything the window's own teardown generates. Re-verified
+  manually afterward: the same close sequence that previously crashed
+  now shuts down cleanly every time.

@@ -9,19 +9,30 @@
 // module.
 //
 // Includes:
-//   - WindowDesc.hpp         window configuration
-//   - Window.hpp              the generic Window interface + CreateAppWindow
+//   - WindowDesc.hpp                  window configuration
+//   - Window.hpp                       the generic Window interface + CreateAppWindow
 //   - WindowCloseEvent.hpp
 //   - WindowResizeEvent.hpp
-//   - Clock.hpp               SteadyClock
+//   - WindowFocusLostEvent.hpp         (M7)
+//   - KeyPressedEvent.hpp              (M7)
+//   - KeyReleasedEvent.hpp             (M7)
+//   - MouseButtonPressedEvent.hpp      (M7)
+//   - MouseButtonReleasedEvent.hpp     (M7)
+//   - MouseMovedEvent.hpp              (M7)
+//   - Clock.hpp                        SteadyClock
 //
-// File I/O is deliberately NOT implemented in M2 — nothing in this
-// milestone actually needs it (the window demo reads no files). It will
-// be added once a real consumer exists (Assets, M6, or earlier if one
-// comes up sooner) rather than speculatively now.
+// File I/O is deliberately NOT implemented — nothing so far needs it
+// (see docs/ARCHITECTURE.md, Section 10). It will be added once a real
+// consumer exists rather than speculatively now.
 
 #include "AREngine/Platform/WindowDesc.hpp"
 #include "AREngine/Platform/Window.hpp"
 #include "AREngine/Platform/WindowCloseEvent.hpp"
 #include "AREngine/Platform/WindowResizeEvent.hpp"
+#include "AREngine/Platform/WindowFocusLostEvent.hpp"
+#include "AREngine/Platform/KeyPressedEvent.hpp"
+#include "AREngine/Platform/KeyReleasedEvent.hpp"
+#include "AREngine/Platform/MouseButtonPressedEvent.hpp"
+#include "AREngine/Platform/MouseButtonReleasedEvent.hpp"
+#include "AREngine/Platform/MouseMovedEvent.hpp"
 #include "AREngine/Platform/Clock.hpp"
