@@ -3,6 +3,7 @@
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Platform/WindowCloseEvent.hpp"
 #include "AREngine/Platform/WindowResizeEvent.hpp"
+#include "AREngine/Rendering/NullRenderDevice.hpp"
 #include "AREngine/Runtime/DesktopFrameDriver.hpp"
 
 #include <format>
@@ -47,15 +48,42 @@ namespace AREngine::Runtime
         // interface, so it would not need to change at all.
         m_frameDriver = std::make_unique<DesktopFrameDriver>(*m_window);
 
+        // Same reasoning as DesktopFrameDriver above: constructed
+        // directly via its factory (CreateNullRenderDevice, declared
+        // alongside the concrete NullRenderDevice), stored as the
+        // abstract Rendering::RenderDevice interface. Nothing past this
+        // line ever names NullRenderDevice or touches its internals —
+        // see docs/ARCHITECTURE.md, "M4 Implementation Notes".
+        m_renderDevice = Rendering::CreateNullRenderDevice();
+
+        // TEMPORARY (M4 validation only): a placeholder vertex buffer,
+        // just large enough to be a valid buffer, that exists purely so
+        // Run()'s dummy draw call has something valid to reference. Its
+        // content is meaningless — nothing reads it, since there is no
+        // real backend to read anything yet. Removed once Scene (M5)
+        // provides real geometry.
+        Rendering::BufferDesc dummyBufferDesc;
+        dummyBufferDesc.sizeBytes = 12; // arbitrary non-zero size
+        dummyBufferDesc.usage = Rendering::BufferUsage::Vertex;
+        m_dummyVertexBuffer = m_renderDevice->CreateBuffer(dummyBufferDesc);
+
         AR_LOG_INFO("Runtime initialized");
     }
 
     Runtime::~Runtime()
     {
-        // Both members are std::unique_ptr and clean themselves up; this
-        // destructor exists to log the moment of shutdown. Destruction
-        // order (frame driver, then window) is guaranteed correct by
-        // member declaration order — see the comment in Runtime.hpp.
+        // Explicit, while m_renderDevice is still alive, to exercise the
+        // destroy path rather than relying only on NullRenderDevice's
+        // own destructor to clean up. Harmless either way today (no real
+        // GPU resource exists), but establishes the habit for when it
+        // won't be.
+        m_renderDevice->DestroyBuffer(m_dummyVertexBuffer);
+
+        // Everything else is a std::unique_ptr and cleans itself up;
+        // this destructor exists mainly to log the moment of shutdown.
+        // Destruction order (render device, then frame driver, then
+        // window) is guaranteed correct by member declaration order —
+        // see the comment in Runtime.hpp.
         AR_LOG_INFO("Runtime shutting down");
     }
 
@@ -86,10 +114,23 @@ namespace AREngine::Runtime
 
             const Frame::FrameTiming timing = m_frameDriver->WaitForNextFrame();
             const std::vector<Frame::ViewInfo> views = m_frameDriver->GetViews();
-            (void)views; // nothing consumes views yet — no renderer until M4+
+            (void)views; // not consumed by rendering yet — no camera/Scene until M5+
 
             // "Update runtime/application state" belongs here once
             // there is any state to update (Scene, M5+).
+
+            // TEMPORARY (M4 validation only): a hard-coded dummy draw
+            // proving the Rendering seam works end to end (CreateBuffer
+            // -> BeginRendering -> SubmitDraw -> EndRendering), with
+            // nothing actually appearing on screen since NullRenderDevice
+            // does no real graphics work. Scene (M5) replaces this with
+            // real geometry submission driven by actual scene content.
+            m_renderDevice->BeginRendering();
+            Rendering::DrawCommand dummyDraw;
+            dummyDraw.vertexBuffer = m_dummyVertexBuffer;
+            dummyDraw.count = 3; // pretend one triangle
+            m_renderDevice->SubmitDraw(dummyDraw);
+            m_renderDevice->EndRendering();
 
             fpsAccumulatedSeconds += timing.deltaTimeSeconds;
             ++fpsFrameCount;

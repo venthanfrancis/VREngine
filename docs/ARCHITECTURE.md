@@ -359,3 +359,82 @@ worth recording:
   equivalent (deliberately undesigned so far — see Section 4, "RHI
   Presentation") is implemented. No frame limiting is being added ahead
   of that.
+
+## 12. M4 Implementation Notes
+
+M4 implemented `Rendering`'s public API and its `NullRenderDevice`
+backend, and wired a minimal, clearly-temporary draw into `Runtime`.
+Concrete decisions worth recording:
+
+- **Minimal Rendering API**: five things — two resource kinds
+  (`BufferHandle`/`BufferDesc`, `TextureHandle`/`TextureDesc`), one
+  `DrawCommand`, and the `RenderDevice` interface itself
+  (`CreateBuffer`/`DestroyBuffer`, `CreateTexture`/`DestroyTexture`,
+  `BeginRendering`/`SubmitDraw`/`EndRendering`). Nothing else. No render
+  graph, material system, descriptor framework, bindless system,
+  multi-threaded command recording, or shader reflection — M4 exists
+  only to prove the seam between engine code and a future graphics
+  backend, not to design the final renderer.
+- **Pipelines and shaders are deferred entirely, not stubbed.** No
+  `PipelineHandle`, no `PipelineDesc`, no `CreatePipeline`, and
+  `DrawCommand` has no pipeline reference. A placeholder `PipelineDesc`
+  with no real fields would just be guessing at what a real backend
+  needs before any real backend exists to ask. This is deferred until
+  Vulkan (M8) reveals actual shader-stage and vertex-layout
+  requirements — documenting the deferral instead of guessing, per M4's
+  own design guidance.
+- **Texture upload/content is out of scope.** `TextureDesc` describes
+  width/height/format only; `NullRenderDevice::CreateTexture` validates
+  and stores the descriptor but never touches pixel data. Loading image
+  content belongs to `Assets` (M6+), not `Rendering`.
+- **Handle strategy**: `BufferHandle`/`TextureHandle` are each just a
+  `std::uint32_t id` (0 = invalid) with an `IsValid()` check — no
+  generational reuse counters, no exposed backend memory objects, two
+  separate plain structs rather than one templated `Handle<Tag>` (kept
+  as simple and readable as the codebase's existing style, e.g. `Mat4`'s
+  explicit `At`/`Set` over an `operator()` template). `NullRenderDevice`
+  maps ids to descriptors in `std::unordered_map`; a future Vulkan
+  backend would map the same ids to `VkBuffer`/`VkImage` it owns
+  privately — the id itself carries no backend meaning.
+- **`RenderDevice` knows nothing about how a frame is paced or
+  presented.** `BeginRendering`/`EndRendering` only bracket one frame's
+  worth of draw submissions (so a backend can group/count them, and so
+  `Runtime` has one clear place to plug rendering into its loop) — they
+  are explicitly not `Present()` and carry no swapchain/vsync meaning.
+  This is the same boundary from Section 4, restated because M4 is the
+  first milestone where it's actually exercised end to end: `Frame`
+  (frame lifecycle/timing) and `Rendering` (GPU operations) remain
+  separate modules with no dependency between them in either direction.
+- **`SubmitDraw` returns `bool`, `CreateBuffer`/`CreateTexture` assert.**
+  Two different failure philosophies, deliberately: a zero-size buffer
+  or zero-dimension texture passed to `Create*` is a caller bug (an
+  `AR_ASSERT_MSG`, consistent with M1/M2's established use of Core's
+  assertion facility for genuine invariant violations), whereas a
+  `DrawCommand` referencing an unknown or stale handle is a plausible,
+  checkable runtime outcome — `SubmitDraw` rejects it (logs a warning,
+  returns `false`, submits nothing) rather than crashing, so both
+  production code and tests can handle it predictably.
+- **`Destroy*` is a no-op on invalid/unknown/already-destroyed
+  handles** — the same "predictable, not an error" philosophy as
+  `delete nullptr`. No garbage collection, no deferred GPU destruction;
+  real Vulkan resource-lifetime requirements (GPU work still in flight
+  when destroy is requested, etc.) are a Vulkan-milestone (M8) problem,
+  not an M4 one.
+- **`NullRenderDevice`'s diagnostic methods
+  (`GetLiveBufferCount`/`GetLiveTextureCount`/`GetTotalDrawCount`/
+  `GetLastFrameDrawCount`) are on the concrete class, not on
+  `RenderDevice`.** Tests construct a `NullRenderDevice` directly to
+  reach them; `Runtime` only ever holds the abstract `RenderDevice`
+  interface (via `CreateNullRenderDevice()`) and never sees them. This
+  keeps the generic interface free of Null-backend-specific concerns,
+  the same pattern used for `WindowsWindow`'s Win32-only surface area.
+- **Runtime integration required no architectural changes** — it
+  followed the exact ownership pattern `DesktopFrameDriver` established
+  in M3: a `std::unique_ptr<Rendering::RenderDevice>` member,
+  constructed via `CreateNullRenderDevice()` (never naming
+  `NullRenderDevice` itself), destroyed automatically in reverse
+  declaration order. `Runtime::Run()` now does one hard-coded, clearly
+  temporary `BeginRendering`/`SubmitDraw`/`EndRendering` per frame
+  against a placeholder vertex buffer created at startup, purely to
+  prove `CreateBuffer` → `SubmitDraw` works end to end — both are
+  removed once `Scene` (M5) provides real geometry.

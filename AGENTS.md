@@ -18,21 +18,26 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M3 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
+**M0 through M4 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
 logging, assertions, the `Event` base type), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform`'s `Window`
-abstraction + Windows/Win32 backend + `SteadyClock`, and `Runtime`
-(owns `Window` + a `FrameDriver`, runs the main loop) + its
-`DesktopFrameDriver` are all implemented. `AREngineSandbox.exe` is the
-first real running engine: it opens a window, runs a real frame loop,
-logs FPS once per second, and shuts down cleanly on close. Raw
-keyboard/mouse input and file I/O were deliberately NOT added in M2 —
-see `docs/ARCHITECTURE.md` Section 10. There is still no rendering,
-Scene, frame limiting, or camera system — `DesktopFrameDriver` produces
-one placeholder identity `ViewInfo` per frame and `SubmitFrame()` is a
-no-op — see Section 11. Everything else (`Rendering`, `Scene`, `Assets`,
-`Input`, `XR`, `Editor`) is still an M0-style stub with no
-functionality. Next up is M4 (`Rendering`'s minimal RHI). See
+abstraction + Windows/Win32 backend + `SteadyClock`, `Runtime` (owns
+`Window` + a `FrameDriver` + a `RenderDevice`, runs the main loop) with
+`DesktopFrameDriver`, and `Rendering`'s minimal RHI
+(`RenderDevice`/`BufferHandle`/`TextureHandle`/`DrawCommand`) with its
+`NullRenderDevice` backend are all implemented. `AREngineSandbox.exe`
+opens a window, runs a real frame loop, submits one hard-coded
+temporary dummy draw per frame through the Null backend (nothing
+visibly renders — that's expected, see
+`docs/ARCHITECTURE.md` Section 12), logs FPS once per second, and shuts
+down cleanly on close. Raw keyboard/mouse input and file I/O were
+deliberately NOT added in M2 — see Section 10. There is still no Scene,
+no real graphics backend, no frame limiting, no camera system, and no
+pipeline/shader API (deferred entirely until Vulkan, M8, per Section
+12) — `DesktopFrameDriver` produces one placeholder identity `ViewInfo`
+per frame and `SubmitFrame()` is a no-op — see Section 11. Everything
+else (`Scene`, `Assets`, `Input`, `XR`, `Editor`) is still an M0-style
+stub with no functionality. Next up is M5 (`Scene`). See
 `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval

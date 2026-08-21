@@ -30,6 +30,13 @@ target_link_libraries(arengine_runtime_tests PRIVATE AREngine::Core AREngine::Pl
 target_compile_features(arengine_runtime_tests PRIVATE cxx_std_20)
 add_test(NAME RuntimeTests COMMAND arengine_runtime_tests)
 
+add_executable(arengine_rendering_tests
+    rendering_tests.cpp
+)
+target_link_libraries(arengine_rendering_tests PRIVATE AREngine::Core AREngine::Rendering)
+target_compile_features(arengine_rendering_tests PRIVATE cxx_std_20)
+add_test(NAME RenderingTests COMMAND arengine_rendering_tests)
+
 # Manual-only: proves M2's Window works end-to-end with real user
 # interaction (opening a window, closing it via the close button). Built
 # by CMake but deliberately NOT registered with add_test — CTest must

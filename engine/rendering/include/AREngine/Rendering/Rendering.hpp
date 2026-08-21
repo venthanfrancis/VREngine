@@ -1,24 +1,28 @@
 #pragma once
 
-// AREngine::Rendering
+// AREngine::Rendering — convenience umbrella header.
 //
-// The RHI (Render Hardware Interface): an abstraction over GPU rendering
-// operations, kept intentionally small. No graphics API is implemented
-// yet (Vulkan lands at M8 — see docs/ROADMAP.md).
+// The RHI (Render Hardware Interface): GPU rendering operations only,
+// kept intentionally small. Depends only on Core. Public headers expose
+// zero backend-specific types.
 //
-// Intended eventual contents, scoped to GPU operations only:
-//   - Create buffer / texture / pipeline
-//   - Submit draw calls
+// Includes:
+//   - Handles.hpp             BufferHandle, TextureHandle
+//   - BufferDesc.hpp
+//   - TextureDesc.hpp
+//   - DrawCommand.hpp
+//   - RenderDevice.hpp         the generic interface
+//   - NullRenderDevice.hpp     the M4 backend + CreateNullRenderDevice()
 //
-// Explicitly NOT this module's job: frame lifecycle, presentation, or
-// frame submission timing. Desktop Vulkan presentation and OpenXR frame
-// submission have different lifecycle requirements, so that concern is
-// kept separate (owned by Frame + Runtime) until real requirements from
-// both backends are known. See docs/ARCHITECTURE.md, "RHI Presentation".
+// Deliberately NOT here, until Vulkan (M8) reveals real requirements:
+// pipelines/shaders (no PipelineHandle/PipelineDesc — see
+// docs/ARCHITECTURE.md, "M4 Implementation Notes"), texture upload or
+// content, and frame lifecycle/presentation (owned by Frame + Runtime —
+// see "RHI Presentation").
 
-namespace AREngine::Rendering
-{
-    // Placeholder only, to prove this module compiles, links, and can be
-    // consumed by other modules. Remove once the real RHI lands.
-    [[nodiscard]] const char* ModuleName();
-}
+#include "AREngine/Rendering/Handles.hpp"
+#include "AREngine/Rendering/BufferDesc.hpp"
+#include "AREngine/Rendering/TextureDesc.hpp"
+#include "AREngine/Rendering/DrawCommand.hpp"
+#include "AREngine/Rendering/RenderDevice.hpp"
+#include "AREngine/Rendering/NullRenderDevice.hpp"

@@ -1,9 +1,5 @@
 #include "AREngine/Rendering/Rendering.hpp"
 
-namespace AREngine::Rendering
-{
-    const char* ModuleName()
-    {
-        return "AREngine.Rendering";
-    }
-}
+// Rendering.hpp aggregates the generic RHI types plus the Null backend.
+// This file exists so the umbrella header gets a standalone compile
+// check; the real implementation lives in NullRenderDevice.cpp.
