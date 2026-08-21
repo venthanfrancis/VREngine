@@ -1,7 +1,15 @@
 add_library(arengine_runtime STATIC
     src/Runtime.cpp
+    src/DesktopFrameDriver.cpp
 )
 add_library(AREngine::Runtime ALIAS arengine_runtime)
+
+target_sources(arengine_runtime
+    PRIVATE
+        include/AREngine/Runtime/Runtime.hpp
+        include/AREngine/Runtime/RuntimeConfig.hpp
+        include/AREngine/Runtime/DesktopFrameDriver.hpp
+)
 
 target_include_directories(arengine_runtime
     PUBLIC

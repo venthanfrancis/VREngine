@@ -276,3 +276,86 @@ backend, plus `SteadyClock`. Concrete decisions worth recording:
   checks `Window::ShouldClose()` directly rather than waiting on
   `WM_QUIT` via a blocking `GetMessage` loop, so there is only one
   "should the app end" signal, not two that could disagree.
+
+## 11. M3 Implementation Notes
+
+M3 connected `Core` + `Frame` + `Platform` into the first real running
+engine loop: `Runtime` and `DesktopFrameDriver`. Concrete decisions
+worth recording:
+
+- **`DesktopFrameDriver` placement**: lives in `runtime/`
+  (`AREngine::Runtime::DesktopFrameDriver`), not in `Frame` or
+  `Platform`. It needs both Frame's `FrameDriver` interface/types and
+  Platform's `Window`/`SteadyClock`, and `Runtime` is the one module
+  already wired to depend on both — adding it there required zero new
+  cross-module dependency edges anywhere in the build. `Frame` and
+  `Platform` remain peers at the same layer (Section 1); neither gained
+  a dependency on the other.
+- **Runtime ownership model**: `Runtime` owns exactly two things —
+  `std::unique_ptr<Platform::Window>` and
+  `std::unique_ptr<Frame::FrameDriver>` — both constructed in its
+  constructor and torn down implicitly by its destructor (pure RAII, no
+  explicit `Shutdown()` call needed). No singleton, no service locator,
+  no global mutable state. An application constructs exactly one
+  `Runtime`, on the stack, and owns it directly (`sandbox/src/main.cpp`
+  does this). Member declaration order (`m_window` before
+  `m_frameDriver`) is what guarantees `m_frameDriver` — which holds a
+  reference to `*m_window` — is destroyed first, since C++ destroys
+  members in reverse declaration order.
+- **`DesktopFrameDriver` is constructed directly**, not through a
+  factory function: unlike `Platform::Window` (which hides
+  `WindowsWindow` behind `CreateAppWindow` specifically to keep Win32
+  out of public headers), `DesktopFrameDriver` already lives in the same
+  module as `Runtime` and leaks no platform-specific types, so there's
+  nothing for an extra layer of indirection to hide.
+
+  The precise architectural guarantee here is narrower than "swapping in
+  `XRFrameDriver` is a one-line change": **`Run()`'s loop should not
+  require structural changes**, because it only ever calls through the
+  `Frame::FrameDriver` interface (`WaitForNextFrame`/`GetViews`/
+  `SubmitFrame`) and has no idea which concrete implementation is
+  underneath. That guarantee does not extend to everything around the
+  loop — XR session initialization, OpenXR instance/session ownership,
+  window/surface requirements, and other XR-specific setup may well
+  need real changes outside the loop itself (e.g. in how and when
+  `Runtime` is constructed, or what it's constructed with) once M9
+  actually builds `XRFrameDriver`. Which of those changes are needed
+  won't be known for certain until M9.
+- **Main loop order**: `PollEvents()` then `ShouldClose()` is checked
+  *before* any frame work starts, every iteration. Reasoning: if a new
+  frame were started first and `ShouldClose()` only checked afterward, a
+  close request would still cost one more full frame of work before the
+  loop noticed — pointless today since nothing renders yet, but the
+  wrong habit to build. Checking immediately after processing messages
+  means a close request is acted on the moment it's known.
+- **Authoritative close signal**: `Window::ShouldClose()` is the only
+  thing that ends `Runtime::Run()`'s loop. `WindowCloseEvent` is also
+  wired up (via `Window::SetEventCallback`) but used purely for logging
+  — it never drives control flow. This keeps exactly one source of truth
+  for "should the app end," matching the same principle already applied
+  to `WM_CLOSE`/`WM_QUIT` in Section 10.
+- **No FrameDriver redesign needed.** The M1 interface (`WaitForNextFrame`
+  → `FrameTiming`, `GetViews` → `vector<ViewInfo>`, `SubmitFrame`) fit
+  M3's needs exactly as designed; nothing was changed. `DesktopFrameDriver`
+  implements `WaitForNextFrame` by ticking a `Platform::SteadyClock` (no
+  actual "wait," since there's no vsync/present to synchronize with
+  yet), `GetViews` by returning one default-constructed `ViewInfo` (no
+  camera system exists yet — Scene, M5+), and `SubmitFrame` as a no-op
+  (no renderer exists yet — see Section 4, "RHI Presentation").
+- **FPS logging, not per-frame**: `Runtime::Run()` accumulates delta
+  time and frame count, logging an FPS line only once per elapsed
+  second, to avoid flooding the console — the loop currently runs
+  unthrottled (no frame limiting; not implemented per design, since
+  there's no renderer to pace against yet), so per-frame logging would
+  be well over a million lines a second.
+
+  This unthrottled behavior will **not** be resolved by M4: M4 adds a
+  "null" `Rendering` backend that only logs draw calls (see M4's roadmap
+  entry) — it provides no real GPU presentation and no vsync, so it
+  gives `DesktopFrameDriver::WaitForNextFrame()` nothing to actually wait
+  on. The loop is expected to remain effectively unthrottled until a
+  real graphics/presentation path exists — realistically not before the
+  Vulkan milestone (M8), and only once that backend's `Present()`
+  equivalent (deliberately undesigned so far — see Section 4, "RHI
+  Presentation") is implemented. No frame limiting is being added ahead
+  of that.

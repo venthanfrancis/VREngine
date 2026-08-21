@@ -4,13 +4,21 @@ namespace AREngine::Frame
 {
     // Timing information for a single frame, provided by whichever
     // FrameDriver is currently in use (desktop today, XR later).
+    //
+    // All three fields are double, not float: totalTimeSeconds
+    // accumulates for the entire lifetime of a running engine session,
+    // and float's ~7 significant digits start losing meaningful
+    // precision after a few hours of continuous runtime. Double
+    // precision is cheap and removes that limit. This is specific to
+    // timing — Vec3/Mat4/Quaternion and general rendering/transform math
+    // stay float.
     struct FrameTiming
     {
         // Time elapsed since the previous frame, in seconds.
-        float deltaTimeSeconds = 0.0f;
+        double deltaTimeSeconds = 0.0;
 
         // Time elapsed since the application started, in seconds.
-        float totalTimeSeconds = 0.0f;
+        double totalTimeSeconds = 0.0;
 
         // Placeholder for a future XR-style predicted display time: the
         // moment this frame's image is expected to actually be shown to

@@ -18,7 +18,7 @@ all come after that chain is proven.
 | M0 | Repository structure + CMake scaffolding | **Complete** | Stub targets only, no functionality |
 | M1 | `Core`: math (built to the world conventions), logging, assertions, `Frame`'s `FrameDriver`/`FrameTiming`/`ViewInfo` types. `std::` containers throughout. | **Complete** | See `docs/ARCHITECTURE.md` Section 9 |
 | M2 | `Platform` (Windows): window, raw keyboard/mouse, timing, file I/O | **Complete** | Window + SteadyClock done; raw keyboard/mouse deferred to M7 (Input); file I/O deferred to a milestone with a real consumer — see `docs/ARCHITECTURE.md` Section 10 |
-| M3 | Minimal `Runtime`: main loop written against `FrameDriver`, backed by `DesktopFrameDriver`. Opens a window, prints FPS. | Not started | Proves the loop doesn't hard-code desktop timing assumptions |
+| M3 | Minimal `Runtime`: main loop written against `FrameDriver`, backed by `DesktopFrameDriver`. Opens a window, prints FPS. | **Complete** | Proves the loop doesn't hard-code desktop timing assumptions — see `docs/ARCHITECTURE.md` Section 11 |
 | M4 | `Rendering`: minimal RHI (create buffer/texture/pipeline, draw) + a "null" backend that logs calls | Not started | RHI kept deliberately small; no `Present()` yet — see ARCHITECTURE.md |
 | M5 | `Scene`: entities, transforms, hierarchy; Sandbox draws through the null renderer | Not started | Confirms world-convention math end-to-end |
 | M6 | `Assets`: minimal file-based mesh/texture loading | Not started | |

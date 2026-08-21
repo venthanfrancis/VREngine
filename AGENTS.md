@@ -18,15 +18,21 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0, M1, and M2 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
+**M0 through M3 complete.** `Core` (math: Vec2/Vec3/Vec4/Quaternion/Mat4,
 logging, assertions, the `Event` base type), `Frame`
-(`FrameTiming`/`ViewInfo`/`FrameDriver`), and `Platform`'s `Window`
-abstraction + Windows/Win32 backend + `SteadyClock` are implemented.
-Raw keyboard/mouse input and file I/O were deliberately NOT added in M2
-— see `docs/ARCHITECTURE.md` Section 10 for why. Everything else
-(`Rendering`, `Scene`, `Assets`, `Input`, `XR`, `Runtime`, `Editor`,
-`Sandbox`) is still an M0-style stub with no functionality. Next up is
-M3 (`Runtime`'s main loop, backed by `DesktopFrameDriver`). See
+(`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform`'s `Window`
+abstraction + Windows/Win32 backend + `SteadyClock`, and `Runtime`
+(owns `Window` + a `FrameDriver`, runs the main loop) + its
+`DesktopFrameDriver` are all implemented. `AREngineSandbox.exe` is the
+first real running engine: it opens a window, runs a real frame loop,
+logs FPS once per second, and shuts down cleanly on close. Raw
+keyboard/mouse input and file I/O were deliberately NOT added in M2 —
+see `docs/ARCHITECTURE.md` Section 10. There is still no rendering,
+Scene, frame limiting, or camera system — `DesktopFrameDriver` produces
+one placeholder identity `ViewInfo` per frame and `SubmitFrame()` is a
+no-op — see Section 11. Everything else (`Rendering`, `Scene`, `Assets`,
+`Input`, `XR`, `Editor`) is still an M0-style stub with no
+functionality. Next up is M4 (`Rendering`'s minimal RHI). See
 `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval

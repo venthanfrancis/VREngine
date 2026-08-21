@@ -25,7 +25,7 @@ namespace
         AREngine::Frame::FrameTiming WaitForNextFrame() override
         {
             AREngine::Frame::FrameTiming timing;
-            timing.deltaTimeSeconds = 0.016f;
+            timing.deltaTimeSeconds = 0.016;
             return timing;
         }
 
@@ -45,8 +45,8 @@ namespace
     void TestFrameTiming()
     {
         const AREngine::Frame::FrameTiming timing;
-        Check(timing.deltaTimeSeconds == 0.0f, "FrameTiming defaults deltaTimeSeconds to 0");
-        Check(timing.totalTimeSeconds == 0.0f, "FrameTiming defaults totalTimeSeconds to 0");
+        Check(timing.deltaTimeSeconds == 0.0, "FrameTiming defaults deltaTimeSeconds to 0");
+        Check(timing.totalTimeSeconds == 0.0, "FrameTiming defaults totalTimeSeconds to 0");
         Check(timing.predictedDisplayTimeSeconds == 0.0, "FrameTiming defaults predictedDisplayTimeSeconds to 0");
     }
 
@@ -64,7 +64,7 @@ namespace
         DummyFrameDriver driver;
 
         const auto timing = driver.WaitForNextFrame();
-        Check(timing.deltaTimeSeconds == 0.016f, "FrameDriver::WaitForNextFrame returns timing");
+        Check(timing.deltaTimeSeconds == 0.016, "FrameDriver::WaitForNextFrame returns timing");
 
         const auto views = driver.GetViews();
         Check(views.size() == 1, "FrameDriver::GetViews can return a view");
