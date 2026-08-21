@@ -23,7 +23,9 @@ all come after that chain is proven.
 | M5 | `Scene`: entities, transforms, hierarchy | **Complete** | Confirms world-convention math end-to-end; not yet wired into Runtime/Rendering — see `docs/ARCHITECTURE.md` Section 13 |
 | M6 | `Assets`: asset root, AssetId, TextAsset/BinaryAsset loading, caching | **Complete** | Real mesh/texture formats deferred — see `docs/ARCHITECTURE.md` Section 14 |
 | M7 | `Input`: desktop keyboard/mouse state + action-mapping over raw Platform input | **Complete** | Desktop-only (no hand/controller/XR input yet) — see `docs/ARCHITECTURE.md` Section 15 |
-| M8 | **Vulkan backend** implementing the RHI: triangle, then a textured mesh | Not started | First external dependency, isolated to `Rendering` |
+| M8 | **Vulkan backend** implementing the RHI: triangle, then a textured mesh | In progress | First external dependency, isolated to `Rendering`. Split into sub-milestones — see below |
+| — M8A | Vulkan bring-up: instance, validation, physical/logical device, graphics queue. No swapchain, no rendering. | **Complete** | See `docs/ARCHITECTURE.md` Section 16 |
+| — M8B+ | Surface, swapchain, command pool/buffers, render pass or dynamic rendering, shaders, first triangle, then a textured mesh | Not started | |
 | M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | Not started | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |

@@ -64,6 +64,40 @@ target_link_libraries(arengine_input_tests PRIVATE AREngine::Core AREngine::Plat
 target_compile_features(arengine_input_tests PRIVATE cxx_std_20)
 add_test(NAME InputTests COMMAND arengine_input_tests)
 
+# Everything Vulkan-specific is gated on ARENGINE_ENABLE_VULKAN (top-
+# level option, default ON) — when OFF, none of this is added: no
+# find_package(Vulkan) call, no Vulkan targets at all. See
+# docs/ARCHITECTURE.md, "Making Vulkan Optional".
+if(ARENGINE_ENABLE_VULKAN)
+    # find_package(Vulkan) is cached by CMake, so calling it again here
+    # (engine/rendering/CMakeLists.txt already called it) is cheap and
+    # just confirms the Vulkan::Vulkan target used below is available in
+    # this directory's scope too.
+    find_package(Vulkan REQUIRED)
+
+    # Pure-logic Vulkan tests: no real Vulkan API calls, so no GPU is
+    # required at runtime (see vulkan_tests.cpp for the one caveat this
+    # doesn't eliminate — the loader DLL must still be resolvable at
+    # process load time, since this links the whole Rendering library).
+    add_executable(arengine_vulkan_tests
+        vulkan_tests.cpp
+    )
+    target_link_libraries(arengine_vulkan_tests PRIVATE AREngine::Core AREngine::Rendering Vulkan::Vulkan)
+    target_include_directories(arengine_vulkan_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+    target_compile_features(arengine_vulkan_tests PRIVATE cxx_std_20)
+    add_test(NAME VulkanTests COMMAND arengine_vulkan_tests)
+
+    # Manual-only: requires a real Vulkan-capable GPU and driver, which
+    # CI/headless systems may lack. Built by CMake but deliberately NOT
+    # registered with add_test. Run it directly instead.
+    add_executable(arengine_vulkan_demo
+        vulkan_demo.cpp
+    )
+    target_link_libraries(arengine_vulkan_demo PRIVATE AREngine::Core AREngine::Rendering Vulkan::Vulkan)
+    target_include_directories(arengine_vulkan_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+    target_compile_features(arengine_vulkan_demo PRIVATE cxx_std_20)
+endif()
+
 # Manual-only: proves M2's Window works end-to-end with real user
 # interaction (opening a window, closing it via the close button). Built
 # by CMake but deliberately NOT registered with add_test — CTest must

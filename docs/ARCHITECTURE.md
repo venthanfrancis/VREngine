@@ -812,3 +812,179 @@ into `Runtime`'s existing loop. Concrete decisions worth recording:
   alive for anything the window's own teardown generates. Re-verified
   manually afterward: the same close sequence that previously crashed
   now shuts down cleanly every time.
+
+## 16. M8A Implementation Notes
+
+M8A introduced Vulkan for the first time: instance creation, validation,
+physical-device selection, and a logical device + graphics queue —
+bring-up only, no rendering. Concrete decisions worth recording:
+
+- **Vulkan SDK discovery**: `engine/rendering/CMakeLists.txt` calls
+  `find_package(Vulkan REQUIRED)`, CMake's standard Vulkan discovery
+  (via the `VULKAN_SDK` environment variable the LunarG SDK installer
+  sets, among other standard search paths). No headers are vendored
+  into the repository, no machine-specific `C:\VulkanSDK\<version>` path
+  is hard-coded anywhere. On this machine, only the GPU driver's Vulkan
+  *runtime* (loader + `vulkaninfo`) was present initially — the SDK
+  itself (headers, the `Vulkan::Vulkan` CMake package, validation
+  layers) had to be installed separately before `find_package(Vulkan)`
+  could succeed.
+- **Chosen Vulkan API target: 1.2.** Released 2020, supported by
+  essentially all Vulkan-capable hardware still in use — chosen over
+  requiring newer optional features (dynamic rendering, ray tracing,
+  mesh shaders) that nothing in this engine needs yet and that M8A's
+  own "do not implement" list explicitly excludes. `VkApplicationInfo::
+  apiVersion` requests 1.2; `SelectPhysicalDevice` additionally rejects
+  any physical device whose own reported `apiVersion` is below that —
+  querying capability rather than assuming every device supports it.
+  This target only sets a *floor*: on this machine the selected device
+  reports 1.4.325 (its driver's actual max supported version), well
+  above the 1.2 minimum, confirming the floor doesn't artificially
+  understate what's actually available.
+- **Instance ownership**: `Rendering::Vulkan::VulkanInstance` (private,
+  `engine/rendering/src/vulkan/`) owns exactly one `VkInstance` and, in
+  debug builds when available, one `VkDebugUtilsMessengerEXT`. RAII:
+  constructor creates, destructor destroys, non-copyable and
+  non-movable — there is never any ambiguity about which object is
+  responsible for a given `VkInstance`. No surface extensions are
+  requested; M8A has no window/surface to present to, so enabling them
+  now would be speculative.
+- **Validation behavior**: the Khronos validation layer
+  (`VK_LAYER_KHRONOS_validation`) is only *requested* in debug builds
+  (the same `#if !defined(NDEBUG)` gate `Core::Assert` already
+  established), and even then only actually *enabled* if
+  `vkEnumerateInstanceLayerProperties` reports it present — if not, a
+  warning is logged (via `AR_LOG_WARNING`, naming exactly which layer
+  was missing) and bring-up continues without it, rather than failing.
+  Release builds never request it at all. When enabled, a
+  `VK_EXT_debug_utils` messenger routes every validation message through
+  AREngine's own logging (severity mapped to `AR_LOG_ERROR`/
+  `AR_LOG_WARNING`/`AR_LOG_INFO`) — confirmed working end to end by the
+  manual demo, which logged the validation layer's own layer-stack setup
+  diagnostics as `[INFO]` lines with zero errors or warnings.
+- **Physical-device selection**: `SelectPhysicalDevice` enumerates every
+  device, discards any below the API version floor or lacking a
+  graphics-capable queue family (`FindGraphicsQueueFamily`), and picks
+  the best survivor by `RankPhysicalDeviceType` — discrete GPU ranked
+  best (0), integrated next (1), everything else (virtual GPU, CPU,
+  unknown) tied for last (2). No ray tracing, no mesh shaders, no
+  feature negotiation of any kind — exactly the minimal policy M8A
+  asked for. Asserts if nothing qualifies at all (there is no
+  "gracefully render nothing" fallback for a bring-up demo with no
+  renderer). The ranking and queue-family-selection functions take
+  already-queried Vulkan structs as plain data and make no Vulkan API
+  calls themselves, so both are unit-tested directly with synthetic
+  data in `tests/vulkan_tests.cpp` — genuinely exercised, not just
+  exercised indirectly through the hardware demo.
+- **Queue selection**: only a graphics-capable queue family is found;
+  M8A deliberately does not assume a present queue exists or is the
+  same family, since there is no `VkSurfaceKHR` yet to query
+  presentation support against. `VkPhysicalDeviceQueueFamilyProperties`
+  don't answer "can this present to *this* surface" — that question
+  only exists once a surface does. Finding (and possibly needing to
+  fall back to a *different* family for) present support is explicitly
+  deferred to whichever M8 sub-milestone adds a swapchain.
+- **Device ownership**: `VulkanDevice` (also private,
+  `engine/rendering/src/vulkan/`) owns one `VkDevice` and its graphics
+  `VkQueue` (queues are retrieved handles, not separately destroyed —
+  destroying the device is what invalidates them). Same RAII, same
+  non-copyable/non-movable discipline as `VulkanInstance`. No device
+  extensions are enabled and no optional features are requested —
+  `VK_KHR_swapchain` in particular stays out until a swapchain
+  milestone genuinely needs it, per the M8A brief.
+- **Exact destruction order**, confirmed by both the type system and a
+  successful real run: `VulkanDevice` and `VulkanInstance` are ordinary
+  local RAII objects in `arengine_vulkan_demo`'s `main()`, `VulkanDevice`
+  constructed after `VulkanInstance` — so at the end of `main()`, C++
+  destroys `VulkanDevice` first (`vkDestroyDevice`), then
+  `VulkanInstance` (whose own destructor destroys the debug messenger
+  before the `VkInstance` itself). This matches the brief's required
+  order exactly: device → debug messenger → instance. Nothing that
+  depends on a `VkDevice` is ever destroyed after it; nothing that
+  depends on the `VkInstance` (the messenger) is ever destroyed after
+  it either.
+- **`RenderDevice` relationship — Option B chosen**: `VulkanInstance`/
+  `VulkanDevice`/`SelectPhysicalDevice` do **not** implement
+  `Rendering::RenderDevice` and are not reachable through
+  `CreateNullRenderDevice`-style public factories. They are private
+  Rendering infrastructure, exercised only by
+  `tests/vulkan_demo.cpp` reaching directly into
+  `engine/rendering/src/vulkan/` (a deliberate, temporary exception —
+  the same kind of "trusted, in-tree" access tests already have to
+  concrete backend types like `NullRenderDevice`). Option A (a
+  `VulkanRenderDevice` implementing the full interface with
+  buffer/draw operations explicitly unsupported) was rejected: it would
+  mean shipping a `RenderDevice` that mostly doesn't work, and the M8A
+  brief explicitly forbids faking success — better to have no
+  `VulkanRenderDevice` at all yet than a dishonest one. A real
+  `VulkanRenderDevice` is added once a later M8 sub-milestone has enough
+  real Vulkan capability (command buffers, memory allocation) to
+  implement `CreateBuffer`/`SubmitDraw` honestly.
+- **`Runtime` untouched.** `NullRenderDevice` remains Runtime's only
+  backend; nothing about M8A changes what `AREngineSandbox.exe` does,
+  confirmed by an unchanged manual run after this milestone's work.
+  Vulkan initialization failure — a real possibility on unusual
+  hardware/driver combinations — stays fully isolated in the standalone
+  demo while this code is new, per the brief.
+- **A build-system caveat, not a code defect, worth recording**: the
+  pure-logic Vulkan tests (`tests/vulkan_tests.cpp`) call zero real
+  Vulkan API functions, but they still link the whole
+  `AREngine::Rendering` library, which *does* contain object code that
+  calls real Vulkan functions (`VulkanInstance.cpp`, etc.) — so the
+  resulting test executable still carries a load-time dependency on the
+  Vulkan loader DLL, even though the test itself never exercises it.
+  Splitting the pure-logic helpers into a wholly separate library target
+  (with no link dependency on the Vulkan loader at all) would remove
+  this, but was judged not worth the added build-system complexity for
+  M8A — the practical goal ("don't require a Vulkan-*capable GPU* for
+  normal `ctest`") is still met, since these tests make no hardware-
+  dependent calls; only the narrower, less likely scenario of "loader
+  DLL present but zero usable devices" isn't fully decoupled. Documented
+  here rather than solved, in case it becomes worth revisiting later.
+
+No other architectural issues were discovered — the manual bring-up
+succeeded on the first real run (instance, validation, device selection,
+logical device, and queue all worked correctly the first time they were
+exercised against real hardware).
+
+### Making Vulkan Optional
+
+Added immediately after M8A, before M8B, in response to a fair concern:
+the initial M8A implementation made `find_package(Vulkan REQUIRED)`
+unconditional, meaning a machine without the Vulkan SDK could not
+configure *any* part of AREngine — including all the Null-backend,
+non-Vulkan work from M0–M7. Fixed with one new top-level option:
+
+```
+option(ARENGINE_ENABLE_VULKAN "Build Vulkan support (requires the Vulkan SDK)" ON)
+```
+
+Default `ON`, since the SDK is now installed on this development
+machine and that preserves M8A's existing behavior by default. When
+`OFF`: `engine/rendering/CMakeLists.txt` never calls
+`find_package(Vulkan)` at all, none of `src/vulkan/`'s five source
+files are added to `arengine_rendering`'s sources, and no link against
+`Vulkan::Vulkan` happens — `arengine_rendering` becomes exactly the
+`NullRenderDevice`-only library it was before M8A existed. The same
+`ARENGINE_ENABLE_VULKAN` check in `tests/CMakeLists.txt` skips
+registering `arengine_vulkan_tests`/`arengine_vulkan_demo` entirely
+(not "build them but skip running them" — they are never added as
+CMake targets at all when Vulkan is disabled).
+
+No dummy/stub Vulkan types were introduced for the disabled case —
+there was no need to: since the `.cpp`/`.hpp` files under
+`src/vulkan/` simply aren't compiled when the option is `OFF`, nothing
+elsewhere in the codebase references a Vulkan type at all in that
+configuration, so there is nothing to stub out.
+
+Both configurations were verified in separate build directories:
+`ARENGINE_ENABLE_VULKAN=ON` (default) — full build, `ctest` 9/9
+including `VulkanTests`, `arengine_vulkan_demo` unchanged from its
+original M8A run. `ARENGINE_ENABLE_VULKAN=OFF` — configure produces no
+Vulkan-related output at all (confirming `find_package` was never
+invoked), full build succeeds with `arengine_vulkan_tests`/
+`arengine_vulkan_demo` absent from the target list entirely, and
+`ctest` reports 8/8 (one fewer than the Vulkan-enabled configuration,
+exactly the missing `VulkanTests`), including `RenderingTests` passing
+— confirming `NullRenderDevice` needs nothing Vulkan-related to build
+or run correctly.

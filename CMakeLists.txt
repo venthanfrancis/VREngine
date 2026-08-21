@@ -17,6 +17,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 option(ARENGINE_BUILD_EDITOR  "Build the AREngine editor application"       ON)
 option(ARENGINE_BUILD_SANDBOX "Build the AREngine sandbox test application" ON)
 option(ARENGINE_BUILD_TESTS   "Build AREngine unit tests"                   ON)
+option(ARENGINE_ENABLE_VULKAN "Build Vulkan support (requires the Vulkan SDK)" ON)
 
 # Engine modules (core, frame, platform, rendering, scene, assets, input, xr).
 add_subdirectory(engine)
