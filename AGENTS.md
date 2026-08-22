@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A and M8B (Vulkan bring-up + presentation) complete.** `Core`
+**M0 through M7 complete; M8A, M8B, and M8C (Vulkan bring-up + presentation + first triangle) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -61,13 +61,33 @@ real validation-layer errors were found and fixed during M8B
 and a minimize-transition race) — see `docs/ARCHITECTURE.md` Section 17
 for details; the final run has zero validation errors/warnings.
 
-There is still no real rendering output beyond a clear color, no frame
-limiting, no pipeline/shader API, no ECS/component system, no real
-mesh/texture/image format parsing, and no analog/XR/controller input —
-see Sections 11–15. Everything else (`XR`, `Editor`) is still an
-M0-style stub with no functionality. Next up is M8C+ (command
-buffers/render pass, shaders, first triangle). See `docs/ROADMAP.md`
-for the full plan.
+**M8C adds AREngine's first triangle** on top of M8B: Rendering's
+Vulkan backend gained `VulkanShaderModule` (loads a compiled SPIR-V
+`.spv` into a `VkShaderModule`), `VulkanRenderPass` (one color
+attachment, cleared on load, presentable on completion — no depth, no
+MSAA), `VulkanFramebuffers` (one per swapchain image view,
+recreated alongside the swapchain), and `VulkanGraphicsPipeline` (empty
+pipeline layout, dynamic viewport/scissor, no vertex input state). Two
+GLSL shaders (`engine/rendering/src/vulkan/shaders/triangle.vert/.frag`)
+are compiled to SPIR-V by CMake via `glslc` automatically as part of
+the build — nothing manual, no hard-coded SDK path. The vertex shader
+generates its 3 positions from `gl_VertexIndex`; **there is still no
+vertex buffer** — that's M8D. `VulkanImageBarrier`, M8B's manual
+clear-image machinery, was deleted (the render pass now performs the
+same clear/layout-transition work). `tests/vulkan_present_demo.cpp` now
+draws one RGB-interpolated triangle over the same teal background every
+frame, still surviving resize/minimize exactly as in M8B. Zero
+validation errors on the final run — see `docs/ARCHITECTURE.md` Section
+18 for full details, including why a traditional `VkRenderPass` was
+chosen over Vulkan 1.3 dynamic rendering (AREngine targets 1.2).
+
+There is still no vertex/index buffer, no mesh abstraction, no texture,
+no descriptor sets, no uniform buffers, no camera, no depth buffer, no
+frame limiting, no ECS/component system, no real mesh/texture/image
+format parsing, and no analog/XR/controller input — see Sections 11–15.
+Everything else (`XR`, `Editor`) is still an M0-style stub with no
+functionality. Next up is M8D+ (vertex/index buffers, then a textured
+mesh). See `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -75,10 +95,10 @@ for the full plan.
    `docs/ROADMAP.md` before adding functionality to a module.
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
-3. **Vulkan bring-up + presentation only (M8A/M8B)**: no shaders, no
-   pipeline, no triangle yet — see `docs/ROADMAP.md`'s M8C+ row for
-   what's still pending within M8. **No OpenXR code** before milestone
-   M9.
+3. **Vulkan bring-up + presentation + first triangle only (M8A/M8B/
+   M8C)**: no vertex/index buffers, no mesh, no texture, no camera yet
+   — see `docs/ROADMAP.md`'s M8D+ row for what's still pending within
+   M8. **No OpenXR code** before milestone M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

@@ -1375,3 +1375,262 @@ validation errors already described (each found via real hardware
 validation-layer output during development, and fixed before the
 milestone's final run) — every other piece of M8B's design worked as
 planned on the first real run.
+
+## 18. M8C Implementation Notes
+
+M8C renders AREngine's first real triangle: a fixed-function graphics
+pipeline (vertex shader → rasterizer → fragment shader) draws 3
+vertices, generated inside the vertex shader itself from
+`gl_VertexIndex`, into a render pass over the swapchain image M8B was
+already clearing. No vertex buffer, no mesh, no camera, no material
+system — exactly the minimum needed to prove shaders + pipeline +
+rasterization + fragment output work end to end.
+
+### Shader Language / Toolchain (M8C)
+
+GLSL compiled to SPIR-V via `glslc` (part of the Vulkan SDK) — no
+strong reason to reach for anything else at this scale. Two shader
+source files live at `engine/rendering/src/vulkan/shaders/triangle.vert`
+and `triangle.frag`, both plain `#version 450` GLSL with no includes or
+preprocessor tricks.
+
+### SPIR-V Build Path (M8C)
+
+`engine/rendering/CMakeLists.txt`, inside the existing
+`ARENGINE_ENABLE_VULKAN` block, locates `glslc` two ways: first by
+reusing `Vulkan_GLSLC_EXECUTABLE` if CMake's `FindVulkan` module already
+populated it (it does, on the CMake version this project was verified
+against), falling back to `find_program(... HINTS
+"$ENV{VULKAN_SDK}/Bin")` for older CMake versions where `FindVulkan`
+doesn't locate SDK tools. Either path is fully SDK/CMake-discoverable —
+no hard-coded SDK version or install path anywhere. If neither finds
+`glslc`, configuration fails immediately with a clear
+`message(FATAL_ERROR ...)` rather than failing obscurely at link time.
+
+Each `.vert`/`.frag` source gets one `add_custom_command` that invokes
+`glslc <source> -o <output>.spv` into `${CMAKE_BINARY_DIR}/shaders/`
+(a single config-independent location — this project uses a multi-config
+generator, so this avoids duplicating identical SPIR-V per Debug/
+Release). A `DEPENDS` on the GLSL source means editing a shader and
+rebuilding is enough — nothing manual, matching the "do not require the
+user to compile shaders themselves" requirement. All the outputs are
+gathered under one `arengine_shaders` custom target, which
+`arengine_rendering` depends on (`add_dependencies`) — so building the
+engine (or the demo, which links the engine) always compiles current
+shaders first. `VulkanGraphicsPipeline.cpp` — the one file that actually
+loads them — learns where to find them via a single private compile
+definition, `ARENGINE_SHADER_DIR`, set only on `arengine_rendering`
+(never propagated to consumers, never appearing in a public header).
+
+This added a small but real amount of build-system complexity (a
+custom-command loop plus a custom target) — judged worth it here rather
+than over-engineered, since the alternative (asking the user to run
+`glslc` by hand before every build) was explicitly ruled out by the
+brief, and the actual CMake involved is about 30 lines, not a shader
+build framework.
+
+### Render Pass vs. Dynamic Rendering (M8C)
+
+**Traditional `VkRenderPass` + `VkFramebuffer`**, not Vulkan 1.3 dynamic
+rendering. AREngine targets Vulkan 1.2 (`kTargetApiVersion`, set in
+M8A) for broad hardware compatibility; dynamic rendering is core in 1.3
+and only available earlier via the optional `VK_KHR_dynamic_rendering`
+extension, which would have to be queried and could be absent on
+targeted hardware. The brief was explicit: don't require an optional
+feature merely to avoid writing a render pass. A render pass this small
+(one color attachment, one subpass, no depth) is not meaningfully more
+code than the dynamic-rendering equivalent would be, so there was no
+real cost to picking the more broadly compatible option.
+
+### Pipeline Layout (M8C)
+
+Empty (`VkPipelineLayoutCreateInfo{}` with every count left at its
+zero-initialized default): no descriptor set layouts, no push-constant
+ranges. Nothing in M8C's shaders declares a `uniform`, a sampler, or a
+push-constant block, so there's nothing for a layout to describe yet.
+No future descriptor architecture was speculated about or partially
+built.
+
+### Viewport / Scissor Strategy (M8C)
+
+**Dynamic** (`VK_DYNAMIC_STATE_VIEWPORT` + `VK_DYNAMIC_STATE_SCISSOR`) —
+core Vulkan 1.0 state, no extension or optional feature needed at
+AREngine's target API version. `VulkanGraphicsPipeline`'s
+`VkPipelineViewportStateCreateInfo` only sets `viewportCount`/
+`scissorCount` to 1; the actual `VkViewport`/`VkRect2D` values are
+recorded fresh every frame in `vulkan_present_demo.cpp` via
+`vkCmdSetViewport`/`vkCmdSetScissor`, sized from the swapchain's
+*current* extent. This is precisely why the pipeline itself never needs
+recreating on resize — only `VulkanFramebuffers` does (see below). The
+alternative (baking a fixed viewport into the pipeline and recreating
+the whole pipeline on every resize) would work too, but dynamic state
+is the smaller, more obviously correct choice at this scale, so nothing
+more general was built.
+
+### Swapchain-Dependent Pipeline Resources (M8C)
+
+Three new Vulkan-private object owners, with three different lifetimes
+relative to the swapchain:
+
+- **`VulkanRenderPass`** depends only on the swapchain's *format*
+  (`VkFormat`), which is chosen once by `ChooseSurfaceFormat` and never
+  changes across a resize on a given device/surface pair. **Does not
+  need to be recreated.**
+- **`VulkanGraphicsPipeline`** depends on render-pass compatibility
+  (same format) and uses dynamic viewport/scissor, so it has no baked-in
+  dependency on extent either. **Does not need to be recreated.**
+- **`VulkanFramebuffers`** wraps one `VkFramebuffer` per swapchain image
+  view, sized to the swapchain's *extent*. Both of those change on
+  every swapchain recreation. **Must be destroyed and rebuilt every
+  time**, using the same destroy-then-reconstruct policy
+  `VulkanSwapchain` itself already established in M8B.
+
+`vulkan_present_demo.cpp`'s `recreateSwapchain()` reflects exactly this:
+it destroys and rebuilds `framebuffers` (before) and `swapchain`, but
+never touches `renderPass` or `pipeline`. This is the "don't blindly
+recreate every Vulkan object" the brief asked for, applied literally —
+correctness came first (framebuffers destroyed before the image views
+they reference, per the general Vulkan lifetime rule that a bound
+resource must not be destroyed while something still references it),
+and it turned out the minimal-correct answer was also the cheap one.
+
+### Command Recording Sequence (M8C)
+
+Per frame, inside the single primary command buffer already established
+in M8B:
+
+```
+vkResetCommandBuffer → vkBeginCommandBuffer
+    → vkCmdBeginRenderPass (attachment cleared to the same background
+      color M8B used, via loadOp=CLEAR — see "Clear Color" below)
+    → vkCmdSetViewport, vkCmdSetScissor (current swapchain extent)
+    → vkCmdBindPipeline (the one VulkanGraphicsPipeline)
+    → vkCmdDraw(3, 1, 0, 0)
+    → vkCmdEndRenderPass
+→ vkEndCommandBuffer → vkQueueSubmit → vkQueuePresentKHR
+```
+
+M8B's manual `VkImageMemoryBarrier` pair (`VulkanImageBarrier.hpp/.cpp`)
+and its `vkCmdClearColorImage` call are gone entirely — deleted, not
+left dead — because the render pass now performs both jobs itself: the
+color attachment's `loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR` is the clear,
+and the attachment's `initialLayout`/`finalLayout` plus one
+`VkSubpassDependency` (external → subpass 0, gating on
+`VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT`) perform the same
+`UNDEFINED → COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR` transitions the
+manual barriers used to. There is exactly one clear path now, not two
+competing ones. The frame's submit wait-stage changed to match:
+`VK_PIPELINE_STAGE_TRANSFER_BIT` (M8B, for the old transfer-based clear)
+→ `VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT` (M8C, matching the
+subpass dependency).
+
+### Why gl_VertexIndex Instead Of A Vertex Buffer (M8C)
+
+`triangle.vert` looks up its 3 output positions (and a color per
+vertex, purely to make fragment interpolation visibly provable) from
+two small local arrays indexed by `gl_VertexIndex` — no
+`VkVertexInputBindingDescription`, no `VkVertexInputAttributeDescription`,
+no `VkBuffer`, no device memory allocation at all.
+`vkCmdDraw(commandBuffer, 3, 1, 0, 0)` needs nothing bound to produce
+those 3 vertices. This was the brief's explicit instruction, and the
+reasoning holds up: M8C's actual goal is proving the pipeline
+(shaders → rasterizer → fragment output) works, and a vertex buffer is
+an orthogonal concern — memory allocation, upload, binding — that would
+add real complexity without helping prove the pipeline. Deferring it to
+M8D keeps M8C's diff to exactly what it claims to be. Since generating a
+`vec2`/`vec3` per index needs no additional pipeline state (no vertex
+input state beyond the empty `VkPipelineVertexInputStateCreateInfo{}`),
+this cleanly requires nothing more of `VulkanGraphicsPipeline` than the
+shaders themselves already express.
+
+### Pipeline Ownership (M8C)
+
+`VulkanGraphicsPipeline` (owns `VkPipelineLayout` + `VkPipeline`),
+`VulkanRenderPass` (owns `VkRenderPass`), and `VulkanFramebuffers` (owns
+the `VkFramebuffer`s) are all private to Rendering's Vulkan backend,
+under `engine/rendering/src/vulkan/`, exactly like every Vulkan object
+owner since M8A. **No `PipelineHandle` or equivalent was added to the
+public `Rendering` API.** M4 explicitly deferred designing a generic
+pipeline abstraction until there was real Vulkan evidence to design it
+from; one triangle, with no material variation, no shader permutation,
+and no second pipeline to compare it against, is evidence that *a*
+pipeline concept will eventually need a public shape, but not nearly
+enough evidence to guess correctly at what that shape is. `VkShaderModule`
+in particular never escapes `VulkanShaderModule`/`VulkanGraphicsPipeline`
+— it doesn't even outlive `VulkanGraphicsPipeline`'s constructor, since
+nothing about a `VkPipeline` needs its source shader modules once
+`vkCreateGraphicsPipelines` returns.
+
+### Clear Color
+
+Unchanged from M8B: the same fixed teal (`kClearColor` in
+`vulkan_present_demo.cpp`) is still what the background clears to —
+only *how* it's applied changed (render pass `loadOp`, not
+`vkCmdClearColorImage`; see "Command Recording Sequence" above).
+
+### Exact Destruction Order (M8C addendum)
+
+Extends M8B's order exactly at one point: **framebuffers → pipeline →
+render pass → swapchain**, inserted between "command/sync resources"
+and "device" in M8B's original chain (GPU idle → command/sync resources
+→ **framebuffers → pipeline → render pass** → image views/swapchain →
+device → surface → debug messenger → instance). Confirmed by C++ local
+destruction order in `vulkan_present_demo.cpp` (`swapchain`,
+`renderPass`, `pipeline`, `framebuffers` are declared in that order, so
+they're destroyed in the reverse) and by a clean real shutdown with no
+validation errors.
+
+### NullRenderDevice / Runtime
+
+Both untouched, exactly as the brief required.
+`engine/rendering/src/NullRenderDevice.cpp` was not modified; its tests
+(`RenderingTests`) still pass unchanged. `AREngineSandbox.exe` still
+runs on `NullRenderDevice` — no Vulkan pipeline concept was forced into
+it. `arengine_vulkan_present_demo` remains the only place M8C's new
+types are exercised.
+
+### Validation Results (M8C)
+
+`ARENGINE_ENABLE_VULKAN=ON` (default): full `/W4 /WX` clean build
+(including shader compilation), `ctest` 9/9. `ARENGINE_ENABLE_VULKAN=OFF`:
+configuration performs no `glslc` lookup and no shader compilation at
+all, full build succeeds with no Vulkan/shader targets present, `ctest`
+8/8 (no `VulkanTests`).
+
+`arengine_vulkan_present_demo` run against real hardware (NVIDIA GeForce
+RTX 3060 Laptop GPU): window opens, teal background visible, one
+RGB-interpolated triangle visible centered on screen (confirmed by
+screenshot), survives two resizes and two full minimize/restore cycles
+with the triangle correctly re-centered/scaled after each recreation
+(framebuffers rebuilt, pipeline and render pass untouched, exactly as
+designed), closes cleanly via the window's close button. **Zero
+validation errors or warnings** — unlike M8B, no real validation issue
+was hit during M8C's development; the render pass's subpass dependency
+and the framebuffer-before-swapchain destruction order were both
+correct on the first real run.
+
+- Shader compiler/tool used: **`glslc`** (Vulkan SDK 1.4.357.0 on the
+  development machine, but not version-pinned by the build)
+- Shader files generated: **`triangle.vert.spv`**, **`triangle.frag.spv`**
+  (into `${CMAKE_BINARY_DIR}/shaders/`)
+- Render-pass vs. dynamic-rendering decision: **traditional
+  `VkRenderPass` + `VkFramebuffer`** (see above)
+- Pipeline recreation behavior: **render pass and pipeline are never
+  recreated on resize; only framebuffers are** (see "Swapchain-Dependent
+  Pipeline Resources (M8C)")
+
+### What's Deferred to M8D+
+
+No vertex/index buffers, no mesh abstraction, no textures, no descriptor
+sets, no uniform buffers, no push constants, no camera, no transforms
+sent to the GPU, no depth buffer, no Scene rendering, no Assets
+integration, no OpenXR, no lighting, no PBR, no material system, no
+VMA, no render graph. `VulkanGraphicsPipeline` is Vulkan-private and
+expected to be revisited once M8D's real vertex-buffer work gives enough
+evidence to design a generic pipeline/material shape — not before.
+
+No other architectural issues were discovered — every part of M8C's
+design (the render pass's implicit layout transitions, the
+framebuffer/pipeline/render-pass lifetime split, dynamic viewport/
+scissor across resize) worked correctly on the first real hardware run,
+with zero validation warnings to investigate.

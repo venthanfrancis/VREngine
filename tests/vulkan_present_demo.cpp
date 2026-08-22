@@ -1,14 +1,18 @@
-// Manual M8B validation demo — NOT part of the automated CTest suite,
+// Manual M8C validation demo — NOT part of the automated CTest suite,
 // since it requires a real Vulkan-capable GPU/driver and opens a real
 // window, neither of which CI/headless systems have. Built by CMake
 // but deliberately not registered with add_test. Run it manually.
 //
-// Proves the M8B presentation path end to end: AREngine Window ->
-// VkSurfaceKHR -> presentation-capable physical device -> logical
-// device with graphics+present queues -> swapchain -> acquire -> clear
-// -> present, repeated every frame until the window closes, handling
-// resize/minimize along the way. Deliberately draws NO triangle - see
-// docs/ROADMAP.md, M8B.
+// Extends M8B's presentation path with AREngine's first real graphics
+// pipeline: AREngine Window -> VkSurfaceKHR -> presentation-capable
+// physical device -> logical device with graphics+present queues ->
+// swapchain -> acquire -> [render pass: clear background, draw one
+// triangle] -> present, repeated every frame until the window closes,
+// handling resize/minimize along the way. The triangle's 3 positions
+// come from the vertex shader's gl_VertexIndex, not a vertex buffer -
+// see docs/ARCHITECTURE.md, "Why gl_VertexIndex Instead Of A Vertex
+// Buffer (M8C)". No mesh/material/camera/depth - see docs/ROADMAP.md,
+// M8C.
 //
 // This demo reaches directly into Rendering's private src/vulkan/
 // implementation (not through any public Rendering API), same as
@@ -21,10 +25,12 @@
 
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
-#include "vulkan/VulkanImageBarrier.hpp"
+#include "vulkan/VulkanFramebuffers.hpp"
+#include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
+#include "vulkan/VulkanRenderPass.hpp"
 #include "vulkan/VulkanResult.hpp"
 #include "vulkan/VulkanSurface.hpp"
 #include "vulkan/VulkanSwapchain.hpp"
@@ -48,9 +54,10 @@ namespace
     // work. See docs/ARCHITECTURE.md, "Synchronization Model (M8B)".
     constexpr int kMaxFramesInFlight = 2;
 
-    // A visible, non-black color so a human can immediately confirm
-    // presentation is working - AREngine blue-ish teal, not anything
-    // meaningful beyond "clearly not a blank/garbage window".
+    // The render pass's background clear color - a visible, non-black
+    // color so a human can immediately confirm presentation is working
+    // and see the triangle stand out against it. AREngine blue-ish
+    // teal, not anything meaningful beyond that.
     constexpr VkClearColorValue kClearColor{{0.06f, 0.30f, 0.42f, 1.0f}};
 
     // Per frame-in-flight: waited/signaled by that frame's own
@@ -85,7 +92,7 @@ namespace
 int main()
 {
     Platform::WindowDesc desc;
-    desc.title = "AREngine M8B Vulkan Presentation Demo";
+    desc.title = "AREngine M8C Vulkan Triangle Demo";
     desc.width = 1280;
     desc.height = 720;
     auto window = Platform::CreateAppWindow(desc);
@@ -124,6 +131,18 @@ int main()
     AR_LOG_INFO(std::format("Swapchain image format: {}", static_cast<int>(swapchain->GetImageFormat())));
     AR_LOG_INFO(std::format("Swapchain extent: {}x{}", swapchain->GetExtent().width, swapchain->GetExtent().height));
     AR_LOG_INFO(std::format("Swapchain image count: {}", swapchain->GetImageCount()));
+
+    // renderPass/pipeline depend only on the swapchain's FORMAT, which
+    // doesn't change across a resize - so, unlike the swapchain itself,
+    // neither needs to be recreated in recreateSwapchain() below. Only
+    // framebuffers (which wrap image views + extent) does. See
+    // docs/ARCHITECTURE.md, "Swapchain-Dependent Pipeline Resources
+    // (M8C)".
+    VulkanRenderPass renderPass(device.Get(), swapchain->GetImageFormat());
+    VulkanGraphicsPipeline pipeline(device.Get(), renderPass.Get());
+
+    auto framebuffers = std::make_unique<VulkanFramebuffers>(
+        device.Get(), renderPass.Get(), swapchain->GetImageViews(), swapchain->GetExtent());
 
     VulkanCommandPool commandPool(device.Get(), physicalDevice.queueFamilies.graphicsFamily);
 
@@ -204,10 +223,17 @@ int main()
 
         vkDeviceWaitIdle(device.Get());
 
+        // Framebuffers before swapchain: they wrap the swapchain's
+        // image views, which must not be destroyed while a framebuffer
+        // built from them still exists. See docs/ARCHITECTURE.md,
+        // "Swapchain-Dependent Pipeline Resources (M8C)".
+        framebuffers.reset();
         swapchain.reset(); // destroy-before-construct: see VulkanSwapchain.hpp
         swapchain = std::make_unique<VulkanSwapchain>(
             physicalDevice.device, device.Get(), surface.Get(), physicalDevice.queueFamilies,
             window->GetWidth(), window->GetHeight());
+        framebuffers = std::make_unique<VulkanFramebuffers>(
+            device.Get(), renderPass.Get(), swapchain->GetImageViews(), swapchain->GetExtent());
 
         imagesInFlight.assign(swapchain->GetImageCount(), VK_NULL_HANDLE);
 
@@ -221,7 +247,7 @@ int main()
                                  swapchain->GetExtent().width, swapchain->GetExtent().height, swapchain->GetImageCount()));
     };
 
-    AR_LOG_INFO("AREngine M8B presentation demo: close the window to exit.");
+    AR_LOG_INFO("AREngine M8C triangle demo: close the window to exit.");
 
     int currentFrame = 0;
     while (!window->ShouldClose())
@@ -266,29 +292,61 @@ int main()
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         CheckVkResult(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
-        VkImage image = swapchain->GetImages()[imageIndex];
+        const VkExtent2D extent = swapchain->GetExtent();
 
-        RecordImageLayoutTransition(commandBuffer, image,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            0, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // Background clear + the layout transitions into and out of
+        // COLOR_ATTACHMENT_OPTIMAL/PRESENT_SRC_KHR all happen as part
+        // of the render pass itself now (loadOp=CLEAR, the attachment's
+        // initial/finalLayout - see VulkanRenderPass.cpp) - M8B's
+        // separate vkCmdClearColorImage + manual barrier pair is gone;
+        // there is exactly one clear path now, not two competing ones.
+        VkClearValue clearValue{};
+        clearValue.color = kClearColor;
 
-        VkImageSubresourceRange range{};
-        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        range.baseMipLevel = 0;
-        range.levelCount = 1;
-        range.baseArrayLayer = 0;
-        range.layerCount = 1;
-        vkCmdClearColorImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &kClearColor, 1, &range);
+        VkRenderPassBeginInfo renderPassBegin{};
+        renderPassBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassBegin.renderPass = renderPass.Get();
+        renderPassBegin.framebuffer = framebuffers->Get(imageIndex);
+        renderPassBegin.renderArea.offset = {0, 0};
+        renderPassBegin.renderArea.extent = extent;
+        renderPassBegin.clearValueCount = 1;
+        renderPassBegin.pClearValues = &clearValue;
 
-        RecordImageLayoutTransition(commandBuffer, image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        vkCmdBeginRenderPass(commandBuffer, &renderPassBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+        // Viewport/scissor are dynamic pipeline state (see
+        // VulkanGraphicsPipeline.cpp), set fresh every frame from the
+        // current swapchain extent - this is what lets the pipeline
+        // itself stay valid across a resize instead of needing
+        // recreation. See docs/ARCHITECTURE.md, "Viewport / Scissor
+        // Strategy (M8C)".
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(extent.width);
+        viewport.height = static_cast<float>(extent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+        VkRect2D scissor{};
+        scissor.offset = {0, 0};
+        scissor.extent = extent;
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
+
+        // No vertex buffer bound: triangle.vert generates its 3
+        // positions from gl_VertexIndex, so this draw call needs
+        // nothing but a vertex count. See docs/ARCHITECTURE.md, "Why
+        // gl_VertexIndex Instead Of A Vertex Buffer (M8C)".
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(commandBuffer);
 
         CheckVkResult(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
 
-        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.waitSemaphoreCount = 1;
@@ -326,9 +384,12 @@ int main()
     }
 
     // GPU idle before destroying anything - see docs/ARCHITECTURE.md,
-    // "Exact Destruction Order (M8B)". Everything else (sync objects,
-    // command pool, swapchain, device, surface, instance) unwinds
-    // automatically after this in reverse construction order.
+    // "Exact Destruction Order (M8B)" and "M8C Implementation Notes".
+    // Everything else (sync objects, command pool, framebuffers,
+    // pipeline, render pass, swapchain, device, surface, instance)
+    // unwinds automatically after this in reverse construction order -
+    // framebuffers before pipeline before render pass before swapchain,
+    // matching the dependency direction each was built in.
     vkDeviceWaitIdle(device.Get());
 
     for (FrameSyncObjects& sync : frameSync)

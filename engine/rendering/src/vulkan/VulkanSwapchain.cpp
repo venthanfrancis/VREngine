@@ -36,17 +36,17 @@ namespace AREngine::Rendering::Vulkan
         createInfo.imageColorSpace = surfaceFormat.colorSpace;
         createInfo.imageExtent = extent;
         createInfo.imageArrayLayers = 1;
-        // TRANSFER_DST: M8B clears the swapchain image directly via
-        // vkCmdClearColorImage, not a render pass - see
-        // docs/ARCHITECTURE.md, "Clearing (M8B)". COLOR_ATTACHMENT is
-        // also requested even though nothing renders to it yet: a
-        // VkImageView (below) requires the image it's a view of to
-        // have at least one of a small set of usage bits, none of
-        // which TRANSFER_DST is part of - found the hard way, as a
-        // real validation error, when M8B was first run against real
-        // hardware. COLOR_ATTACHMENT is also what M8C's render pass
-        // will need these images for anyway.
-        createInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // COLOR_ATTACHMENT: M8C's render pass renders (and clears) into
+        // these images directly - see docs/ARCHITECTURE.md, "Render
+        // Pass vs. Dynamic Rendering (M8C)". A VkImageView (below) also
+        // requires the image it's a view of to have at least one of a
+        // small set of usage bits, and COLOR_ATTACHMENT is one of them
+        // - M8B originally requested TRANSFER_DST for this reason
+        // (back when clearing was done via vkCmdClearColorImage, not a
+        // render pass); that usage is no longer needed now that M8C's
+        // render pass is the only clear path, so it was removed rather
+        // than kept as an unused leftover.
+        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         const std::vector<std::uint32_t> uniqueFamilies = GetUniqueQueueFamilies(queueFamilies);
         if (HasSeparatePresentQueue(queueFamilies))
