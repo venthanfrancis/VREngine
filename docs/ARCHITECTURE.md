@@ -1952,3 +1952,351 @@ No other architectural issues were discovered — vertex/index buffer
 creation, staging upload, and indexed drawing all worked correctly on
 the first real hardware run, with zero validation warnings to
 investigate.
+
+## 20. M8E Implementation Notes
+
+M8E adds real Vulkan texturing: a procedurally generated checkerboard
+image, uploaded to a `DEVICE_LOCAL` `VkImage`, sampled in the fragment
+shader through a descriptor set, and composited with the vertex colors
+M8D already established. The quad's shape/geometry is unchanged from
+M8D — only what gets drawn onto it is new.
+
+### Vertex Format (M8E)
+
+`Vertex` (`VulkanVertex.hpp/.cpp`) gained one field, `uv` (`Vec2`),
+after `color`:
+
+```cpp
+struct Vertex
+{
+    AREngine::Core::Math::Vec2 position;
+    AREngine::Core::Math::Vec3 color;
+    AREngine::Core::Math::Vec2 uv;
+};
+```
+
+`color` was kept (the brief allowed dropping it, but keeping it let the
+demo prove texture sampling and vertex-color interpolation compose
+correctly in the same draw — see "Shader Sampling Path" below).
+`GetAttributeDescriptions()` grew a third entry: location 2, `uv`,
+`VK_FORMAT_R32G32_SFLOAT`, offset via `offsetof(Vertex, uv)` — same
+pattern as position/color, still fully unit-tested (an existing M8D
+test was updated for 3 attributes instead of 2; a new location-2/format/
+offset check was added).
+
+### Checkerboard Generation Strategy (M8E)
+
+`GenerateCheckerboardRGBA8(width, height, tileSize)`
+(`VulkanCheckerboard.hpp/.cpp`) is pure logic — no Vulkan calls, no file
+I/O — producing tightly packed 8-bit RGBA pixels
+(`width * height * 4` bytes). A pixel is white
+(`{255,255,255,255}`) if `(x/tileSize + y/tileSize)` is even, black
+(`{0,0,0,255}`) otherwise; alpha is always fully opaque. Chosen over
+option B (a small local image file) specifically to avoid pulling in
+any image decoder — no stb_image, no PNG, no JPEG — which this
+milestone has no other reason to need. Directly unit-tested (byte size,
+adjacent-tile color difference, same-tile color equality, full opacity)
+without touching the GPU at all. The demo generates a 64×64 image with
+an 8×8-pixel tile size (8×8 tiles total).
+
+### Vulkan Image Ownership (M8E)
+
+`VulkanImage` (`VulkanImage.hpp/.cpp`) owns one `VkImage`, the
+`VkDeviceMemory` backing it, and one `VkImageView` over it — one mip
+level, one array layer, no mipmapping, same "one dedicated allocation,
+no VMA" discipline as `VulkanBuffer`. The `VkSampler` is deliberately
+**not** part of this class — see "Sampler Settings" below for why a
+separate `VulkanSampler` was the simpler choice. Never exposed outside
+Rendering's Vulkan backend.
+
+### Image Memory / Upload Path (M8E)
+
+Same staging pattern M8D established for buffers, applied to an image:
+`CreateTextureFromPixels` (`VulkanImage.cpp`) creates a temporary
+`HOST_VISIBLE | HOST_COHERENT` staging `VulkanBuffer`, copies the
+checkerboard pixels into it (`VulkanBuffer::CopyDataIn`, reused
+unchanged from M8D), creates a `DEVICE_LOCAL` `VulkanImage`
+(`VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT`), then
+on one synchronous one-time command buffer (`VulkanOneTimeCommands`,
+also reused unchanged): transitions the image to
+`TRANSFER_DST_OPTIMAL`, `vkCmdCopyBufferToImage`s the staging buffer
+into it, transitions it again to `SHADER_READ_ONLY_OPTIMAL`, then waits
+for completion (`EndOneTimeCommands`'s `vkQueueWaitIdle`, same
+"synchronous, documented limitation" as M8D's buffer uploads — see
+`docs/ARCHITECTURE.md` §19, "Synchronous Upload Limitation (M8D)",
+which applies identically here). The staging buffer is a plain local
+variable, destroyed automatically the moment the function returns — not
+kept alive past the upload.
+
+### Image Layout Transitions (M8E)
+
+`TransitionImageLayout` (`VulkanImageLayoutTransition.hpp/.cpp`)
+supports exactly two transitions, matching what a texture upload
+actually needs:
+
+| Transition | srcAccessMask | dstAccessMask | srcStage | dstStage |
+|---|---|---|---|---|
+| `UNDEFINED` → `TRANSFER_DST_OPTIMAL` | `0` | `TRANSFER_WRITE_BIT` | `TOP_OF_PIPE` | `TRANSFER` |
+| `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL` | `TRANSFER_WRITE_BIT` | `SHADER_READ_BIT` | `TRANSFER` | `FRAGMENT_SHADER` |
+
+Aspect mask is always `VK_IMAGE_ASPECT_COLOR_BIT`, one mip, one layer.
+Asserts on any other `(oldLayout, newLayout)` pair — this is
+deliberately not a generic parameterized barrier builder. M8B's
+`VulkanImageBarrier` (which *was* shaped that way) was already deleted
+in M8C once the render pass took over the swapchain image's
+transitions; M8E's texture upload is a genuinely different use case
+(a different image, different stages/access masks, transfer-then-
+sample rather than clear-then-present), so a fresh, narrower helper was
+written rather than reintroducing the old generic one.
+
+### Image View (M8E)
+
+One `VK_IMAGE_VIEW_TYPE_2D` view per texture, matching the image's
+format exactly, `VK_IMAGE_ASPECT_COLOR_BIT`, `baseMipLevel = 0` /
+`levelCount = 1`, `baseArrayLayer = 0` / `layerCount = 1` — no
+mipmapping, no array textures. Owned by `VulkanImage`, destroyed before
+the image it views (same "dependent object first" ordering as every
+other owned Vulkan pair in this backend).
+
+### Texture Format (M8E)
+
+`VK_FORMAT_R8G8B8A8_SRGB`. This texture holds color data meant to be
+*seen* (even though the checkerboard itself is just black/white) —
+sRGB tells the GPU to convert each sampled texel from sRGB gamma space
+to linear automatically (`texture(uTexture, uv)` returns already-
+linearized values), which is the physically correct way to filter and
+blend color/albedo data. A data texture that isn't meant to be
+perceived directly (a normal map, a roughness map, etc.) would instead
+use an `*_UNORM` format to keep its raw numeric values un-transformed —
+that distinction is explicitly out of scope for M8E (no normal maps
+exist yet), noted here only to explain why sRGB was the right choice
+for *this* texture specifically, not a blanket policy.
+
+### Sampler Settings (M8E)
+
+`VulkanSampler` (`VulkanSampler.hpp/.cpp`) is a separate class from
+`VulkanImage`, not merged into it: a sampler describes *how to read* an
+image, not the image data itself, and in a real engine a single sampler
+is commonly shared across many textures — keeping it independently
+constructible is the simpler design at this scale, not a premature
+"texture system." Settings:
+
+- `magFilter`/`minFilter`: `VK_FILTER_LINEAR` — smooth filtering, the
+  common default for a color texture (nearest would keep the
+  checkerboard's tile edges hard-pixelated; either would equally prove
+  sampling works, LINEAR was picked as the more broadly useful default
+  going forward).
+- `addressMode{U,V,W}`: `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` — the
+  demo's UVs span exactly `[0,1]` and never sample outside that range,
+  so tiling behavior is irrelevant either way *here*; CLAMP_TO_EDGE was
+  still chosen deliberately as the more broadly correct default for a
+  single, non-tiling texture (it avoids any wraparound sampling
+  artifact at the very edge texels under linear filtering, which REPEAT
+  would not).
+- `anisotropyEnable = VK_FALSE`, deliberately, even though the RTX 3060
+  supports anisotropic filtering — M8E states no requirement for it, so
+  it was not turned on just because the hardware could.
+- `maxLod = 0.0f`: no mipmaps exist (one level), so LOD never has
+  anywhere to move.
+
+### Descriptor Set Layout (M8E)
+
+M8E is the first milestone with any descriptor requirement at all.
+`VulkanDescriptorSetLayout` (`VulkanDescriptorSetLayout.hpp/.cpp`) owns
+one `VkDescriptorSetLayout` describing exactly one binding: binding 0,
+`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`, visible to
+`VK_SHADER_STAGE_FRAGMENT_BIT` only — matching triangle.frag's
+`layout(set = 0, binding = 0) uniform sampler2D uTexture`. Deliberately
+the smallest possible layout — no generic descriptor-layout builder, no
+bindless descriptors, no descriptor indexing.
+
+### Descriptor Pool/Set Ownership (M8E)
+
+`VulkanDescriptorPool` (`VulkanDescriptorPool.hpp/.cpp`) owns one
+`VkDescriptorPool` sized for exactly one combined-image-sampler
+descriptor and `maxSets = 1` — created **without**
+`VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT`, so its one
+allocated `VkDescriptorSet` is freed implicitly when the pool itself is
+destroyed, never individually. `Allocate(layout)` returns that one
+`VkDescriptorSet`, owned by the pool, not separately RAII-wrapped. A
+free function, `WriteCombinedImageSamplerDescriptor`, performs the one
+`vkUpdateDescriptorSets` call that points the set's binding 0 at the
+texture's image view + sampler (expecting
+`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, the layout
+`CreateTextureFromPixels` leaves the image in). One texture, one
+descriptor set, one write, for the whole demo's lifetime — no
+recycling, no per-frame allocator, no caching, exactly as the brief
+required.
+
+### Pipeline Layout Change (M8E)
+
+`VulkanGraphicsPipeline`'s constructor gained a third parameter,
+`VkDescriptorSetLayout descriptorSetLayout`, and its
+`VkPipelineLayoutCreateInfo` now sets `setLayoutCount = 1` /
+`pSetLayouts = &descriptorSetLayout` (M8C/M8D's empty layout is gone).
+Still no push constants. The pipeline itself remains swapchain-extent-
+independent (dynamic viewport/scissor, unchanged from M8C) and is still
+not recreated on resize.
+
+### Shader Sampling Path (M8E)
+
+`triangle.vert` gained `layout(location = 2) in vec2 inUV` and
+`layout(location = 1) out vec2 fragUV` (color stays at output location
+0). `triangle.frag` gained
+`layout(set = 0, binding = 0) uniform sampler2D uTexture` and now
+computes:
+
+```glsl
+outColor = texture(uTexture, fragUV) * vec4(fragColor, 1.0);
+```
+
+Multiplying by `fragColor` (rather than outputting the raw sample) was
+chosen deliberately — the brief allowed either — because it visibly
+proves both systems compose correctly in one draw: black checkerboard
+tiles stay black (anything × 0 = 0) while white tiles show the full
+per-vertex color gradient M8D already established, confirmed in the
+screenshot taken during validation.
+
+### Command Recording (M8E)
+
+Per-frame recording, extended from M8D:
+
+```
+vkCmdBeginRenderPass / vkCmdSetViewport / vkCmdSetScissor / vkCmdBindPipeline   (unchanged)
+    ↓
+vkCmdBindVertexBuffers   (unchanged)
+    ↓
+vkCmdBindIndexBuffer   (unchanged)
+    ↓
+vkCmdBindDescriptorSets(commandBuffer, GRAPHICS, pipeline.GetLayout(), 0, 1, &descriptorSet, 0, nullptr)   [NEW]
+    ↓
+vkCmdDrawIndexed(commandBuffer, 6, 1, 0, 0, 0)   (unchanged)
+    ↓
+vkCmdEndRenderPass   (unchanged)
+```
+
+No per-frame texture upload — the texture, sampler, and descriptor set
+are all created once before the render loop begins.
+
+### Resource Lifetime (M8E)
+
+Extends M8D's swapchain-dependent/not-dependent split with the new
+texture resources:
+
+- **Swapchain-dependent** (recreated on every resize):
+  `VulkanSwapchain` (images/views), `VulkanFramebuffers`.
+- **Not swapchain-dependent** (created once, survive every resize):
+  the vertex buffer, the index buffer, `VulkanGraphicsPipeline`,
+  `VulkanRenderPass` (both already established in M8C), and as of M8E:
+  the texture image, its image view, the sampler, and the descriptor
+  pool/set (unless the pipeline layout itself changes, which resizing
+  never does).
+
+A texture has no relationship to window size, same reasoning as M8D's
+geometry buffers — a checkerboard's pixels don't change because the
+window got bigger. `recreateSwapchain()` was extended with new
+swapchain-dependent objects (`VulkanFramebuffers`, already handled in
+M8C) but not touched for any texture/descriptor resource. Verified in
+practice: two resizes and two minimize/restore cycles during
+validation, with the textured quad correctly re-rendered every time and
+none of the texture/sampler/descriptor objects recreated, logged, or
+touched.
+
+### Generic TextureDesc/TextureHandle Review (M8E)
+
+Same situation as M8D's `BufferDesc` review: M8E's demo does **not**
+route through `RenderDevice`/`CreateTexture` — it reaches directly into
+Rendering's private `src/vulkan/` implementation, same as every Vulkan
+demo since M8A. So nothing *forced* a change. Answering the five
+questions anyway:
+
+1. **Does `TextureDesc` contain enough information?** No — it has
+   `width`, `height`, and `format` (currently only `RGBA8Unorm`), but
+   no mip-level count, no array-layer count, no usage flags (sampled
+   vs. render target vs. storage), and critically:
+2. **Is initial pixel data missing from the generic API?** Yes — same
+   gap as `BufferDesc`. There is no way to say "create this texture and
+   fill it with these pixels," which is exactly what
+   `CreateTextureFromPixels` does. This is now proven twice (buffers in
+   M8D, images in M8E) — a real, recurring pattern, not a one-off.
+3. **Should image creation and data upload remain separate?** Most
+   likely yes, for the same reason as `BufferDesc`'s answer: M8E's own
+   implementation already separates "create the image" (`VulkanImage`'s
+   constructor) from "upload data into it" (the staging/copy dance in
+   `CreateTextureFromPixels`), because upload carries real
+   synchronization considerations creation alone doesn't.
+4. **Can `TextureHandle` stay backend-neutral?** Yes, unaffected — same
+   reasoning as `BufferHandle`: it's an opaque id, and a future Vulkan
+   `RenderDevice` would map it to a `VulkanImage*`/`VulkanSampler*` pair
+   internally.
+5. **Are format names sufficiently backend-neutral?** Partially proven
+   inadequate: `TextureFormat::RGBA8Unorm` doesn't distinguish sRGB from
+   linear encoding, and M8E specifically needed
+   `VK_FORMAT_R8G8B8A8_SRGB`, not `_UNORM`. A generic `TextureFormat`
+   enum will eventually need to express that distinction (color data vs.
+   data textures use different encodings) — another real, now-
+   documented gap, not yet fixed.
+
+**No change was made to `TextureDesc.hpp` or `Handles.hpp`.** The gaps
+in points (1)/(2)/(5) are real and now evidenced twice over (buffers
+and textures both need initial-data upload; textures additionally need
+an sRGB/linear distinction `TextureFormat` doesn't have), but M8D
+already documented that one non-generic Vulkan backend isn't proof of
+the *right* shape for a generic upload API — M8E adds a second data
+point in the same direction without yet forcing the design question.
+Revisit both together once a real `VulkanRenderDevice` needs to answer
+this for real.
+
+### NullRenderDevice / Runtime
+
+Both untouched, exactly as the brief required. `RenderingTests` still
+pass unchanged; `AREngineSandbox.exe` still runs on `NullRenderDevice`.
+
+### Validation Results (M8E)
+
+`ARENGINE_ENABLE_VULKAN=ON` (default): full `/W4 /WX` clean build,
+`ctest` 9/9 (one M8D test updated for the new 3-attribute `Vertex`;
+3 new M8E pure-logic checks for the checkerboard generator).
+`ARENGINE_ENABLE_VULKAN=OFF`: full build succeeds, no Vulkan/shader
+targets present, `ctest` 8/8 (no `VulkanTests`).
+
+`arengine_vulkan_present_demo` run against real hardware (NVIDIA
+GeForce RTX 3060 Laptop GPU): window opens, a textured quad — an 8×8
+checkerboard multiplied by the M8D vertex-color gradient, confirming
+UV orientation is correct (a clean, undistorted grid, not mirrored or
+skewed) and that the descriptor-bound texture is genuinely being
+sampled (not a fallback/default color) — renders on the teal
+background, confirmed by screenshot both initially and after two
+resizes plus two full minimize/restore cycles (with the texture
+correctly re-rendered every time and never recreated), closes cleanly.
+**Zero validation errors or warnings** — nothing needed fixing during
+M8E's development; image memory binding, buffer/image usage flags,
+copy synchronization, the layout transition sequence, and object
+destruction were all correct on the first real hardware run.
+
+- Texture dimensions/format: **64×64, `VK_FORMAT_R8G8B8A8_SRGB`**
+  (16,384 bytes, tightly packed RGBA8)
+- Sampler settings: **`VK_FILTER_LINEAR`** (mag/min),
+  **`VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE`** (U/V/W),
+  **anisotropy disabled**, **`maxLod = 0`** (no mipmaps)
+- Descriptor layout/binding: **set 0, binding 0,
+  `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`, fragment stage only**
+- Image layout transition sequence: **`UNDEFINED` →
+  `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL`**
+
+### What's Deferred to M8F+
+
+No PNG/JPEG/stb_image decoding, no glTF, no `MeshAsset`, no material
+system, no normal maps, no mipmaps, no anisotropic filtering, no depth
+buffer, no camera, no transforms sent to the GPU, no Scene rendering,
+no PBR, no lighting, no OpenXR, no VMA, no bindless descriptors, no
+descriptor indexing, no texture streaming. `VulkanImage`/
+`VulkanSampler`/the descriptor infrastructure remain Vulkan-private,
+same reasoning as `VulkanGraphicsPipeline` (M8C) and `VulkanBuffer`
+(M8D) — one texture's worth of evidence is not enough to design a
+generic Texture/Material abstraction from.
+
+No other architectural issues were discovered — image creation, staging
+upload, layout transitions, descriptor binding, and textured indexed
+drawing all worked correctly on the first real hardware run, with zero
+validation warnings to investigate.

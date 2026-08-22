@@ -21,14 +21,15 @@ namespace AREngine::Rendering::Vulkan
     // its generic shape - see docs/ARCHITECTURE.md, "Pipeline Ownership
     // (M8C)".
     //
-    // No descriptor sets, no push constants (empty VkPipelineLayout).
-    // One vertex input binding, two attributes (position, color) -
+    // One descriptor set (the combined-image-sampler layout the caller
+    // passes in — see VulkanDescriptorSetLayout.hpp), no push constants.
+    // One vertex input binding, three attributes (position, color, uv) -
     // matches Vertex exactly (VulkanVertex.hpp/.cpp); M8C's
     // gl_VertexIndex-generated positions are gone as of M8D - see
-    // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)". Viewport and
-    // scissor are dynamic state, so this pipeline does not need to be
-    // recreated when the swapchain extent changes on resize - only
-    // VulkanFramebuffers does.
+    // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)" and "Pipeline
+    // Layout Change (M8E)". Viewport and scissor are dynamic state, so
+    // this pipeline does not need to be recreated when the swapchain
+    // extent changes on resize - only VulkanFramebuffers does.
     //
     // Independent of swapchain extent/image count, same as
     // VulkanRenderPass — does NOT need to be recreated on resize.
@@ -39,7 +40,7 @@ namespace AREngine::Rendering::Vulkan
     class VulkanGraphicsPipeline
     {
     public:
-        VulkanGraphicsPipeline(VkDevice device, VkRenderPass renderPass);
+        VulkanGraphicsPipeline(VkDevice device, VkRenderPass renderPass, VkDescriptorSetLayout descriptorSetLayout);
         ~VulkanGraphicsPipeline();
 
         VulkanGraphicsPipeline(const VulkanGraphicsPipeline&) = delete;

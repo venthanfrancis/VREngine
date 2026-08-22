@@ -13,9 +13,9 @@ namespace AREngine::Rendering::Vulkan
         return binding;
     }
 
-    std::array<VkVertexInputAttributeDescription, 2> Vertex::GetAttributeDescriptions()
+    std::array<VkVertexInputAttributeDescription, 3> Vertex::GetAttributeDescriptions()
     {
-        std::array<VkVertexInputAttributeDescription, 2> attributes{};
+        std::array<VkVertexInputAttributeDescription, 3> attributes{};
 
         attributes[0].binding = 0;
         attributes[0].location = 0;
@@ -26,6 +26,11 @@ namespace AREngine::Rendering::Vulkan
         attributes[1].location = 1;
         attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributes[1].offset = offsetof(Vertex, color);
+
+        attributes[2].binding = 0;
+        attributes[2].location = 2;
+        attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributes[2].offset = offsetof(Vertex, uv);
 
         return attributes;
     }

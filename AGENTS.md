@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A, M8B, M8C, and M8D (Vulkan bring-up + presentation + first triangle + vertex/index buffers) complete.** `Core`
+**M0 through M7 complete; M8A through M8E (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -105,13 +105,40 @@ isn't enough evidence to pick the right generic upload shape yet. Zero
 validation errors on the final run — see `docs/ARCHITECTURE.md`
 Section 19 for full details.
 
-There is still no mesh abstraction, no texture, no descriptor sets, no
-uniform buffers, no camera, no depth buffer, no frame limiting, no ECS/
-component system, no real mesh/texture/image format parsing, and no
-analog/XR/controller input — see Sections 11–15. Everything else (`XR`,
-`Editor`) is still an M0-style stub with no functionality. Next up is
-M8E+ (textures, then a textured mesh). See `docs/ROADMAP.md` for the
-full plan.
+**M8E adds real texturing** on top of M8D: Rendering's Vulkan backend
+gained `VulkanImage` (owns `VkImage`+`VkDeviceMemory`+`VkImageView`),
+`VulkanSampler` (kept separate from `VulkanImage` — a sampler is
+commonly shared across textures), `VulkanImageLayoutTransition`
+(a narrow helper for exactly the two transitions a texture upload
+needs — `UNDEFINED`→`TRANSFER_DST_OPTIMAL`→`SHADER_READ_ONLY_OPTIMAL`;
+not a revival of M8B's deleted generic `VulkanImageBarrier`),
+`VulkanDescriptorSetLayout`/`VulkanDescriptorPool` (one combined-image-
+sampler binding, one pool, one set — no descriptor recycling/caching),
+and `VulkanCheckerboard::GenerateCheckerboardRGBA8` (a pure-logic,
+unit-tested procedural test texture — no PNG/JPEG/stb_image). `Vertex`
+gained a `uv` field (location 2). `triangle.vert`/`.frag` now pass UVs
+through and sample `layout(set = 0, binding = 0) uniform sampler2D
+uTexture`, multiplying the sample by the M8D vertex-color gradient.
+Texture upload reuses M8D's staging-buffer pattern
+(`CreateTextureFromPixels`): CPU pixels → `HOST_VISIBLE|HOST_COHERENT`
+staging buffer → `vkCmdCopyBufferToImage` → `DEVICE_LOCAL` image,
+synchronously. `tests/vulkan_present_demo.cpp` now renders a 64×64
+checkerboard-textured quad — none of the texture/sampler/descriptor
+resources are swapchain-dependent, so `recreateSwapchain()` never
+touches them. M4's `TextureDesc`/`TextureHandle` were reviewed against
+this evidence (the same initial-data gap `BufferDesc` had, now proven
+twice, plus a newly found format gap — `TextureFormat` can't express
+sRGB vs. linear encoding) but deliberately left unchanged, for the same
+reason as M8D's `BufferDesc` review. Zero validation errors on the
+final run — see `docs/ARCHITECTURE.md` Section 20 for full details.
+
+There is still no mesh abstraction, no real image loading (PNG/JPEG/
+stb_image), no uniform buffers, no camera, no depth buffer, no frame
+limiting, no ECS/component system, and no analog/XR/controller input —
+see Sections 11–15. Everything else (`XR`, `Editor`) is still an
+M0-style stub with no functionality. Next up is M8F+ (real image
+loading, then a textured mesh). See `docs/ROADMAP.md` for the full
+plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -120,10 +147,10 @@ full plan.
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
 3. **Vulkan bring-up + presentation + first triangle + vertex/index
-   buffers only (M8A/M8B/M8C/M8D)**: no mesh abstraction, no texture,
-   no descriptor sets, no camera yet — see `docs/ROADMAP.md`'s M8E+ row
-   for what's still pending within M8. **No OpenXR code** before
-   milestone M9.
+   buffers + textures only (M8A–M8E)**: no mesh abstraction, no real
+   image loading, no uniform buffers, no camera yet — see
+   `docs/ROADMAP.md`'s M8F+ row for what's still pending within M8.
+   **No OpenXR code** before milestone M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

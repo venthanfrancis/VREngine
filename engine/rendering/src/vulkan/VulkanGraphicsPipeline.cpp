@@ -14,7 +14,7 @@
 
 namespace AREngine::Rendering::Vulkan
 {
-    VulkanGraphicsPipeline::VulkanGraphicsPipeline(VkDevice device, VkRenderPass renderPass)
+    VulkanGraphicsPipeline::VulkanGraphicsPipeline(VkDevice device, VkRenderPass renderPass, VkDescriptorSetLayout descriptorSetLayout)
         : m_device(device)
     {
         VulkanShaderModule vertModule(device, std::string(ARENGINE_SHADER_DIR) + "/triangle.vert.spv");
@@ -34,12 +34,12 @@ namespace AREngine::Rendering::Vulkan
 
         const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
 
-        // One binding, two attributes (position, color) - matches
+        // One binding, three attributes (position, color, uv) - matches
         // Vertex exactly (VulkanVertex.hpp/.cpp) and triangle.vert's
-        // `layout(location = 0/1) in ...` declarations. See
+        // `layout(location = 0/1/2) in ...` declarations. See
         // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)".
         const VkVertexInputBindingDescription bindingDescription = Vertex::GetBindingDescription();
-        const std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions = Vertex::GetAttributeDescriptions();
+        const std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = Vertex::GetAttributeDescriptions();
 
         VkPipelineVertexInputStateCreateInfo vertexInput{};
         vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -90,10 +90,14 @@ namespace AREngine::Rendering::Vulkan
         dynamicState.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
         dynamicState.pDynamicStates = dynamicStates.data();
 
-        // Empty: M8C needs no descriptor sets and no push constants -
-        // see docs/ARCHITECTURE.md, "Pipeline Layout (M8C)".
+        // One descriptor set layout (the combined-image-sampler layout
+        // from VulkanDescriptorSetLayout), no push constants - see
+        // docs/ARCHITECTURE.md, "Pipeline Layout (M8C)" and "Pipeline
+        // Layout Change (M8E)".
         VkPipelineLayoutCreateInfo layoutCreateInfo{};
         layoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutCreateInfo.setLayoutCount = 1;
+        layoutCreateInfo.pSetLayouts = &descriptorSetLayout;
 
         VkResult layoutResult = vkCreatePipelineLayout(device, &layoutCreateInfo, nullptr, &m_layout);
         CheckVkResult(layoutResult, "vkCreatePipelineLayout");

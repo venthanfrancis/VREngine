@@ -1,18 +1,18 @@
-// Manual M8D validation demo — NOT part of the automated CTest suite,
+// Manual M8E validation demo — NOT part of the automated CTest suite,
 // since it requires a real Vulkan-capable GPU/driver and opens a real
 // window, neither of which CI/headless systems have. Built by CMake
 // but deliberately not registered with add_test. Run it manually.
 //
-// Extends M8C's graphics pipeline with real GPU vertex/index buffers:
+// Extends M8D's vertex/index-buffer quad with a real sampled texture:
 // AREngine Window -> VkSurfaceKHR -> presentation-capable physical
 // device -> logical device with graphics+present queues -> swapchain
-// -> acquire -> [render pass: clear background, draw a quad from a
-// real vertex buffer + index buffer via vkCmdDrawIndexed] -> present,
+// -> acquire -> [render pass: clear background, draw a textured quad
+// via vkCmdDrawIndexed with a bound descriptor set] -> present,
 // repeated every frame until the window closes, handling resize/
-// minimize along the way. M8C's gl_VertexIndex-generated positions are
-// gone - see docs/ARCHITECTURE.md, "Vertex Buffer (M8D)" and "Index
-// Buffer (M8D)". No mesh/material/texture/camera/depth - see
-// docs/ROADMAP.md, M8D.
+// minimize along the way. The texture is a procedurally generated
+// checkerboard (no PNG/JPEG decoding) - see docs/ARCHITECTURE.md,
+// "Checkerboard Generation Strategy (M8E)". No mesh/material/model-
+// loading/camera/depth - see docs/ROADMAP.md, M8E.
 //
 // This demo reaches directly into Rendering's private src/vulkan/
 // implementation (not through any public Rendering API), same as
@@ -24,15 +24,20 @@
 #include "AREngine/Platform/Platform.hpp"
 
 #include "vulkan/VulkanBuffer.hpp"
+#include "vulkan/VulkanCheckerboard.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDescriptorPool.hpp"
+#include "vulkan/VulkanDescriptorSetLayout.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanFramebuffers.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
+#include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
 #include "vulkan/VulkanResult.hpp"
+#include "vulkan/VulkanSampler.hpp"
 #include "vulkan/VulkanSurface.hpp"
 #include "vulkan/VulkanSwapchain.hpp"
 #include "vulkan/VulkanSwapchainSupport.hpp"
@@ -94,7 +99,7 @@ namespace
 int main()
 {
     Platform::WindowDesc desc;
-    desc.title = "AREngine M8D Vulkan Vertex Buffer Demo";
+    desc.title = "AREngine M8E Vulkan Texture Demo";
     desc.width = 1280;
     desc.height = 720;
     auto window = Platform::CreateAppWindow(desc);
@@ -141,7 +146,13 @@ int main()
     // docs/ARCHITECTURE.md, "Swapchain-Dependent Pipeline Resources
     // (M8C)".
     VulkanRenderPass renderPass(device.Get(), swapchain->GetImageFormat());
-    VulkanGraphicsPipeline pipeline(device.Get(), renderPass.Get());
+
+    // One combined-image-sampler binding, matching triangle.frag's
+    // `layout(set = 0, binding = 0) uniform sampler2D uTexture`. See
+    // docs/ARCHITECTURE.md, "Descriptor Set Layout (M8E)".
+    VulkanDescriptorSetLayout descriptorSetLayout(device.Get());
+
+    VulkanGraphicsPipeline pipeline(device.Get(), renderPass.Get(), descriptorSetLayout.Get());
 
     auto framebuffers = std::make_unique<VulkanFramebuffers>(
         device.Get(), renderPass.Get(), swapchain->GetImageViews(), swapchain->GetExtent());
@@ -161,11 +172,16 @@ int main()
     //   |  /   |
     //   | /    |
     //   3 ---- 2
+    //
+    // UVs map each corner to the matching corner of the texture (0,0)
+    // top-left to (1,1) bottom-right - the same corner order as
+    // position, so the whole texture covers the whole quad exactly
+    // once, with no cropping or repetition.
     const std::vector<Vertex> vertices = {
-        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // 0
-        {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}}, // 1
-        {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // 2
-        {{-0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}}, // 3
+        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // 0
+        {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}}, // 1
+        {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}}, // 2
+        {{-0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}, // 3
     };
     const std::vector<std::uint32_t> indices = {0, 1, 2, 2, 3, 0};
 
@@ -179,6 +195,32 @@ int main()
                              vertices.size(), vertexBuffer->GetSize(), sizeof(Vertex)));
     AR_LOG_INFO(std::format("Index buffer: {} indices (uint32_t), {} bytes",
                              indices.size(), indexBuffer->GetSize()));
+
+    // A tiny procedural checkerboard - M8E's whole "texture asset",
+    // deliberately generated rather than decoded from a file (no PNG/
+    // JPEG support exists yet). Not swapchain-dependent - created once,
+    // survives every resize untouched, same as the vertex/index
+    // buffers above. See docs/ARCHITECTURE.md, "Resource Lifetime
+    // (M8E)".
+    constexpr std::uint32_t kTextureWidth = 64;
+    constexpr std::uint32_t kTextureHeight = 64;
+    constexpr std::uint32_t kTextureTileSize = 8;
+    const std::vector<std::uint8_t> checkerboardPixels =
+        GenerateCheckerboardRGBA8(kTextureWidth, kTextureHeight, kTextureTileSize);
+
+    auto texture = CreateTextureFromPixels(
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
+        kTextureWidth, kTextureHeight, checkerboardPixels.data());
+    VulkanSampler sampler(device.Get());
+    AR_LOG_INFO(std::format("Texture: {}x{} VK_FORMAT_R8G8B8A8_SRGB, {} bytes, {}x{} tile checkerboard",
+                             kTextureWidth, kTextureHeight, checkerboardPixels.size(),
+                             kTextureTileSize, kTextureTileSize));
+
+    // One pool, one set, one write - see docs/ARCHITECTURE.md,
+    // "Descriptor Pool/Set Ownership (M8E)".
+    VulkanDescriptorPool descriptorPool(device.Get());
+    VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
+    WriteCombinedImageSamplerDescriptor(device.Get(), descriptorSet, texture->GetView(), sampler.Get());
 
     std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
     {
@@ -281,7 +323,7 @@ int main()
                                  swapchain->GetExtent().width, swapchain->GetExtent().height, swapchain->GetImageCount()));
     };
 
-    AR_LOG_INFO("AREngine M8D vertex/index buffer demo: close the window to exit.");
+    AR_LOG_INFO("AREngine M8E texture demo: close the window to exit.");
 
     int currentFrame = 0;
     while (!window->ShouldClose())
@@ -372,12 +414,15 @@ int main()
 
         // Real geometry from real GPU buffers: bind the quad's vertex
         // buffer at binding 0 (matching Vertex::GetBindingDescription())
-        // and its index buffer, then draw indexed. See
-        // docs/ARCHITECTURE.md, "Indexed Draw Path (M8D)".
+        // and its index buffer, then the texture's descriptor set, then
+        // draw indexed. See docs/ARCHITECTURE.md, "Indexed Draw Path
+        // (M8D)" and "Command Recording (M8E)".
         VkBuffer vertexBuffers[] = {vertexBuffer->Get()};
         VkDeviceSize vertexOffsets[] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, vertexOffsets);
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer->Get(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
+            0, 1, &descriptorSet, 0, nullptr);
         vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
 
         vkCmdEndRenderPass(commandBuffer);
@@ -422,12 +467,14 @@ int main()
     }
 
     // GPU idle before destroying anything - see docs/ARCHITECTURE.md,
-    // "Exact Destruction Order (M8B)" and "M8C"/"M8D Implementation
-    // Notes". This also covers the vertex/index buffers: the last
-    // frame's draw commands may still be referencing them until the
-    // GPU actually finishes, which this wait guarantees. Everything
-    // else (sync objects, index buffer, vertex buffer, command pool,
-    // framebuffers, pipeline, render pass, swapchain, device, surface,
+    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E
+    // Implementation Notes". This also covers the vertex/index buffers
+    // and the texture/descriptor resources: the last frame's draw
+    // commands may still be referencing all of them until the GPU
+    // actually finishes, which this wait guarantees. Everything else
+    // (sync objects, descriptor pool, sampler, texture image, index
+    // buffer, vertex buffer, command pool, framebuffers, pipeline,
+    // descriptor set layout, render pass, swapchain, device, surface,
     // instance) unwinds automatically after this in reverse
     // construction order.
     vkDeviceWaitIdle(device.Get());

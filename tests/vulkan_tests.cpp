@@ -15,6 +15,7 @@
 // part of this suite, since CTest must not depend on a GPU being
 // present.
 
+#include "vulkan/VulkanCheckerboard.hpp"
 #include "vulkan/VulkanMemory.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
@@ -268,7 +269,7 @@ namespace
     void TestVertexAttributeDescriptions()
     {
         const auto attributes = Vertex::GetAttributeDescriptions();
-        Check(attributes.size() == 2, "Vertex has exactly 2 attributes (position, color)");
+        Check(attributes.size() == 3, "Vertex has exactly 3 attributes (position, color, uv)");
 
         Check(attributes[0].location == 0, "Position is at shader location 0");
         Check(attributes[0].format == VK_FORMAT_R32G32_SFLOAT, "Position is a 2-component float format (Vec2)");
@@ -277,6 +278,49 @@ namespace
         Check(attributes[1].location == 1, "Color is at shader location 1");
         Check(attributes[1].format == VK_FORMAT_R32G32B32_SFLOAT, "Color is a 3-component float format (Vec3)");
         Check(attributes[1].offset == offsetof(Vertex, color), "Color offset matches the real struct layout");
+
+        Check(attributes[2].location == 2, "UV is at shader location 2");
+        Check(attributes[2].format == VK_FORMAT_R32G32_SFLOAT, "UV is a 2-component float format (Vec2)");
+        Check(attributes[2].offset == offsetof(Vertex, uv), "UV offset matches the real struct layout");
+    }
+
+    // --- M8E pure-logic checks ---
+
+    void TestCheckerboardByteSize()
+    {
+        const auto pixels = GenerateCheckerboardRGBA8(64, 64, 8);
+        Check(pixels.size() == 64u * 64u * 4u, "Checkerboard byte size is width * height * 4 (RGBA8, tightly packed)");
+    }
+
+    void TestCheckerboardAlternatesTiles()
+    {
+        // tileSize=2: tile (0,0) covers pixels x/y in [0,2), tile (1,0)
+        // covers x in [2,4) - adjacent tiles along a row must differ.
+        const auto pixels = GenerateCheckerboardRGBA8(4, 2, 2);
+
+        auto pixelAt = [&](std::uint32_t x, std::uint32_t y)
+        {
+            const std::size_t index = (static_cast<std::size_t>(y) * 4 + x) * 4;
+            return pixels[index]; // R channel is enough to distinguish black (0) from white (255)
+        };
+
+        Check(pixelAt(0, 0) != pixelAt(2, 0), "Adjacent tiles along a row have different colors");
+        Check(pixelAt(0, 0) == pixelAt(1, 0), "Pixels within the same tile share the same color");
+    }
+
+    void TestCheckerboardFullyOpaque()
+    {
+        const auto pixels = GenerateCheckerboardRGBA8(8, 8, 4);
+        bool allOpaque = true;
+        for (std::size_t i = 3; i < pixels.size(); i += 4)
+        {
+            if (pixels[i] != 255)
+            {
+                allOpaque = false;
+                break;
+            }
+        }
+        Check(allOpaque, "Every checkerboard pixel's alpha channel is fully opaque (255)");
     }
 }
 
@@ -307,6 +351,10 @@ int main()
     TestFindMemoryTypeRespectsTypeFilterBitmask();
     TestVertexBindingDescription();
     TestVertexAttributeDescriptions();
+
+    TestCheckerboardByteSize();
+    TestCheckerboardAlternatesTiles();
+    TestCheckerboardFullyOpaque();
 
     if (g_failureCount == 0)
     {
