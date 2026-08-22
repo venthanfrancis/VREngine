@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A, M8B, and M8C (Vulkan bring-up + presentation + first triangle) complete.** `Core`
+**M0 through M7 complete; M8A, M8B, M8C, and M8D (Vulkan bring-up + presentation + first triangle + vertex/index buffers) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -81,13 +81,37 @@ validation errors on the final run — see `docs/ARCHITECTURE.md` Section
 18 for full details, including why a traditional `VkRenderPass` was
 chosen over Vulkan 1.3 dynamic rendering (AREngine targets 1.2).
 
-There is still no vertex/index buffer, no mesh abstraction, no texture,
-no descriptor sets, no uniform buffers, no camera, no depth buffer, no
-frame limiting, no ECS/component system, no real mesh/texture/image
-format parsing, and no analog/XR/controller input — see Sections 11–15.
-Everything else (`XR`, `Editor`) is still an M0-style stub with no
-functionality. Next up is M8D+ (vertex/index buffers, then a textured
-mesh). See `docs/ROADMAP.md` for the full plan.
+**M8D adds real GPU geometry** on top of M8C: Rendering's Vulkan backend
+gained `VulkanBuffer` (owns one `VkBuffer`+`VkDeviceMemory`, no VMA),
+`VulkanMemory::FindMemoryType` (pure-logic memory-type selection,
+unit-tested), `VulkanOneTimeCommands` (allocate/begin/submit/wait/free
+helper for one-shot command buffers), and `VulkanVertex::Vertex`
+(`Vec2` position + `Vec3` color, with binding/attribute descriptions).
+`triangle.vert` now reads real per-vertex data (`layout(location = 0/1)
+in ...`) instead of generating positions from `gl_VertexIndex`.
+Uploads go CPU → `HOST_VISIBLE|HOST_COHERENT` staging buffer →
+`vkCmdCopyBuffer` → `DEVICE_LOCAL` destination buffer
+(`CreateDeviceLocalBuffer`), synchronously (`vkQueueWaitIdle` after the
+copy — documented as a deliberate simplification, not built to scale to
+per-frame uploads). `tests/vulkan_present_demo.cpp` now renders a
+colored quad (4 vertices, 6 indices, `VK_INDEX_TYPE_UINT32`) via
+`vkCmdBindVertexBuffers`/`vkCmdBindIndexBuffer`/`vkCmdDrawIndexed` —
+neither buffer is swapchain-dependent, so `recreateSwapchain()` never
+touches them. M4's `BufferDesc`/`BufferHandle`/`RenderDevice::CreateBuffer`
+were reviewed against this evidence (a real gap was found: no way to
+supply initial data) but deliberately left unchanged — M8D's demo
+bypasses the generic API entirely, so one non-generic Vulkan buffer
+isn't enough evidence to pick the right generic upload shape yet. Zero
+validation errors on the final run — see `docs/ARCHITECTURE.md`
+Section 19 for full details.
+
+There is still no mesh abstraction, no texture, no descriptor sets, no
+uniform buffers, no camera, no depth buffer, no frame limiting, no ECS/
+component system, no real mesh/texture/image format parsing, and no
+analog/XR/controller input — see Sections 11–15. Everything else (`XR`,
+`Editor`) is still an M0-style stub with no functionality. Next up is
+M8E+ (textures, then a textured mesh). See `docs/ROADMAP.md` for the
+full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -95,10 +119,11 @@ mesh). See `docs/ROADMAP.md` for the full plan.
    `docs/ROADMAP.md` before adding functionality to a module.
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
-3. **Vulkan bring-up + presentation + first triangle only (M8A/M8B/
-   M8C)**: no vertex/index buffers, no mesh, no texture, no camera yet
-   — see `docs/ROADMAP.md`'s M8D+ row for what's still pending within
-   M8. **No OpenXR code** before milestone M9.
+3. **Vulkan bring-up + presentation + first triangle + vertex/index
+   buffers only (M8A/M8B/M8C/M8D)**: no mesh abstraction, no texture,
+   no descriptor sets, no camera yet — see `docs/ROADMAP.md`'s M8E+ row
+   for what's still pending within M8. **No OpenXR code** before
+   milestone M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

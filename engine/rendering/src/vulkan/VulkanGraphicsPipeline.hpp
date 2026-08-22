@@ -21,12 +21,13 @@ namespace AREngine::Rendering::Vulkan
     // its generic shape - see docs/ARCHITECTURE.md, "Pipeline Ownership
     // (M8C)".
     //
-    // No descriptor sets, no push constants (empty VkPipelineLayout);
-    // no vertex input bindings/attributes (the vertex shader generates
-    // its 3 positions from gl_VertexIndex - see docs/ARCHITECTURE.md,
-    // "Why gl_VertexIndex Instead Of A Vertex Buffer (M8C)"); viewport
-    // and scissor are dynamic state, so this pipeline does not need to
-    // be recreated when the swapchain extent changes on resize - only
+    // No descriptor sets, no push constants (empty VkPipelineLayout).
+    // One vertex input binding, two attributes (position, color) -
+    // matches Vertex exactly (VulkanVertex.hpp/.cpp); M8C's
+    // gl_VertexIndex-generated positions are gone as of M8D - see
+    // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)". Viewport and
+    // scissor are dynamic state, so this pipeline does not need to be
+    // recreated when the swapchain extent changes on resize - only
     // VulkanFramebuffers does.
     //
     // Independent of swapchain extent/image count, same as

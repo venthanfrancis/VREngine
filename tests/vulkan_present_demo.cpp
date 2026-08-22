@@ -1,18 +1,18 @@
-// Manual M8C validation demo — NOT part of the automated CTest suite,
+// Manual M8D validation demo — NOT part of the automated CTest suite,
 // since it requires a real Vulkan-capable GPU/driver and opens a real
 // window, neither of which CI/headless systems have. Built by CMake
 // but deliberately not registered with add_test. Run it manually.
 //
-// Extends M8B's presentation path with AREngine's first real graphics
-// pipeline: AREngine Window -> VkSurfaceKHR -> presentation-capable
-// physical device -> logical device with graphics+present queues ->
-// swapchain -> acquire -> [render pass: clear background, draw one
-// triangle] -> present, repeated every frame until the window closes,
-// handling resize/minimize along the way. The triangle's 3 positions
-// come from the vertex shader's gl_VertexIndex, not a vertex buffer -
-// see docs/ARCHITECTURE.md, "Why gl_VertexIndex Instead Of A Vertex
-// Buffer (M8C)". No mesh/material/camera/depth - see docs/ROADMAP.md,
-// M8C.
+// Extends M8C's graphics pipeline with real GPU vertex/index buffers:
+// AREngine Window -> VkSurfaceKHR -> presentation-capable physical
+// device -> logical device with graphics+present queues -> swapchain
+// -> acquire -> [render pass: clear background, draw a quad from a
+// real vertex buffer + index buffer via vkCmdDrawIndexed] -> present,
+// repeated every frame until the window closes, handling resize/
+// minimize along the way. M8C's gl_VertexIndex-generated positions are
+// gone - see docs/ARCHITECTURE.md, "Vertex Buffer (M8D)" and "Index
+// Buffer (M8D)". No mesh/material/texture/camera/depth - see
+// docs/ROADMAP.md, M8D.
 //
 // This demo reaches directly into Rendering's private src/vulkan/
 // implementation (not through any public Rendering API), same as
@@ -23,6 +23,7 @@
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Platform/Platform.hpp"
 
+#include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanFramebuffers.hpp"
@@ -36,6 +37,7 @@
 #include "vulkan/VulkanSwapchain.hpp"
 #include "vulkan/VulkanSwapchainSupport.hpp"
 #include "vulkan/VulkanVersion.hpp"
+#include "vulkan/VulkanVertex.hpp"
 
 #include <array>
 #include <cstdint>
@@ -92,7 +94,7 @@ namespace
 int main()
 {
     Platform::WindowDesc desc;
-    desc.title = "AREngine M8C Vulkan Triangle Demo";
+    desc.title = "AREngine M8D Vulkan Vertex Buffer Demo";
     desc.width = 1280;
     desc.height = 720;
     auto window = Platform::CreateAppWindow(desc);
@@ -145,6 +147,38 @@ int main()
         device.Get(), renderPass.Get(), swapchain->GetImageViews(), swapchain->GetExtent());
 
     VulkanCommandPool commandPool(device.Get(), physicalDevice.queueFamilies.graphicsFamily);
+
+    // A colored quad: 4 vertices, 6 indices, 2 triangles - proves both
+    // vertex-buffer and index-buffer infrastructure (a triangle alone
+    // wouldn't need an index buffer to be meaningful). Neither buffer
+    // is swapchain-dependent - both are created once here and survive
+    // every swapchain recreation untouched. See docs/ARCHITECTURE.md,
+    // "Resource Lifetime: Swapchain-Dependent vs. Geometry (M8D)".
+    //
+    //   0 ---- 1
+    //   |    / |
+    //   |   /  |
+    //   |  /   |
+    //   | /    |
+    //   3 ---- 2
+    const std::vector<Vertex> vertices = {
+        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // 0
+        {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}}, // 1
+        {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // 2
+        {{-0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}}, // 3
+    };
+    const std::vector<std::uint32_t> indices = {0, 1, 2, 2, 3, 0};
+
+    auto vertexBuffer = CreateDeviceLocalBuffer(
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
+        vertices.data(), sizeof(Vertex) * vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    auto indexBuffer = CreateDeviceLocalBuffer(
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
+        indices.data(), sizeof(std::uint32_t) * indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    AR_LOG_INFO(std::format("Vertex buffer: {} vertices, {} bytes, stride {} bytes",
+                             vertices.size(), vertexBuffer->GetSize(), sizeof(Vertex)));
+    AR_LOG_INFO(std::format("Index buffer: {} indices (uint32_t), {} bytes",
+                             indices.size(), indexBuffer->GetSize()));
 
     std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
     {
@@ -247,7 +281,7 @@ int main()
                                  swapchain->GetExtent().width, swapchain->GetExtent().height, swapchain->GetImageCount()));
     };
 
-    AR_LOG_INFO("AREngine M8C triangle demo: close the window to exit.");
+    AR_LOG_INFO("AREngine M8D vertex/index buffer demo: close the window to exit.");
 
     int currentFrame = 0;
     while (!window->ShouldClose())
@@ -336,11 +370,15 @@ int main()
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
 
-        // No vertex buffer bound: triangle.vert generates its 3
-        // positions from gl_VertexIndex, so this draw call needs
-        // nothing but a vertex count. See docs/ARCHITECTURE.md, "Why
-        // gl_VertexIndex Instead Of A Vertex Buffer (M8C)".
-        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        // Real geometry from real GPU buffers: bind the quad's vertex
+        // buffer at binding 0 (matching Vertex::GetBindingDescription())
+        // and its index buffer, then draw indexed. See
+        // docs/ARCHITECTURE.md, "Indexed Draw Path (M8D)".
+        VkBuffer vertexBuffers[] = {vertexBuffer->Get()};
+        VkDeviceSize vertexOffsets[] = {0};
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, vertexOffsets);
+        vkCmdBindIndexBuffer(commandBuffer, indexBuffer->Get(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
 
         vkCmdEndRenderPass(commandBuffer);
 
@@ -384,12 +422,14 @@ int main()
     }
 
     // GPU idle before destroying anything - see docs/ARCHITECTURE.md,
-    // "Exact Destruction Order (M8B)" and "M8C Implementation Notes".
-    // Everything else (sync objects, command pool, framebuffers,
-    // pipeline, render pass, swapchain, device, surface, instance)
-    // unwinds automatically after this in reverse construction order -
-    // framebuffers before pipeline before render pass before swapchain,
-    // matching the dependency direction each was built in.
+    // "Exact Destruction Order (M8B)" and "M8C"/"M8D Implementation
+    // Notes". This also covers the vertex/index buffers: the last
+    // frame's draw commands may still be referencing them until the
+    // GPU actually finishes, which this wait guarantees. Everything
+    // else (sync objects, index buffer, vertex buffer, command pool,
+    // framebuffers, pipeline, render pass, swapchain, device, surface,
+    // instance) unwinds automatically after this in reverse
+    // construction order.
     vkDeviceWaitIdle(device.Get());
 
     for (FrameSyncObjects& sync : frameSync)

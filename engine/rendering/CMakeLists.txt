@@ -36,6 +36,10 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanRenderPass.cpp
             src/vulkan/VulkanFramebuffers.cpp
             src/vulkan/VulkanGraphicsPipeline.cpp
+            src/vulkan/VulkanVertex.cpp
+            src/vulkan/VulkanMemory.cpp
+            src/vulkan/VulkanBuffer.cpp
+            src/vulkan/VulkanOneTimeCommands.cpp
             src/vulkan/VulkanVersion.hpp
             src/vulkan/VulkanResult.hpp
             src/vulkan/VulkanPhysicalDevice.hpp
@@ -50,6 +54,10 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanRenderPass.hpp
             src/vulkan/VulkanFramebuffers.hpp
             src/vulkan/VulkanGraphicsPipeline.hpp
+            src/vulkan/VulkanVertex.hpp
+            src/vulkan/VulkanMemory.hpp
+            src/vulkan/VulkanBuffer.hpp
+            src/vulkan/VulkanOneTimeCommands.hpp
     )
     target_link_libraries(arengine_rendering PRIVATE Vulkan::Vulkan AREngine::Platform)
 

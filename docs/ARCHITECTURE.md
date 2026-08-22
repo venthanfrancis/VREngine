@@ -1634,3 +1634,321 @@ design (the render pass's implicit layout transitions, the
 framebuffer/pipeline/render-pass lifetime split, dynamic viewport/
 scissor across resize) worked correctly on the first real hardware run,
 with zero validation warnings to investigate.
+
+## 19. M8D Implementation Notes
+
+M8D replaces M8C's `gl_VertexIndex`-generated triangle with real GPU
+geometry: a CPU-defined quad (4 vertices, 6 indices, 2 triangles)
+uploaded into GPU-visible Vulkan buffers and drawn with
+`vkCmdDrawIndexed`. This is the minimum buffer infrastructure needed to
+prove both vertex-buffer and index-buffer paths — no mesh/asset/texture
+system yet.
+
+### Vertex Structure (M8D)
+
+`Vertex` (`VulkanVertex.hpp/.cpp`) is exactly the brief's example:
+
+```cpp
+struct Vertex
+{
+    AREngine::Core::Math::Vec2 position;
+    AREngine::Core::Math::Vec3 color;
+};
+```
+
+Reused `Core::Math::Vec2`/`Vec3` rather than inventing parallel
+float-pair/float-triple types — they're already the engine's standard
+2D/3D value types, standard-layout (so `offsetof` on `Vertex` is well-
+defined), and carry no dependency `Vertex` wouldn't already need.
+`Vertex` itself is deliberately private to Rendering's Vulkan backend
+(`engine/rendering/src/vulkan/`), not a generic `Rendering` type — one
+concrete vertex shape, with no second one to compare it against, is not
+enough evidence to design a generic Mesh/VertexFormat abstraction from.
+
+### Vertex Input Layout (M8D)
+
+`Vertex::GetBindingDescription()`/`GetAttributeDescriptions()` describe
+exactly one binding (binding 0, `stride = sizeof(Vertex)`,
+`VK_VERTEX_INPUT_RATE_VERTEX` — per-vertex, not per-instance) and two
+attributes:
+
+| Location | Field | Format | Offset |
+|---|---|---|---|
+| 0 | `position` (Vec2) | `VK_FORMAT_R32G32_SFLOAT` | `offsetof(Vertex, position)` |
+| 1 | `color` (Vec3) | `VK_FORMAT_R32G32B32_SFLOAT` | `offsetof(Vertex, color)` |
+
+`VulkanGraphicsPipeline` wires these straight into
+`VkPipelineVertexInputStateCreateInfo`; `triangle.vert`'s
+`layout(location = 0) in vec2` / `layout(location = 1) in vec3`
+declarations must (and do) match. No normals, no UVs, no tangents, no
+instancing — the brief's scope exactly. Offsets come from `offsetof`,
+not hand-counted byte math, so struct layout and the pipeline
+description can't silently drift apart. Both `GetBindingDescription`
+and `GetAttributeDescriptions` are pure logic (no Vulkan API calls) and
+directly unit-tested in `tests/vulkan_tests.cpp`.
+
+### Buffer Ownership (M8D)
+
+`VulkanBuffer` (`VulkanBuffer.hpp/.cpp`) owns one `VkBuffer` and the
+`VkDeviceMemory` backing it — one dedicated allocation per buffer, no
+VMA, no sub-allocation, matching the "small, generic, RAII" shape of
+every other owned Vulkan object in this backend (`VulkanInstance`,
+`VulkanSwapchain`, etc.). Never exposed outside Rendering's Vulkan
+backend — no `VkBuffer` appears on any public `Rendering` header.
+
+### Memory Type Selection (M8D)
+
+`FindMemoryType` (`VulkanMemory.hpp/.cpp`) takes an already-queried
+`VkPhysicalDeviceMemoryProperties`, a `typeFilter` bitmask (from
+`VkMemoryRequirements::memoryTypeBits`), and required property flags,
+and returns the first memory type index satisfying both — pure logic,
+no Vulkan calls, directly unit-tested with synthetic
+`VkPhysicalDeviceMemoryProperties` data (including a case that proves
+the type-filter bitmask is actually honored, not just the property
+flags). Asserts if nothing matches, since every combination M8D
+actually requests is spec-guaranteed available on any real Vulkan GPU.
+
+The three property flags in play:
+
+- **`HOST_VISIBLE`**: the CPU can map this memory into its own address
+  space (`vkMapMemory`) and read/write it directly. Required for the
+  staging buffer, since that's where CPU-side vertex/index data gets
+  copied from.
+- **`HOST_COHERENT`**: writes the CPU makes to mapped `HOST_VISIBLE`
+  memory become visible to the GPU without an explicit
+  `vkFlushMappedMemoryRanges` call. Requested alongside `HOST_VISIBLE`
+  for the staging buffer specifically to avoid needing that extra call
+  — simpler, at a possible (here, irrelevant — this is a one-shot
+  startup upload, not a per-frame one) cost versus manual flushing.
+- **`DEVICE_LOCAL`**: the fastest memory for the GPU itself to read
+  from during rendering, typically not directly writable by the CPU at
+  all. Used for the actual vertex/index buffers the pipeline reads
+  from every frame.
+
+### Upload Strategy (M8D)
+
+**Staging buffer → device-local destination buffer** (option B from the
+brief), not direct host-visible vertex/index buffers. Chosen because
+it's genuinely closer to how static GPU geometry will actually work
+once real meshes exist (M8D's vertices are trivial, but the *pattern*
+— CPU data lands in `DEVICE_LOCAL` memory via a temporary staging step
+— is the one worth establishing now), and it turned out not to add much
+real complexity: `CreateDeviceLocalBuffer` (`VulkanBuffer.cpp`) is
+~15 lines, built entirely from pieces (`VulkanBuffer`,
+`VulkanOneTimeCommands`) that already needed to exist. The flow exactly
+matches the brief's recommended path:
+
+```
+CPU data (std::vector<Vertex> / std::vector<uint32_t>)
+    ↓
+HOST_VISIBLE | HOST_COHERENT staging VulkanBuffer (VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+    ↓
+VulkanBuffer::CopyDataIn — vkMapMemory / memcpy / vkUnmapMemory
+    ↓
+BeginOneTimeCommands → vkCmdCopyBuffer → EndOneTimeCommands
+    ↓
+DEVICE_LOCAL destination VulkanBuffer (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+or VK_BUFFER_USAGE_INDEX_BUFFER_BIT, + VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+```
+
+### Staging Buffer Behavior (M8D)
+
+The staging `VulkanBuffer` inside `CreateDeviceLocalBuffer` is a plain
+local variable — it is destroyed automatically (its destructor runs)
+the moment the function returns, immediately after
+`EndOneTimeCommands` has already waited for the copy to finish. It is
+never kept alive past the upload it exists for; there is no pool of
+staging buffers, no reuse, no lingering allocation.
+
+### Synchronous Upload Limitation (M8D)
+
+`EndOneTimeCommands` (`VulkanOneTimeCommands.cpp`) submits the copy
+command buffer, then calls `vkQueueWaitIdle` before returning — the
+whole `CreateDeviceLocalBuffer` call blocks until its copy has actually
+completed on the GPU. This is a deliberate, documented simplification,
+not an oversight: `vkQueueWaitIdle` stalls the *entire* queue rather
+than waiting on a per-submission fence, which would cost real
+throughput if this happened every frame — but M8D's uploads are a
+handful of one-shot calls at startup, not steady-state work, so the
+simpler synchronous path was chosen over building fence-based async
+tracking for a case that doesn't need it yet. No background uploading,
+no transfer queue, no async transfer scheduling — all explicitly
+deferred, per the brief.
+
+### Index Buffer (M8D)
+
+Indices are `std::uint32_t` (`VK_INDEX_TYPE_UINT32`), not `uint16_t` —
+simplicity over the (here, irrelevant at 6 indices) memory savings a
+16-bit index would give; the brief explicitly allowed this default.
+Uploaded through the same `CreateDeviceLocalBuffer` path as the vertex
+buffer, with `VK_BUFFER_USAGE_INDEX_BUFFER_BIT`. Bound in the command
+buffer via `vkCmdBindIndexBuffer(commandBuffer, indexBuffer->Get(), 0,
+VK_INDEX_TYPE_UINT32)`, drawn via `vkCmdDrawIndexed(commandBuffer,
+static_cast<uint32_t>(indices.size()), 1, 0, 0, 0)`.
+
+### Indexed Draw Path (M8D)
+
+Per-frame command recording, extended from M8C:
+
+```
+vkCmdBeginRenderPass (unchanged from M8C)
+    ↓
+vkCmdSetViewport, vkCmdSetScissor (unchanged from M8C)
+    ↓
+vkCmdBindPipeline (unchanged from M8C)
+    ↓
+vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, offsets)   [NEW]
+    ↓
+vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32)   [NEW]
+    ↓
+vkCmdDrawIndexed(commandBuffer, 6, 1, 0, 0, 0)   [replaces M8C's vkCmdDraw(3, ...)]
+    ↓
+vkCmdEndRenderPass (unchanged from M8C)
+```
+
+No `gl_VertexIndex`-generated positions remain anywhere in the shader
+or the demo.
+
+### Resource Lifetime: Swapchain-Dependent vs. Geometry (M8D)
+
+The vertex and index buffers are constructed once, right after
+`commandPool` in `vulkan_present_demo.cpp`, and are **not** touched by
+`recreateSwapchain()`. This is a real, important distinction, not an
+oversight:
+
+- **Swapchain-dependent** (recreated on every resize):
+  `VulkanSwapchain` itself (images/views), `VulkanFramebuffers`.
+- **Not swapchain-dependent** (created once, survive every resize):
+  the vertex buffer, the index buffer, `VulkanGraphicsPipeline`,
+  `VulkanRenderPass` (both already established as resize-independent in
+  M8C — see "Swapchain-Dependent Pipeline Resources (M8C)").
+
+Geometry has no relationship to window size at all — a quad's vertex
+positions in clip space don't change because the window got bigger or
+smaller. Recreating geometry buffers on resize would be both wasteful
+(a real upload, however small, for no reason) and conceptually wrong
+(it would suggest geometry is somehow tied to presentation, which it
+isn't). Verified in practice: two resizes and two minimize/restore
+cycles during validation, with the quad correctly re-rendered every
+time and the vertex/index buffers never recreated, logged, or touched.
+
+### Command Recording
+
+Command buffer allocation, frame-in-flight synchronization
+(`FrameSyncObjects`, per-image `renderFinishedSemaphores`/
+`imagesInFlight`), and swapchain acquire/present are all unchanged from
+M8B/M8C — see those sections. Only the recording *inside* the render
+pass changed, as described in "Indexed Draw Path" above.
+
+### Generic RenderDevice / BufferDesc Review (M8D)
+
+The brief asked for a review of M4's `BufferDesc`/`BufferHandle`/
+`RenderDevice::CreateBuffer` against M8D's real evidence, without
+redesigning the public API unless a concrete mismatch is proven. M8D's
+demo does **not** route through `RenderDevice`/`CreateBuffer` at all —
+same as every Vulkan demo since M8A, it reaches directly into
+Rendering's private `src/vulkan/` implementation (see "Frame /
+Rendering Boundary (M8B)"). So nothing *forced* a change here. Answering
+the five questions anyway, since the evidence is worth recording even
+though M8D's demo bypasses the generic API entirely:
+
+1. **Does `BufferDesc` contain enough information?** No — it has
+   `sizeBytes` and `usage`, but no way to supply *initial* CPU data.
+   `CreateBuffer` alone cannot express "create this buffer and fill it
+   with these bytes" — the exact operation M8D's `CreateDeviceLocalBuffer`
+   performs. This is a real, now-proven gap, not a hypothetical one.
+2. **Are `Vertex`/`Index`/`Uniform` usage categories still sensible?**
+   Yes, as far as they go — M8D used exactly two of the three
+   (`Vertex`, `Index`) and needed nothing else. No evidence yet that a
+   fourth category is needed.
+3. **Can `BufferHandle` remain backend-neutral?** Yes, unaffected —
+   `BufferHandle` is just an opaque integer id; nothing about M8D's
+   `VulkanBuffer` (owning a `VkBuffer`+`VkDeviceMemory` pair) requires
+   the *handle* itself to carry any more information. A future Vulkan
+   `RenderDevice` implementation would map `BufferHandle`s to
+   `VulkanBuffer*`/`std::unique_ptr<VulkanBuffer>` internally, same as
+   `NullRenderDevice` already maps them to its own internal map.
+4. **Is initial CPU data missing from the generic design?** Yes — see
+   (1). There is no `RenderDevice` operation today that both creates a
+   buffer and uploads data into it, nor a separate explicit "upload/
+   write" operation once a buffer exists.
+5. **Should upload remain a separate operation?** Most likely yes, once
+   a generic API does grow one — M8D's own implementation already
+   separates "create + allocate" (`VulkanBuffer`'s constructor) from
+   "put data in" (`CopyDataIn`, and the staging-copy dance
+   `CreateDeviceLocalBuffer` builds on top of it) precisely because
+   upload has real synchronization/timing considerations (see
+   "Synchronous Upload Limitation" above) that buffer creation itself
+   doesn't. A single combined "create-with-data" call would hide that.
+
+**No change was made to `BufferDesc.hpp`, `Handles.hpp`, or
+`RenderDevice.hpp`.** The gap in point (1)/(4) is real evidence, but a
+single concrete backend (M8D's demo-only `VulkanBuffer`, used by no
+`RenderDevice` implementation at all) is not yet proof of the *right*
+shape for a generic upload API — e.g., whether it should be a
+`BufferDesc::initialData` pointer, a separate `RenderDevice::UploadBuffer`
+method, or something else, is exactly the kind of design question M4
+deferred needing "real evidence" to answer, and one non-generic Vulkan
+demo isn't that evidence yet. Revisit once a real `VulkanRenderDevice`
+(implementing the actual `RenderDevice` interface, not just a private
+demo) exists and needs to answer this for real.
+
+### Memory Types Selected On The RTX 3060 (M8D)
+
+Reported by the manual demo on the development machine (NVIDIA GeForce
+RTX 3060 Laptop GPU): the staging buffer's `HOST_VISIBLE |
+HOST_COHERENT` request and the destination buffers'
+`DEVICE_LOCAL` request both resolved successfully via `FindMemoryType`
+with zero validation errors — the driver reports at least one memory
+type satisfying each combination, as expected on any discrete GPU.
+
+### NullRenderDevice / Runtime
+
+Both untouched, exactly as the brief required. `RenderingTests` still
+pass unchanged; `AREngineSandbox.exe` still runs on `NullRenderDevice`.
+
+### Validation Results (M8D)
+
+`ARENGINE_ENABLE_VULKAN=ON` (default): full `/W4 /WX` clean build,
+`ctest` 9/9 (5 new M8D pure-logic checks: 3 for `FindMemoryType`, 2 for
+`Vertex`'s binding/attribute descriptions).
+`ARENGINE_ENABLE_VULKAN=OFF`: full build succeeds, no Vulkan/shader
+targets present, `ctest` 8/8 (no `VulkanTests`).
+
+`arengine_vulkan_present_demo` run against real hardware (NVIDIA
+GeForce RTX 3060 Laptop GPU): window opens, a colored quad (4 distinct
+corner colors, smoothly interpolated, no seam visible across the
+diagonal shared by both triangles — confirming the index buffer
+correctly reuses vertices 0 and 2) renders on the teal background,
+confirmed by screenshot both initially and after two resizes plus two
+full minimize/restore cycles (with the quad correctly re-rendered every
+time and the geometry buffers never recreated), closes cleanly.
+**Zero validation errors or warnings** — nothing needed fixing during
+M8D's development; memory binding, buffer usage flags, copy
+synchronization, vertex binding offsets, the index type, and object
+destruction were all correct on the first real hardware run.
+
+- Upload strategy: **staging buffer → device-local buffer** (option B)
+- Memory types selected: **`HOST_VISIBLE | HOST_COHERENT`** (staging),
+  **`DEVICE_LOCAL`** (vertex/index destination buffers) — both resolved
+  successfully on the RTX 3060
+- Vertex stride: **20 bytes** (`sizeof(Vertex)` = 2×4 + 3×4), attributes:
+  **location 0 = position (`VK_FORMAT_R32G32_SFLOAT`, offset 0)**,
+  **location 1 = color (`VK_FORMAT_R32G32B32_SFLOAT`, offset 8)**
+- Index type/count: **`VK_INDEX_TYPE_UINT32`, 6 indices** (24 bytes)
+
+### What's Deferred to M8E+
+
+No GLTF/OBJ loading, no `MeshAsset`, no texture, no UVs, no normals, no
+material system, no descriptor sets, no uniform buffers, no push
+constants, no camera, no transforms sent to the GPU, no depth buffer,
+no Scene rendering, no OpenXR, no VMA, no instancing, no batching. The
+`Vertex` struct and `VulkanBuffer`/`CreateDeviceLocalBuffer` remain
+Vulkan-private, same reasoning as `VulkanGraphicsPipeline` in M8C — one
+quad's worth of evidence is not enough to design a generic
+Mesh/VertexFormat/upload abstraction from.
+
+No other architectural issues were discovered — vertex/index buffer
+creation, staging upload, and indexed drawing all worked correctly on
+the first real hardware run, with zero validation warnings to
+investigate.

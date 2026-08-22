@@ -2,6 +2,7 @@
 
 #include "VulkanResult.hpp"
 #include "VulkanShaderModule.hpp"
+#include "VulkanVertex.hpp"
 
 #include <array>
 #include <cstdint>
@@ -33,12 +34,19 @@ namespace AREngine::Rendering::Vulkan
 
         const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
 
-        // No vertex bindings/attributes: triangle.vert generates its 3
-        // positions from gl_VertexIndex, so the pipeline is never given
-        // any vertex data to fetch. See docs/ARCHITECTURE.md, "Why
-        // gl_VertexIndex Instead Of A Vertex Buffer (M8C)".
+        // One binding, two attributes (position, color) - matches
+        // Vertex exactly (VulkanVertex.hpp/.cpp) and triangle.vert's
+        // `layout(location = 0/1) in ...` declarations. See
+        // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)".
+        const VkVertexInputBindingDescription bindingDescription = Vertex::GetBindingDescription();
+        const std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions = Vertex::GetAttributeDescriptions();
+
         VkPipelineVertexInputStateCreateInfo vertexInput{};
         vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &bindingDescription;
+        vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
+        vertexInput.pVertexAttributeDescriptions = attributeDescriptions.data();
 
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
         inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;

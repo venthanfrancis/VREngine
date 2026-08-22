@@ -15,12 +15,15 @@
 // part of this suite, since CTest must not depend on a GPU being
 // present.
 
+#include "vulkan/VulkanMemory.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
 #include "vulkan/VulkanResult.hpp"
 #include "vulkan/VulkanSwapchainSupport.hpp"
 #include "vulkan/VulkanVersion.hpp"
+#include "vulkan/VulkanVertex.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <limits>
 
@@ -205,6 +208,76 @@ namespace
         Check(extent.width == 100, "Window width below the surface minimum is clamped up");
         Check(extent.height == 1000, "Window height above the surface maximum is clamped down");
     }
+
+    // --- M8D pure-logic checks ---
+
+    VkPhysicalDeviceMemoryProperties MakeSyntheticMemoryProperties()
+    {
+        // A small, made-up memory layout - not a real GPU's - with four
+        // types, including two (1 and 3) that share the same property
+        // flags, specifically so a test can prove FindMemoryType
+        // actually honors the type-index bitmask and doesn't just
+        // return the first property-matching type regardless of it.
+        VkPhysicalDeviceMemoryProperties props{};
+        props.memoryTypeCount = 4;
+
+        props.memoryTypes[0].propertyFlags = 0; // no relevant properties at all
+        props.memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        props.memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        props.memoryTypes[3].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+        return props;
+    }
+
+    void TestFindMemoryTypeMatchesHostVisible()
+    {
+        const VkPhysicalDeviceMemoryProperties props = MakeSyntheticMemoryProperties();
+        // typeFilter allows all four types (bits 0-3 set).
+        const std::uint32_t index = FindMemoryType(props, 0b1111,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        Check(index == 1, "FindMemoryType selects the first type with both required HOST_VISIBLE and HOST_COHERENT bits");
+    }
+
+    void TestFindMemoryTypeMatchesDeviceLocal()
+    {
+        const VkPhysicalDeviceMemoryProperties props = MakeSyntheticMemoryProperties();
+        const std::uint32_t index = FindMemoryType(props, 0b1111, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(index == 2, "FindMemoryType selects the DEVICE_LOCAL type");
+    }
+
+    void TestFindMemoryTypeRespectsTypeFilterBitmask()
+    {
+        const VkPhysicalDeviceMemoryProperties props = MakeSyntheticMemoryProperties();
+        // Type 1 has the exact properties being searched for, but bit 1
+        // is excluded from the filter (0b1101 = types 0, 2, 3 allowed) -
+        // if the bitmask were being ignored, this would incorrectly
+        // return 1 instead of 3.
+        const std::uint32_t index = FindMemoryType(props, 0b1101,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        Check(index == 3, "FindMemoryType skips a property-matching type excluded by the type filter bitmask");
+    }
+
+    void TestVertexBindingDescription()
+    {
+        const VkVertexInputBindingDescription binding = Vertex::GetBindingDescription();
+        Check(binding.binding == 0, "Vertex uses binding 0");
+        Check(binding.stride == sizeof(Vertex), "Vertex binding stride equals sizeof(Vertex)");
+        Check(binding.inputRate == VK_VERTEX_INPUT_RATE_VERTEX, "Vertex binding input rate is per-vertex, not per-instance");
+    }
+
+    void TestVertexAttributeDescriptions()
+    {
+        const auto attributes = Vertex::GetAttributeDescriptions();
+        Check(attributes.size() == 2, "Vertex has exactly 2 attributes (position, color)");
+
+        Check(attributes[0].location == 0, "Position is at shader location 0");
+        Check(attributes[0].format == VK_FORMAT_R32G32_SFLOAT, "Position is a 2-component float format (Vec2)");
+        Check(attributes[0].offset == offsetof(Vertex, position), "Position offset matches the real struct layout");
+
+        Check(attributes[1].location == 1, "Color is at shader location 1");
+        Check(attributes[1].format == VK_FORMAT_R32G32B32_SFLOAT, "Color is a 3-component float format (Vec3)");
+        Check(attributes[1].offset == offsetof(Vertex, color), "Color offset matches the real struct layout");
+    }
 }
 
 int main()
@@ -228,6 +301,12 @@ int main()
     TestChooseSwapchainImageCountNoMaxLimit();
     TestChooseSwapchainExtentUsesCurrentExtentWhenFixed();
     TestChooseSwapchainExtentClampsWindowSize();
+
+    TestFindMemoryTypeMatchesHostVisible();
+    TestFindMemoryTypeMatchesDeviceLocal();
+    TestFindMemoryTypeRespectsTypeFilterBitmask();
+    TestVertexBindingDescription();
+    TestVertexAttributeDescriptions();
 
     if (g_failureCount == 0)
     {

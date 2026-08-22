@@ -1,27 +1,17 @@
 #version 450
 
-// M8C's whole triangle: no vertex buffer exists yet, so the three
-// positions (and a color per vertex, just to prove interpolation
-// works) are generated directly from gl_VertexIndex. See
-// docs/ARCHITECTURE.md, "Why gl_VertexIndex Instead Of A Vertex Buffer
-// (M8C)". Real per-vertex data arrives in M8D.
+// M8D: reads real per-vertex data from a vertex buffer instead of
+// generating positions from gl_VertexIndex. See docs/ARCHITECTURE.md,
+// "Vertex Input Layout (M8D)" - location 0/1 here must match
+// VulkanVertex.cpp's GetAttributeDescriptions() exactly.
+
+layout(location = 0) in vec2 inPosition;
+layout(location = 1) in vec3 inColor;
 
 layout(location = 0) out vec3 fragColor;
 
-vec2 positions[3] = vec2[](
-    vec2(0.0, -0.5),
-    vec2(0.5, 0.5),
-    vec2(-0.5, 0.5)
-);
-
-vec3 colors[3] = vec3[](
-    vec3(1.0, 0.0, 0.0),
-    vec3(0.0, 1.0, 0.0),
-    vec3(0.0, 0.0, 1.0)
-);
-
 void main()
 {
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-    fragColor = colors[gl_VertexIndex];
+    gl_Position = vec4(inPosition, 0.0, 1.0);
+    fragColor = inColor;
 }

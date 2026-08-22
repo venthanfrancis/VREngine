@@ -27,7 +27,8 @@ all come after that chain is proven.
 | — M8A | Vulkan bring-up: instance, validation, physical/logical device, graphics queue. No swapchain, no rendering. | **Complete** | See `docs/ARCHITECTURE.md` Section 16 |
 | — M8B | Window → `VkSurfaceKHR` → presentation-capable device → swapchain → acquire/clear/present loop, resize + minimize handling. No triangle. | **Complete** | See `docs/ARCHITECTURE.md` Section 17 |
 | — M8C | First triangle: render pass, graphics pipeline, GLSL→SPIR-V shaders, `gl_VertexIndex`-generated vertices (no vertex buffer yet). | **Complete** | See `docs/ARCHITECTURE.md` Section 18 |
-| — M8D+ | Vertex/index buffers, then a textured mesh | Not started | |
+| — M8D | Real GPU geometry: `VulkanBuffer`, staging uploads, vertex + index buffers, indexed quad draw. | **Complete** | See `docs/ARCHITECTURE.md` Section 19 |
+| — M8E+ | Textures, then a textured mesh | Not started | |
 | M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | Not started | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |
