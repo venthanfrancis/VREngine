@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AREngine/Core/Event.hpp"
+#include "AREngine/Platform/NativeWindowHandle.hpp"
 #include "AREngine/Platform/WindowDesc.hpp"
 
 #include <cstdint>
@@ -41,6 +42,12 @@ namespace AREngine::Platform
         // WindowResizeEvent, ...) as it happens, if a callback is set.
         // Entirely optional — a Window works fine with none set.
         virtual void SetEventCallback(EventCallback callback) = 0;
+
+        // Returns this window's raw OS handle values — see
+        // NativeWindowHandle.hpp for exactly what this is for (a
+        // graphics API surface, and nothing else) and why gameplay code
+        // should never call this.
+        [[nodiscard]] virtual NativeWindowHandle GetNativeHandle() const = 0;
     };
 
     // Creates a platform-appropriate Window (Windows today; see

@@ -16,10 +16,13 @@
 // present.
 
 #include "vulkan/VulkanPhysicalDevice.hpp"
+#include "vulkan/VulkanQueueFamilies.hpp"
 #include "vulkan/VulkanResult.hpp"
+#include "vulkan/VulkanSwapchainSupport.hpp"
 #include "vulkan/VulkanVersion.hpp"
 
 #include <cstdio>
+#include <limits>
 
 namespace
 {
@@ -110,6 +113,98 @@ namespace
         Check(VkResultToString(static_cast<VkResult>(-12345)) == "VkResult(-12345)",
               "An unrecognized VkResult falls back to a numeric representation, not a crash");
     }
+
+    // --- M8B pure-logic checks ---
+
+    void TestHasSeparatePresentQueue()
+    {
+        Check(!HasSeparatePresentQueue(QueueFamilyIndices{0, 0}), "Same family for graphics and present is not separate");
+        Check(HasSeparatePresentQueue(QueueFamilyIndices{0, 1}), "Different families for graphics and present is separate");
+    }
+
+    void TestGetUniqueQueueFamiliesSameFamily()
+    {
+        const auto unique = GetUniqueQueueFamilies(QueueFamilyIndices{2, 2});
+        Check(unique.size() == 1 && unique[0] == 2, "Same graphics/present family yields exactly one unique family");
+    }
+
+    void TestGetUniqueQueueFamiliesDifferentFamilies()
+    {
+        const auto unique = GetUniqueQueueFamilies(QueueFamilyIndices{0, 3});
+        Check(unique.size() == 2 && unique[0] == 0 && unique[1] == 3,
+              "Different graphics/present families yields both, graphics first");
+    }
+
+    void TestIsSwapchainSupportAdequate()
+    {
+        Check(IsSwapchainSupportAdequate(true, true), "Formats and present modes both present is adequate");
+        Check(!IsSwapchainSupportAdequate(false, true), "No formats is not adequate");
+        Check(!IsSwapchainSupportAdequate(true, false), "No present modes is not adequate");
+        Check(!IsSwapchainSupportAdequate(false, false), "Neither formats nor present modes is not adequate");
+    }
+
+    void TestChooseSurfaceFormatPrefersSrgbBgra()
+    {
+        const std::vector<VkSurfaceFormatKHR> available{
+            {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+            {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+            {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+        };
+        const VkSurfaceFormatKHR chosen = ChooseSurfaceFormat(available);
+        Check(chosen.format == VK_FORMAT_B8G8R8A8_SRGB && chosen.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+              "SRGB BGRA is preferred when available, regardless of list order");
+    }
+
+    void TestChooseSurfaceFormatFallsBackToFirst()
+    {
+        const std::vector<VkSurfaceFormatKHR> available{
+            {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+            {VK_FORMAT_R5G6B5_UNORM_PACK16, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+        };
+        const VkSurfaceFormatKHR chosen = ChooseSurfaceFormat(available);
+        Check(chosen.format == VK_FORMAT_R8G8B8A8_UNORM, "Falls back to the first listed format when SRGB BGRA is unavailable");
+    }
+
+    void TestChoosePresentModePrefersFifo()
+    {
+        const std::vector<VkPresentModeKHR> available{VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR};
+        Check(ChoosePresentMode(available) == VK_PRESENT_MODE_FIFO_KHR, "FIFO is chosen even when other modes are listed first");
+    }
+
+    void TestChooseSwapchainImageCountClampsToMax()
+    {
+        VkSurfaceCapabilitiesKHR capabilities{};
+        capabilities.minImageCount = 2;
+        capabilities.maxImageCount = 2;
+        Check(ChooseSwapchainImageCount(capabilities) == 2, "minImageCount+1 is clamped down to a nonzero maxImageCount");
+    }
+
+    void TestChooseSwapchainImageCountNoMaxLimit()
+    {
+        VkSurfaceCapabilitiesKHR capabilities{};
+        capabilities.minImageCount = 2;
+        capabilities.maxImageCount = 0; // 0 means "no maximum"
+        Check(ChooseSwapchainImageCount(capabilities) == 3, "minImageCount+1 is used as-is when maxImageCount is 0 (no maximum)");
+    }
+
+    void TestChooseSwapchainExtentUsesCurrentExtentWhenFixed()
+    {
+        VkSurfaceCapabilitiesKHR capabilities{};
+        capabilities.currentExtent = {800, 600};
+        const VkExtent2D extent = ChooseSwapchainExtent(capabilities, 1920, 1080);
+        Check(extent.width == 800 && extent.height == 600, "currentExtent is used as-is when the surface dictates a fixed size");
+    }
+
+    void TestChooseSwapchainExtentClampsWindowSize()
+    {
+        VkSurfaceCapabilitiesKHR capabilities{};
+        capabilities.currentExtent = {std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()};
+        capabilities.minImageExtent = {100, 100};
+        capabilities.maxImageExtent = {1000, 1000};
+        const VkExtent2D extent = ChooseSwapchainExtent(capabilities, 50, 2000);
+        Check(extent.width == 100, "Window width below the surface minimum is clamped up");
+        Check(extent.height == 1000, "Window height above the surface maximum is clamped down");
+    }
 }
 
 int main()
@@ -121,6 +216,18 @@ int main()
     TestDecodeVulkanVersion();
     TestFormatVulkanVersion();
     TestVkResultToString();
+
+    TestHasSeparatePresentQueue();
+    TestGetUniqueQueueFamiliesSameFamily();
+    TestGetUniqueQueueFamiliesDifferentFamilies();
+    TestIsSwapchainSupportAdequate();
+    TestChooseSurfaceFormatPrefersSrgbBgra();
+    TestChooseSurfaceFormatFallsBackToFirst();
+    TestChoosePresentModePrefersFifo();
+    TestChooseSwapchainImageCountClampsToMax();
+    TestChooseSwapchainImageCountNoMaxLimit();
+    TestChooseSwapchainExtentUsesCurrentExtentWhenFixed();
+    TestChooseSwapchainExtentClampsWindowSize();
 
     if (g_failureCount == 0)
     {

@@ -988,3 +988,390 @@ invoked), full build succeeds with `arengine_vulkan_tests`/
 exactly the missing `VulkanTests`), including `RenderingTests` passing
 — confirming `NullRenderDevice` needs nothing Vulkan-related to build
 or run correctly.
+
+## 17. M8B Implementation Notes
+
+M8B connects AREngine's Platform `Window` to Vulkan and gets a real
+image on screen: instance → `VkSurfaceKHR` → presentation-capable
+device → swapchain → acquire → clear → present, looping until the
+window closes, surviving resize and minimize along the way.
+Deliberately no triangle, no shaders, no pipeline — that's M8C.
+
+### Native Window Handle
+
+`Window`'s public interface gained exactly one new method:
+`GetNativeHandle() -> NativeWindowHandle`. `NativeWindowHandle`
+(`engine/platform/include/AREngine/Platform/NativeWindowHandle.hpp`) is
+a tiny, deliberate escape hatch:
+
+```cpp
+enum class NativeWindowPlatform { Windows };
+struct NativeWindowHandle
+{
+    NativeWindowPlatform platform = NativeWindowPlatform::Windows;
+    void* window = nullptr;   // HWND on Windows
+    void* instance = nullptr; // HINSTANCE on Windows
+};
+```
+
+`window`/`instance` are `void*`, not `HWND`/`HINSTANCE`, specifically so
+this header — and everything that includes `Platform.hpp` — never pulls
+in `Windows.h`. `WindowsWindow::GetNativeHandle()` does the one
+`reinterpret_cast` from real `HWND`/`HINSTANCE` to `void*`; the only
+other place those values get cast back is `VulkanSurface.cpp`, in its
+own `Windows.h`-including translation unit. This is intentionally
+narrow: nothing about a window's size, events, or close state goes
+through this path — only a graphics API surface creation call needs raw
+OS handles, and that's the only thing this exists for.
+
+### Platform Dependency Isolation (M8B)
+
+The concern going in was real: don't let the whole `Rendering` module
+casually depend on `Platform`. What actually happened:
+
+- The generic RHI (`RenderDevice`, `NullRenderDevice`, `Rendering.hpp`)
+  still links nothing from `Platform` — unchanged from M0–M8A.
+- `AREngine::Platform` is linked to `arengine_rendering` **PRIVATE**,
+  and only inside the `if(ARENGINE_ENABLE_VULKAN)` block in
+  `engine/rendering/CMakeLists.txt`. It is invisible to anything that
+  merely links `AREngine::Rendering` — no public Rendering header
+  mentions `Platform` or `NativeWindowHandle`.
+- The dependency is used in exactly one file: `VulkanSurface.hpp/.cpp`,
+  which takes a `NativeWindowHandle` and produces a `VkSurfaceKHR`.
+  Nothing else in `src/vulkan/` touches `Platform` at all.
+
+So the actual dependency graph is: `Rendering` (generic RHI) has no
+Platform dependency, ever. `Rendering`'s *Vulkan backend*, when built,
+privately depends on `Platform` for exactly one conversion. Turning
+`ARENGINE_ENABLE_VULKAN` off removes even that.
+
+### Instance Extensions (M8B)
+
+`VulkanInstance` gained a constructor parameter,
+`explicit VulkanInstance(bool enablePresentationExtensions = false)`,
+defaulting to `false` so M8A's `arengine_vulkan_demo` is byte-for-byte
+unaffected. The M8B presentation demo passes `true`. When `true`,
+`VK_KHR_surface` and `VK_KHR_win32_surface` are queried via
+`vkEnumerateInstanceExtensionProperties` (never assumed present) and
+enabled only if both are actually reported; if either is missing, the
+constructor asserts — there is no meaningful way to continue without
+them once presentation was requested. `VulkanInstance.cpp` is now one
+of the two Vulkan `.cpp` files (with `VulkanSurface.cpp`) that defines
+`VK_USE_PLATFORM_WIN32_KHR` and includes `<Windows.h>` itself, purely to
+see the `VK_KHR_WIN32_SURFACE_EXTENSION_NAME` macro — nothing Win32
+leaks out of that translation unit.
+
+### Device Extensions (M8B)
+
+`VulkanDevice` gained a second constructor, alongside M8A's original
+(unchanged) one:
+
+```cpp
+VulkanDevice(VkPhysicalDevice, std::uint32_t graphicsQueueFamilyIndex);                       // M8A
+VulkanDevice(VkPhysicalDevice, const QueueFamilyIndices&, bool enableSwapchainExtension);      // M8B
+```
+
+Two constructors rather than one modified/defaulted signature, for the
+same reason `SelectPhysicalDeviceForPresentation` is a separate
+function from `SelectPhysicalDevice` (below): M8A's demo/tests keep
+calling exactly what they always called, unchanged. The M8B constructor
+requests one `VkDeviceQueueCreateInfo` per *unique* queue family
+(`GetUniqueQueueFamilies` — one entry if graphics and present share a
+family, two if not) and enables `VK_KHR_swapchain` when
+`enableSwapchainExtension` is true. `GetPresentQueue()` returns the same
+`VkQueue` as `GetGraphicsQueue()` when the families are the same
+(Vulkan queues are retrieved per family+index; requesting the same
+family twice would itself be invalid).
+
+### Queue Families (M8B)
+
+`QueueFamilyIndices { graphicsFamily, presentFamily }`
+(`VulkanQueueFamilies.hpp`) never assumes the two are the same family.
+`SelectPhysicalDeviceForPresentation` finds both independently
+(`FindGraphicsQueueFamily` unchanged from M8A; `FindPresentQueueFamily`
+calls `vkGetPhysicalDeviceSurfaceSupportKHR` per family) and rejects any
+device missing either. `HasSeparatePresentQueue` and
+`GetUniqueQueueFamilies` are pure logic, unit-tested directly. **On the
+development machine's GPU (NVIDIA RTX 3060 Laptop), graphics and
+present turned out to share the same queue family (index 0)** — the
+single/dual-queue-family code paths (device queue creation,
+`VK_SHARING_MODE_EXCLUSIVE` vs `CONCURRENT`) are both implemented and
+unit-tested, but only the shared-family path has been exercised against
+real hardware in this environment; the differing-family path is
+correct per the Vulkan spec and covered by `TestGetUniqueQueueFamilies
+DifferentFamilies`/`TestHasSeparatePresentQueue`, but not yet proven on
+a GPU that actually splits the two.
+
+### Surface Ownership (M8B)
+
+`VulkanSurface` (`engine/rendering/src/vulkan/VulkanSurface.hpp/.cpp`)
+owns exactly one `VkSurfaceKHR`, created from a `VkInstance` and a
+`NativeWindowHandle`. This is the one file in Rendering's Vulkan backend
+that includes `Windows.h` for surface creation itself (see "Platform
+Dependency Isolation" above) — asserts if handed a non-Windows handle,
+since AREngine has no other platform's `Window` yet. `Platform` never
+sees or owns a `VkSurfaceKHR`; Vulkan Rendering owns every Vulkan object
+it creates, full stop. Not copyable or movable, same discipline as
+every other owned Vulkan object in this backend.
+
+### Swapchain Support Query (M8B)
+
+`SwapchainSupportDetails { capabilities, formats, presentModes }` and
+`QuerySwapchainSupport(device, surface)`
+(`VulkanSwapchainSupport.hpp/.cpp`) wrap the three real Vulkan calls
+(`vkGetPhysicalDeviceSurfaceCapabilitiesKHR`/`FormatsKHR`/
+`PresentModesKHR`). `IsSwapchainSupportAdequate(bool hasFormats, bool
+hasPresentModes)` is pure logic (deliberately takes two bools, not the
+whole struct, so it's trivially unit-testable) — an empty format or
+present-mode list means "not supported," per spec, not merely "use
+defaults."
+
+### Surface Format (M8B)
+
+`ChooseSurfaceFormat` prefers `VK_FORMAT_B8G8R8A8_SRGB` +
+`VK_COLOR_SPACE_SRGB_NONLINEAR_KHR` when available, falling back to
+whatever the device lists first otherwise — never a hard assumption
+with no fallback. On the development machine, `B8G8R8A8_SRGB` (format
+value `50`) was chosen.
+
+### Present Mode (M8B)
+
+`ChoosePresentMode` always searches for and returns
+`VK_PRESENT_MODE_FIFO_KHR` — guaranteed by the Vulkan spec to be
+supported everywhere, and behaves like vsync. M8B deliberately does not
+chase mailbox/immediate for lower latency; that's a later milestone's
+decision once there's an actual frame-time budget to reason about.
+Asserts if FIFO is somehow absent (a spec violation, not a normal
+"unsupported" case to degrade from).
+
+### Swapchain Extent (M8B)
+
+`ChooseSwapchainExtent` uses `capabilities.currentExtent` verbatim when
+the surface dictates a fixed size (`currentExtent.width !=
+UINT32_MAX`); otherwise it clamps the window's **client-area**
+width/height (never the outer window size — the same distinction M2's
+`AdjustWindowRect` decision established) to
+`[minImageExtent, maxImageExtent]`. This one function is also what the
+minimize-handling fix below leans on directly (see "Resize / Swapchain
+Recreation").
+
+### Swapchain Image Count (M8B)
+
+`ChooseSwapchainImageCount` returns `minImageCount + 1`, clamped down to
+`maxImageCount` if the device reports a nonzero maximum (`0` means "no
+maximum"). Not an assumption of triple buffering — just one more than
+the device's stated minimum. On the development machine this resolved
+to **3 images** (`minImageCount` 2, effectively unbounded maximum).
+
+### Image Sharing Mode (M8B)
+
+`VulkanSwapchain`'s constructor sets `VK_SHARING_MODE_CONCURRENT` (with
+both unique queue family indices listed) when
+`HasSeparatePresentQueue` is true, and `VK_SHARING_MODE_EXCLUSIVE`
+otherwise. On the development machine (shared graphics/present family),
+`EXCLUSIVE` was exercised; see "Queue Families (M8B)" for the caveat
+that the `CONCURRENT` path is implemented and unit-tested but not yet
+proven on real hardware in this environment.
+
+### Image Views (M8B)
+
+`VulkanSwapchain` creates one `VkImageView` per swapchain image
+(`VK_IMAGE_VIEW_TYPE_2D`, identity component swizzle, one color
+mip/layer) and destroys all of them before destroying the
+`VkSwapchainKHR` itself, in its destructor. **A real validation error
+was hit and fixed here**: the swapchain was originally created with
+only `VK_IMAGE_USAGE_TRANSFER_DST_BIT` (all M8B actually clears with is
+`vkCmdClearColorImage`, a transfer operation) — but `vkCreateImageView`
+requires the underlying image to have been created with at least one of
+a specific set of usage bits (sampled/storage/color-attachment/depth-
+stencil-attachment/…), none of which `TRANSFER_DST` is part of. Fixed
+by also requesting `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` on the
+swapchain images — which M8C's render pass will need these images for
+anyway, so this isn't a throwaway workaround.
+
+### Clearing (M8B)
+
+No render pass, no shaders. Each frame: `vkCmdPipelineBarrier` (via the
+small `RecordImageLayoutTransition` helper in `VulkanImageBarrier.hpp/
+.cpp`) from `VK_IMAGE_LAYOUT_UNDEFINED` to
+`VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`, then `vkCmdClearColorImage`
+with a fixed visible teal clear color, then a second barrier from
+`TRANSFER_DST_OPTIMAL` to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`. Barrier
+stages are `VK_PIPELINE_STAGE_TRANSFER_BIT` (not
+`COLOR_ATTACHMENT_OUTPUT_BIT`, since this is a transfer operation, not
+a render-pass attachment write), bracketed by `TOP_OF_PIPE`/
+`BOTTOM_OF_PIPE` for the "don't care what came before/after" ends.
+
+### Command Infrastructure (M8B)
+
+One `VulkanCommandPool` (thin RAII wrapper, `VulkanCommandPool.hpp/
+.cpp`) on the graphics queue family, created with
+`VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`. Two primary command
+buffers are allocated from it up front (one per frame-in-flight) and
+reset + re-recorded every frame — no per-frame allocation, no
+multithreaded recording, no transfer queue. The command pool is the
+only piece of "infrastructure" that got its own RAII class; the command
+buffers, semaphores, fences, and the frame-loop orchestration itself
+all live in `tests/vulkan_present_demo.cpp` rather than in Rendering
+proper. Deliberate: their shape will very likely change once M8C
+introduces real command recording against a graphics pipeline, so
+locking in a permanent class design for them now would be premature.
+
+### Synchronization Model (M8B)
+
+Two frames in flight (`kMaxFramesInFlight = 2`). Per frame-in-flight:
+one `imageAvailable` semaphore and one `inFlight` fence
+(signaled-at-creation, so the first frame doesn't stall). Per
+**swapchain image** (not per frame-in-flight): one `renderFinished`
+semaphore, plus the standard `imagesInFlight` fence-tracking array
+(`VkFence` per image, `VK_NULL_HANDLE` = "not in use yet") that makes
+the frame waiting on an image also wait for whatever earlier frame is
+still using it.
+
+**A second real validation error was hit and fixed here.** The first
+version indexed `renderFinished` by frame-in-flight (2 semaphores,
+reused every other frame) rather than by swapchain image (3 images).
+With a 3-image swapchain and only 2 frames in flight, the presentation
+engine's actual acquire order doesn't walk frame-in-flight order 1:1 —
+so a `renderFinished` semaphore could still be in use by a pending
+`vkQueuePresentKHR` when the next frame using that same frame-in-flight
+slot tried to signal it again, tripping
+`VUID-vkQueueSubmit-pSignalSemaphores-00067` ("semaphore must be
+unsignaled when the signal operation is submitted"). Fixed by moving
+`renderFinished` to a `std::vector<VkSemaphore>` sized to and indexed by
+the *swapchain image index*, recreated alongside the swapchain whenever
+image count could change. This is the standard, spec-correct pattern
+(see the Vulkan swapchain-semaphore-reuse guide) — not an AREngine-
+specific workaround.
+
+Per-frame loop: wait `inFlight[currentFrame]` → `vkAcquireNextImageKHR`
+signals `imageAvailable[currentFrame]` → wait on
+`imagesInFlight[imageIndex]` if set → record & submit (waits
+`imageAvailable[currentFrame]`, signals `renderFinished[imageIndex]`
+and `inFlight[currentFrame]`) → present (waits
+`renderFinished[imageIndex]`) → `currentFrame = (currentFrame + 1) %
+kMaxFramesInFlight`.
+
+### Resize / Swapchain Recreation (M8B)
+
+No `oldSwapchain` handoff — on `VK_ERROR_OUT_OF_DATE_KHR`,
+`VK_SUBOPTIMAL_KHR`, or a `WindowResizeEvent`-set flag, the demo calls
+`vkDeviceWaitIdle`, destroys the whole `VulkanSwapchain` object, and
+constructs a new one at the window's current client size. Simpler than
+an in-place transition, and sufficient for M8B's "don't break on
+resize" bar. `renderFinishedSemaphores` and `imagesInFlight` are resized
+alongside (image count can change on recreation).
+
+### Minimize Handling (M8B)
+
+**A third real validation error was hit and fixed here** — the most
+interesting one. The first version waited for `window->GetWidth() != 0
+&& window->GetHeight() != 0` before recreating the swapchain, on the
+theory that a minimized window reports zero size. In practice, around
+the exact moment of a minimize/restore transition, AREngine's own
+cached `Window` width/height could still read as the pre-minimize size
+while the *surface's* live `VkSurfaceCapabilitiesKHR.currentExtent`
+already (or still) reported a degenerate `{0, 0}` — because
+`ChooseSwapchainExtent` takes `currentExtent` verbatim whenever the
+surface provides a fixed one, entirely bypassing the window-size clamp.
+The result was a real `vkCreateSwapchainKHR` validation error
+(`VUID-VkSwapchainCreateInfoKHR-imageExtent-01689`, zero-sized extent).
+Fixed by having the wait loop query the surface directly — the same way
+the swapchain itself will — rather than trusting `Window`'s cached
+size:
+
+```cpp
+while (!window->ShouldClose())
+{
+    const auto support = QuerySwapchainSupport(physicalDevice, surface);
+    const VkExtent2D extent = ChooseSwapchainExtent(support.capabilities, window->GetWidth(), window->GetHeight());
+    if (extent.width != 0 && extent.height != 0) break;
+    window->PollEvents();
+}
+```
+
+Verified against real hardware afterward with two resizes plus two full
+minimize→restore cycles in one run: zero validation errors, swapchain
+correctly recreated each time.
+
+### Exact Destruction Order (M8B)
+
+Confirmed by both the type system (C++ destroys locals in reverse
+declaration order) and a real, clean shutdown log
+(`vkDeviceWaitIdle` → manual semaphore/fence destruction → automatic
+teardown): GPU idle → command pool (frees its command buffers
+implicitly) → swapchain (image views, then the swapchain itself) →
+device → surface → debug messenger (inside `VulkanInstance`'s own
+destructor) → instance → window. Nothing Vulkan-owned outlives what it
+depends on at any point in this chain.
+
+### Frame / Rendering Boundary (M8B)
+
+`RenderDevice::BeginRendering`/`EndRendering` were **not** touched, and
+the Vulkan swapchain/presentation loop is **not** reachable through
+them. `tests/vulkan_present_demo.cpp` reaches directly into
+`engine/rendering/src/vulkan/`'s private headers, the same pattern
+`arengine_vulkan_demo` established in M8A — a deliberate, temporary
+exception for in-tree test/demo code. `NullRenderDevice` remains
+Runtime's only backend; `AREngineSandbox.exe`'s behavior is unchanged by
+M8B. This is intentional: forcing swapchain ownership into the generic
+`RenderDevice` interface now, before M8C/M8D have proven what a real
+draw call needs, would mean guessing at the interface shape rather than
+discovering it.
+
+### Runtime Integration
+
+Unchanged. No sub-milestone of M8 up through M8B has touched
+`runtime/`; `AREngineSandbox.exe` still runs against `NullRenderDevice`
+exactly as it did after M7.
+
+### Validation Results (M8B)
+
+Both build configurations reverified after M8B: `ARENGINE_ENABLE_VULKAN=ON`
+(default) — full `/W4 /WX` clean build (a stray warning was hit and
+fixed during verification, but it turned out to be a pre-existing
+`/EHsc` interaction from the verification method itself, not M8B code —
+see below), `ctest` 9/9 including the ten new M8B pure-logic checks in
+`VulkanTests`. `ARENGINE_ENABLE_VULKAN=OFF` — full build succeeds,
+`ctest` 8/8 (no `VulkanTests`), confirming M8B's additions stay fully
+inside the optional-Vulkan boundary established after M8A.
+
+`arengine_vulkan_present_demo` run against real hardware (NVIDIA GeForce
+RTX 3060 Laptop GPU): window opens at 1280×720, immediately shows the
+fixed teal clear color (confirmed both by the validation-layer log and
+a screenshot), survives two window resizes and two full minimize/
+restore cycles with the swapchain correctly recreated each time
+(`Swapchain recreated: WxH, N images` logged for each), and closes
+cleanly via the window's close button with `vkDeviceWaitIdle` completing
+and no hang. **Zero validation errors or warnings in the final run** —
+the three real validation errors found during development (image-view
+usage flags, semaphore-reuse indexing, minimize-transition race) were
+all fixed before this run, not worked around or suppressed.
+
+- Graphics queue family index: **0**
+- Present queue family index: **0** (same family as graphics on this
+  GPU — see "Queue Families (M8B)")
+- Chosen surface format: **`VK_FORMAT_B8G8R8A8_SRGB`** (value `50`),
+  `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`
+- Chosen present mode: **`VK_PRESENT_MODE_FIFO_KHR`**
+- Swapchain image count: **3**
+- Frames-in-flight model: **2**, with per-image `renderFinished`
+  semaphores and per-image `imagesInFlight` fence tracking (see
+  "Synchronization Model (M8B)")
+
+### What's Deferred to M8C+
+
+No vertex/fragment shaders, no graphics pipeline, no vertex/index
+buffers, no triangle, no texture, no depth buffer, no camera, no Scene
+rendering, no OpenXR, no VMA, no descriptor sets, no materials, no
+render graph. The swapchain-owning `VulkanSwapchain`/`VulkanSurface`
+classes are reusable infrastructure a real `VulkanRenderDevice` will
+need; the command-pool/sync/frame-loop code in the demo is explicitly
+temporary and expected to be redesigned once M8C introduces real
+command recording against a pipeline.
+
+No other architectural issues were discovered beyond the three
+validation errors already described (each found via real hardware
+validation-layer output during development, and fixed before the
+milestone's final run) — every other piece of M8B's design worked as
+planned on the first real run.

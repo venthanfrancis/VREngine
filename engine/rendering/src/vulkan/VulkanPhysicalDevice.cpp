@@ -1,9 +1,11 @@
 #include "VulkanPhysicalDevice.hpp"
 
+#include "VulkanSwapchainSupport.hpp"
 #include "VulkanVersion.hpp"
 
 #include "AREngine/Core/Assert.hpp"
 
+#include <cstring>
 #include <limits>
 
 namespace AREngine::Rendering::Vulkan
@@ -78,6 +80,107 @@ namespace AREngine::Rendering::Vulkan
         }
 
         AR_ASSERT_MSG(found, "No suitable Vulkan physical device found (needs a graphics-capable queue family and API >= target version)");
+        return best;
+    }
+
+    bool DeviceSupportsSwapchainExtension(VkPhysicalDevice device)
+    {
+        std::uint32_t extensionCount = 0;
+        vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
+
+        std::vector<VkExtensionProperties> extensions(extensionCount);
+        vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, extensions.data());
+
+        for (const VkExtensionProperties& extension : extensions)
+        {
+            if (std::strcmp(extension.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::optional<std::uint32_t> FindPresentQueueFamily(VkPhysicalDevice device, VkSurfaceKHR surface, std::uint32_t queueFamilyCount)
+    {
+        for (std::uint32_t i = 0; i < queueFamilyCount; ++i)
+        {
+            VkBool32 presentSupport = VK_FALSE;
+            vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &presentSupport);
+            if (presentSupport == VK_TRUE)
+            {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    SelectedPresentableDevice SelectPhysicalDeviceForPresentation(VkInstance instance, VkSurfaceKHR surface)
+    {
+        std::uint32_t deviceCount = 0;
+        vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+        AR_ASSERT_MSG(deviceCount > 0, "No Vulkan-capable physical devices found");
+
+        std::vector<VkPhysicalDevice> devices(deviceCount);
+        vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
+
+        SelectedPresentableDevice best;
+        int bestRank = std::numeric_limits<int>::max();
+        bool found = false;
+
+        for (VkPhysicalDevice device : devices)
+        {
+            VkPhysicalDeviceProperties properties;
+            vkGetPhysicalDeviceProperties(device, &properties);
+
+            if (properties.apiVersion < kTargetApiVersion)
+            {
+                continue;
+            }
+
+            if (!DeviceSupportsSwapchainExtension(device))
+            {
+                continue;
+            }
+
+            std::uint32_t queueFamilyCount = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
+            std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+            vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+
+            const std::optional<std::uint32_t> graphicsFamily = FindGraphicsQueueFamily(queueFamilies);
+            if (!graphicsFamily.has_value())
+            {
+                continue;
+            }
+
+            const std::optional<std::uint32_t> presentFamily = FindPresentQueueFamily(device, surface, queueFamilyCount);
+            if (!presentFamily.has_value())
+            {
+                continue; // this device can't present to our surface at all
+            }
+
+            const SwapchainSupportDetails swapchainSupport = QuerySwapchainSupport(device, surface);
+            if (!IsSwapchainSupportAdequate(!swapchainSupport.formats.empty(), !swapchainSupport.presentModes.empty()))
+            {
+                continue;
+            }
+
+            const int rank = RankPhysicalDeviceType(properties.deviceType);
+            if (!found || rank < bestRank)
+            {
+                best.device = device;
+                best.properties = properties;
+                best.queueFamilies.graphicsFamily = *graphicsFamily;
+                best.queueFamilies.presentFamily = *presentFamily;
+                bestRank = rank;
+                found = true;
+            }
+        }
+
+        AR_ASSERT_MSG(found,
+            "No suitable presentable Vulkan physical device found "
+            "(needs graphics + present queue families, VK_KHR_swapchain, and adequate swapchain support)");
         return best;
     }
 }

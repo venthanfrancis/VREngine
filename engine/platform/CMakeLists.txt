@@ -8,6 +8,7 @@ target_sources(arengine_platform
     PRIVATE
         include/AREngine/Platform/Platform.hpp
         include/AREngine/Platform/WindowDesc.hpp
+        include/AREngine/Platform/NativeWindowHandle.hpp
         include/AREngine/Platform/Window.hpp
         include/AREngine/Platform/WindowCloseEvent.hpp
         include/AREngine/Platform/WindowResizeEvent.hpp

@@ -2,6 +2,8 @@
 
 // Private Vulkan bring-up implementation — see VulkanVersion.hpp.
 
+#include "VulkanQueueFamilies.hpp"
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -55,4 +57,43 @@ namespace AREngine::Rendering::Vulkan
     // unit-tested, only exercised by the manual bring-up demo. See
     // docs/ARCHITECTURE.md, "Physical Device Selection".
     [[nodiscard]] SelectedPhysicalDevice SelectPhysicalDevice(VkInstance instance);
+
+    // --- M8B: presentation-aware selection ---
+    //
+    // Deliberately a separate function from SelectPhysicalDevice above,
+    // not a modified/overloaded version of it: M8A's bring-up demo and
+    // tests keep working against exactly the function they always used,
+    // and this one's extra requirements (a real VkSurfaceKHR, present
+    // support, VK_KHR_swapchain) are new, M8B-specific criteria that
+    // don't apply to M8A's simpler bring-up. See docs/ARCHITECTURE.md,
+    // "Physical Device Selection (M8B)".
+
+    struct SelectedPresentableDevice
+    {
+        VkPhysicalDevice device = VK_NULL_HANDLE;
+        VkPhysicalDeviceProperties properties{};
+        QueueFamilyIndices queueFamilies;
+    };
+
+    // True if `device` reports support for the VK_KHR_swapchain device
+    // extension. Makes a real Vulkan API call — not unit-tested.
+    [[nodiscard]] bool DeviceSupportsSwapchainExtension(VkPhysicalDevice device);
+
+    // Finds a queue family that supports presenting to `surface` —
+    // which may or may not be the same family FindGraphicsQueueFamily
+    // finds; this function does not assume either way. Makes real
+    // Vulkan API calls (one vkGetPhysicalDeviceSurfaceSupportKHR call
+    // per queue family) — not unit-tested.
+    [[nodiscard]] std::optional<std::uint32_t> FindPresentQueueFamily(
+        VkPhysicalDevice device, VkSurfaceKHR surface, std::uint32_t queueFamilyCount);
+
+    // Like SelectPhysicalDevice, but additionally requires: a
+    // graphics-capable queue family, a (possibly different)
+    // present-capable queue family for `surface`, VK_KHR_swapchain
+    // support, and adequate swapchain support (at least one surface
+    // format and present mode — see VulkanSwapchainSupport.hpp).
+    // Asserts if no suitable device is found. Makes real Vulkan API
+    // calls — not unit-tested, only exercised by the manual
+    // presentation demo.
+    [[nodiscard]] SelectedPresentableDevice SelectPhysicalDeviceForPresentation(VkInstance instance, VkSurfaceKHR surface);
 }

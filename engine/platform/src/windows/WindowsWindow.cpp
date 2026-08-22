@@ -208,6 +208,15 @@ namespace AREngine::Platform
         m_eventCallback = std::move(callback);
     }
 
+    NativeWindowHandle WindowsWindow::GetNativeHandle() const
+    {
+        NativeWindowHandle handle;
+        handle.platform = NativeWindowPlatform::Windows;
+        handle.window = reinterpret_cast<void*>(m_hwnd);
+        handle.instance = reinterpret_cast<void*>(GetModuleHandleW(nullptr));
+        return handle;
+    }
+
     LRESULT CALLBACK WindowsWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (message == WM_NCCREATE)

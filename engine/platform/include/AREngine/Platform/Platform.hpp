@@ -10,6 +10,7 @@
 //
 // Includes:
 //   - WindowDesc.hpp                  window configuration
+//   - NativeWindowHandle.hpp           low-level escape hatch for Vulkan/OpenXR (M8B)
 //   - Window.hpp                       the generic Window interface + CreateAppWindow
 //   - WindowCloseEvent.hpp
 //   - WindowResizeEvent.hpp
@@ -26,6 +27,7 @@
 // consumer exists rather than speculatively now.
 
 #include "AREngine/Platform/WindowDesc.hpp"
+#include "AREngine/Platform/NativeWindowHandle.hpp"
 #include "AREngine/Platform/Window.hpp"
 #include "AREngine/Platform/WindowCloseEvent.hpp"
 #include "AREngine/Platform/WindowResizeEvent.hpp"

@@ -12,14 +12,20 @@ namespace AREngine::Rendering::Vulkan
     // See docs/ARCHITECTURE.md, "Instance Ownership" and "Validation
     // Behavior".
     //
-    // No surface extensions are enabled — M8A has no window/surface to
-    // present to yet (see docs/ARCHITECTURE.md, "What's Deferred to
-    // M8B+"). Not copyable or movable: exactly one VkInstance per
+    // `enablePresentationExtensions` defaults to false, preserving
+    // M8A's exact behavior (no surface extensions - there was no
+    // window/surface to present to yet). Pass true (as the M8B
+    // presentation demo does) to additionally request VK_KHR_surface
+    // and VK_KHR_win32_surface - queried via
+    // vkEnumerateInstanceExtensionProperties first, never assumed
+    // present. See docs/ARCHITECTURE.md, "Instance Extensions (M8B)".
+    //
+    // Not copyable or movable: exactly one VkInstance per
     // VulkanInstance, destroyed exactly once, by this object alone.
     class VulkanInstance
     {
     public:
-        VulkanInstance();
+        explicit VulkanInstance(bool enablePresentationExtensions = false);
         ~VulkanInstance();
 
         VulkanInstance(const VulkanInstance&) = delete;
@@ -29,11 +35,13 @@ namespace AREngine::Rendering::Vulkan
 
         [[nodiscard]] VkInstance Get() const { return m_instance; }
         [[nodiscard]] bool IsValidationEnabled() const { return m_debugMessenger != VK_NULL_HANDLE; }
+        [[nodiscard]] bool ArePresentationExtensionsEnabled() const { return m_presentationExtensionsEnabled; }
 
     private:
         void SetUpDebugMessenger();
 
         VkInstance m_instance = VK_NULL_HANDLE;
         VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
+        bool m_presentationExtensionsEnabled = false;
     };
 }

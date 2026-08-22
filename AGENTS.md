@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A (Vulkan bring-up) complete.** `Core`
+**M0 through M7 complete; M8A and M8B (Vulkan bring-up + presentation) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -45,12 +45,29 @@ Vulkan calls). No `VulkanRenderDevice` exists yet — see
 built this milestone. No surface, no swapchain, no shaders, no
 triangle — bring-up only.
 
-There is still no real rendering output, no frame limiting, no
-pipeline/shader API, no ECS/component system, no real mesh/texture/image
-format parsing, and no analog/XR/controller input — see Sections 11–15.
-Everything else (`XR`, `Editor`) is still an M0-style stub with no
-functionality. Next up is M8B+ (surface, swapchain, first triangle). See
-`docs/ROADMAP.md` for the full plan.
+**M8B adds real presentation** on top of M8A: `Window` gained
+`GetNativeHandle()` (a deliberately narrow `NativeWindowHandle` escape
+hatch — see `docs/ARCHITECTURE.md` Section 17), and Rendering's Vulkan
+backend gained `VulkanSurface`, `VulkanSwapchain`,
+`VulkanSwapchainSupport` (format/present-mode/extent/image-count
+policy), `VulkanQueueFamilies` (graphics vs. present, possibly
+different), `VulkanCommandPool`, and `VulkanImageBarrier`. The manual
+`tests/vulkan_present_demo.cpp` opens a real AREngine window, creates a
+swapchain, and clears each acquired image to a visible color every
+frame until the window closes — handling resize and minimize along the
+way. Still **no shaders, no pipeline, no triangle** — that's M8C. Three
+real validation-layer errors were found and fixed during M8B
+(image-view usage flags, per-image vs. per-frame semaphore indexing,
+and a minimize-transition race) — see `docs/ARCHITECTURE.md` Section 17
+for details; the final run has zero validation errors/warnings.
+
+There is still no real rendering output beyond a clear color, no frame
+limiting, no pipeline/shader API, no ECS/component system, no real
+mesh/texture/image format parsing, and no analog/XR/controller input —
+see Sections 11–15. Everything else (`XR`, `Editor`) is still an
+M0-style stub with no functionality. Next up is M8C+ (command
+buffers/render pass, shaders, first triangle). See `docs/ROADMAP.md`
+for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -58,9 +75,10 @@ functionality. Next up is M8B+ (surface, swapchain, first triangle). See
    `docs/ROADMAP.md` before adding functionality to a module.
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
-3. **Vulkan bring-up only (M8A)**: no surface, no swapchain, no shaders,
-   no rendering output yet — see `docs/ROADMAP.md`'s M8B+ row for what's
-   still pending within M8. **No OpenXR code** before milestone M9.
+3. **Vulkan bring-up + presentation only (M8A/M8B)**: no shaders, no
+   pipeline, no triangle yet — see `docs/ROADMAP.md`'s M8C+ row for
+   what's still pending within M8. **No OpenXR code** before milestone
+   M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

@@ -38,6 +38,7 @@ namespace AREngine::Platform
         [[nodiscard]] std::uint32_t GetWidth() const override;
         [[nodiscard]] std::uint32_t GetHeight() const override;
         void SetEventCallback(EventCallback callback) override;
+        [[nodiscard]] NativeWindowHandle GetNativeHandle() const override;
 
         // Public because RegisterClassExW needs its address from outside
         // the class (see EnsureWindowClassRegistered in the .cpp) — it's

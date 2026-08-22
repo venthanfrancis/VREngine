@@ -96,6 +96,18 @@ if(ARENGINE_ENABLE_VULKAN)
     target_link_libraries(arengine_vulkan_demo PRIVATE AREngine::Core AREngine::Rendering Vulkan::Vulkan)
     target_include_directories(arengine_vulkan_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
     target_compile_features(arengine_vulkan_demo PRIVATE cxx_std_20)
+
+    # Manual-only, M8B: requires a real Vulkan-capable GPU/driver and
+    # opens a real window - CTest must never wait on a human or a GPU.
+    # Built by CMake but deliberately NOT registered with add_test. Run
+    # it directly instead. See docs/ARCHITECTURE.md, "M8B Implementation
+    # Notes".
+    add_executable(arengine_vulkan_present_demo
+        vulkan_present_demo.cpp
+    )
+    target_link_libraries(arengine_vulkan_present_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Rendering Vulkan::Vulkan)
+    target_include_directories(arengine_vulkan_present_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+    target_compile_features(arengine_vulkan_present_demo PRIVATE cxx_std_20)
 endif()
 
 # Manual-only: proves M2's Window works end-to-end with real user
