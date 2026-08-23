@@ -10,7 +10,8 @@ namespace AREngine::Rendering::Vulkan
 {
     VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, VkDevice device,
                               std::uint32_t width, std::uint32_t height, VkFormat format,
-                              VkImageUsageFlags usage, VkMemoryPropertyFlags properties)
+                              VkImageUsageFlags usage, VkMemoryPropertyFlags properties,
+                              VkImageAspectFlags aspectMask)
         : m_device(device)
     {
         VkImageCreateInfo imageInfo{};
@@ -47,7 +48,7 @@ namespace AREngine::Rendering::Vulkan
         viewInfo.image = m_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = format;
-        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.aspectMask = aspectMask;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.baseArrayLayer = 0;

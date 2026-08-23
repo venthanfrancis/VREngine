@@ -9,7 +9,13 @@
 namespace AREngine::Rendering::Vulkan
 {
     // Owns one VkFramebuffer per swapchain image view, all matching
-    // the swapchain's extent and compatible with one VkRenderPass.
+    // the swapchain's extent and compatible with one VkRenderPass. As
+    // of M8F, every framebuffer also attaches the same single depth
+    // image view (attachment 1, matching VulkanRenderPass's attachment
+    // order exactly) - one depth image is shared across all swapchain
+    // images, since only one frame is ever being rasterized into a
+    // given framebuffer at a time. See docs/ARCHITECTURE.md,
+    // "Framebuffers With Depth (M8F)".
     //
     // Swapchain-dependent, unlike VulkanRenderPass: image views and
     // extent change on every swapchain recreation, so a
@@ -18,7 +24,11 @@ namespace AREngine::Rendering::Vulkan
     // as VulkanSwapchain itself — see docs/ARCHITECTURE.md, "Swapchain-
     // Dependent Pipeline Resources (M8C)"). The VkRenderPass it's built
     // against does NOT need to change, since the format it was created
-    // for doesn't change across a resize.
+    // for doesn't change across a resize. The depth image view passed
+    // in DOES change on resize (the depth image is recreated at the
+    // new extent - see docs/ARCHITECTURE.md, "Depth Lifetime (M8F)"),
+    // but that recreation happens outside this class; this class just
+    // uses whatever view it's given.
     //
     // Not copyable or movable: exactly one set of VkFramebuffers per
     // VulkanFramebuffers, destroyed exactly once, by this object alone.
@@ -28,6 +38,7 @@ namespace AREngine::Rendering::Vulkan
         VulkanFramebuffers(VkDevice device,
                             VkRenderPass renderPass,
                             const std::vector<VkImageView>& imageViews,
+                            VkImageView depthImageView,
                             VkExtent2D extent);
         ~VulkanFramebuffers();
 

@@ -1,5 +1,6 @@
 #include "VulkanGraphicsPipeline.hpp"
 
+#include "VulkanPushConstants.hpp"
 #include "VulkanResult.hpp"
 #include "VulkanShaderModule.hpp"
 #include "VulkanVertex.hpp"
@@ -74,6 +75,20 @@ namespace AREngine::Rendering::Vulkan
         multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+        // Standard depth test: closer fragments (smaller Z) win, and
+        // every passing fragment writes its own depth so later,
+        // farther-away fragments at the same pixel correctly lose to
+        // it. See docs/ARCHITECTURE.md, "Depth Compare / Clear Values
+        // (M8F)" for why LESS pairs with a clear value of 1.0. No
+        // depth bounds test, no stencil test - neither is needed here.
+        VkPipelineDepthStencilStateCreateInfo depthStencil{};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+        depthStencil.depthBoundsTestEnable = VK_FALSE;
+        depthStencil.stencilTestEnable = VK_FALSE;
+
         VkPipelineColorBlendAttachmentState colorBlendAttachment{};
         colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                                              | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -91,13 +106,23 @@ namespace AREngine::Rendering::Vulkan
         dynamicState.pDynamicStates = dynamicStates.data();
 
         // One descriptor set layout (the combined-image-sampler layout
-        // from VulkanDescriptorSetLayout), no push constants - see
-        // docs/ARCHITECTURE.md, "Pipeline Layout (M8C)" and "Pipeline
-        // Layout Change (M8E)".
+        // from VulkanDescriptorSetLayout) and one push constant range
+        // (MvpPushConstants - the MVP matrix and a tint color, visible
+        // to both stages since the vertex shader reads mvp and the
+        // fragment shader reads tint). See docs/ARCHITECTURE.md,
+        // "Pipeline Layout (M8C)", "Pipeline Layout Change (M8E)", and
+        // "Transform Upload Method (M8F)".
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(MvpPushConstants);
+
         VkPipelineLayoutCreateInfo layoutCreateInfo{};
         layoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         layoutCreateInfo.setLayoutCount = 1;
         layoutCreateInfo.pSetLayouts = &descriptorSetLayout;
+        layoutCreateInfo.pushConstantRangeCount = 1;
+        layoutCreateInfo.pPushConstantRanges = &pushConstantRange;
 
         VkResult layoutResult = vkCreatePipelineLayout(device, &layoutCreateInfo, nullptr, &m_layout);
         CheckVkResult(layoutResult, "vkCreatePipelineLayout");
@@ -111,6 +136,7 @@ namespace AREngine::Rendering::Vulkan
         pipelineCreateInfo.pViewportState = &viewportState;
         pipelineCreateInfo.pRasterizationState = &rasterization;
         pipelineCreateInfo.pMultisampleState = &multisampling;
+        pipelineCreateInfo.pDepthStencilState = &depthStencil;
         pipelineCreateInfo.pColorBlendState = &colorBlending;
         pipelineCreateInfo.pDynamicState = &dynamicState;
         pipelineCreateInfo.layout = m_layout;

@@ -1,18 +1,19 @@
-// Manual M8E validation demo — NOT part of the automated CTest suite,
+// Manual M8F validation demo — NOT part of the automated CTest suite,
 // since it requires a real Vulkan-capable GPU/driver and opens a real
 // window, neither of which CI/headless systems have. Built by CMake
 // but deliberately not registered with add_test. Run it manually.
 //
-// Extends M8D's vertex/index-buffer quad with a real sampled texture:
-// AREngine Window -> VkSurfaceKHR -> presentation-capable physical
-// device -> logical device with graphics+present queues -> swapchain
-// -> acquire -> [render pass: clear background, draw a textured quad
-// via vkCmdDrawIndexed with a bound descriptor set] -> present,
-// repeated every frame until the window closes, handling resize/
-// minimize along the way. The texture is a procedurally generated
-// checkerboard (no PNG/JPEG decoding) - see docs/ARCHITECTURE.md,
-// "Checkerboard Generation Strategy (M8E)". No mesh/material/model-
-// loading/camera/depth - see docs/ROADMAP.md, M8E.
+// Extends M8E's textured quad into genuine 3D: real Vec3 positions, a
+// fixed camera (Core::Math::LookAtRH), a right-handed/zero-to-one-depth
+// perspective projection (Core::Math::PerspectiveRH_ZO) with Vulkan's
+// NDC Y-flip applied as a separate, explicit Vulkan-layer step
+// (VulkanClipSpace::ApplyVulkanYFlip - see docs/ARCHITECTURE.md,
+// "Core/Vulkan Clip-Space Split"), a depth buffer, and depth testing -
+// proven by drawing two overlapping, differently-tinted copies of the
+// same quad at different depths, the nearer one submitted FIRST, and
+// confirming it still renders in front. See docs/ARCHITECTURE.md,
+// "Exact Visual Proof That Depth Testing Works (M8F)". No movable
+// camera, no Scene integration, no lighting - see docs/ROADMAP.md, M8F.
 //
 // This demo reaches directly into Rendering's private src/vulkan/
 // implementation (not through any public Rendering API), same as
@@ -25,7 +26,9 @@
 
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCheckerboard.hpp"
+#include "vulkan/VulkanClipSpace.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDepthFormat.hpp"
 #include "vulkan/VulkanDescriptorPool.hpp"
 #include "vulkan/VulkanDescriptorSetLayout.hpp"
 #include "vulkan/VulkanDevice.hpp"
@@ -34,6 +37,7 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
+#include "vulkan/VulkanPushConstants.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
 #include "vulkan/VulkanResult.hpp"
@@ -49,6 +53,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <vector>
 
 using namespace AREngine;
@@ -99,7 +104,7 @@ namespace
 int main()
 {
     Platform::WindowDesc desc;
-    desc.title = "AREngine M8E Vulkan Texture Demo";
+    desc.title = "AREngine M8F Vulkan Depth Demo";
     desc.width = 1280;
     desc.height = 720;
     auto window = Platform::CreateAppWindow(desc);
@@ -139,13 +144,20 @@ int main()
     AR_LOG_INFO(std::format("Swapchain extent: {}x{}", swapchain->GetExtent().width, swapchain->GetExtent().height));
     AR_LOG_INFO(std::format("Swapchain image count: {}", swapchain->GetImageCount()));
 
-    // renderPass/pipeline depend only on the swapchain's FORMAT, which
-    // doesn't change across a resize - so, unlike the swapchain itself,
-    // neither needs to be recreated in recreateSwapchain() below. Only
-    // framebuffers (which wrap image views + extent) does. See
+    // Chosen once, from device capabilities - fixed for the whole
+    // demo's lifetime, same as the swapchain's color format. See
+    // docs/ARCHITECTURE.md, "Depth Format Selection (M8F)".
+    const VkFormat depthFormat = FindSupportedDepthFormat(physicalDevice.device);
+    AR_LOG_INFO(std::format("Depth format: {}", static_cast<int>(depthFormat)));
+
+    // renderPass/pipeline depend only on the swapchain's color FORMAT
+    // and the (also fixed) depth format, neither of which changes
+    // across a resize - so, unlike the swapchain itself, neither needs
+    // to be recreated in recreateSwapchain() below. Only framebuffers
+    // and the depth image itself (both extent-dependent) do. See
     // docs/ARCHITECTURE.md, "Swapchain-Dependent Pipeline Resources
-    // (M8C)".
-    VulkanRenderPass renderPass(device.Get(), swapchain->GetImageFormat());
+    // (M8C)" and "Depth Lifetime (M8F)".
+    VulkanRenderPass renderPass(device.Get(), swapchain->GetImageFormat(), depthFormat);
 
     // One combined-image-sampler binding, matching triangle.frag's
     // `layout(set = 0, binding = 0) uniform sampler2D uTexture`. See
@@ -154,17 +166,29 @@ int main()
 
     VulkanGraphicsPipeline pipeline(device.Get(), renderPass.Get(), descriptorSetLayout.Get());
 
+    // The depth image IS swapchain/extent-dependent (unlike a texture -
+    // see docs/ARCHITECTURE.md, "Depth Lifetime (M8F)"): sized to the
+    // swapchain's current extent, so it must be destroyed and rebuilt
+    // alongside the swapchain on every resize, same as framebuffers.
+    auto depthImage = std::make_unique<VulkanImage>(
+        physicalDevice.device, device.Get(), swapchain->GetExtent().width, swapchain->GetExtent().height,
+        depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        VK_IMAGE_ASPECT_DEPTH_BIT);
+
     auto framebuffers = std::make_unique<VulkanFramebuffers>(
-        device.Get(), renderPass.Get(), swapchain->GetImageViews(), swapchain->GetExtent());
+        device.Get(), renderPass.Get(), swapchain->GetImageViews(), depthImage->GetView(), swapchain->GetExtent());
 
     VulkanCommandPool commandPool(device.Get(), physicalDevice.queueFamilies.graphicsFamily);
 
-    // A colored quad: 4 vertices, 6 indices, 2 triangles - proves both
-    // vertex-buffer and index-buffer infrastructure (a triangle alone
-    // wouldn't need an index buffer to be meaningful). Neither buffer
-    // is swapchain-dependent - both are created once here and survive
-    // every swapchain recreation untouched. See docs/ARCHITECTURE.md,
-    // "Resource Lifetime: Swapchain-Dependent vs. Geometry (M8D)".
+    // One shared quad (4 vertices, 6 indices, 2 triangles), drawn TWICE
+    // per frame at two different depths via two different Model
+    // matrices (see the fixed camera/depth-proof setup below) - proves
+    // both vertex-buffer and index-buffer infrastructure (a triangle
+    // alone wouldn't need an index buffer to be meaningful). Neither
+    // buffer is swapchain-dependent - both are created once here and
+    // survive every swapchain recreation untouched. See
+    // docs/ARCHITECTURE.md, "Resource Lifetime: Swapchain-Dependent vs.
+    // Geometry (M8D)".
     //
     //   0 ---- 1
     //   |    / |
@@ -173,15 +197,18 @@ int main()
     //   | /    |
     //   3 ---- 2
     //
-    // UVs map each corner to the matching corner of the texture (0,0)
-    // top-left to (1,1) bottom-right - the same corner order as
-    // position, so the whole texture covers the whole quad exactly
-    // once, with no cropping or repetition.
+    // Positions are local/object-space (z=0 - depth comes entirely from
+    // the Model matrix's translation, not baked into the vertex data;
+    // see docs/ARCHITECTURE.md, "Vec3 Vertex Layout (M8F)"). UVs map
+    // each corner to the matching corner of the texture (0,0) top-left
+    // to (1,1) bottom-right - the same corner order as position, so the
+    // whole texture covers the whole quad exactly once, with no
+    // cropping or repetition.
     const std::vector<Vertex> vertices = {
-        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // 0
-        {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}}, // 1
-        {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}}, // 2
-        {{-0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}, // 3
+        {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // 0
+        {{ 0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}}, // 1
+        {{ 0.5f,  0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}}, // 2
+        {{-0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}, // 3
     };
     const std::vector<std::uint32_t> indices = {0, 1, 2, 2, 3, 0};
 
@@ -221,6 +248,48 @@ int main()
     VulkanDescriptorPool descriptorPool(device.Get());
     VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
     WriteCombinedImageSamplerDescriptor(device.Get(), descriptorSet, texture->GetView(), sampler.Get());
+
+    // M8F's fixed camera: positioned 3 meters back along +Z, looking
+    // toward the origin - i.e. looking down world -Z, exactly matching
+    // AREngine's Forward convention. No keyboard/mouse control, no
+    // Camera component - see docs/ARCHITECTURE.md, "Camera Convention
+    // (M8F)". View never changes once computed; projection is
+    // recomputed every frame from the swapchain's *current* extent
+    // (see the render loop below), so a resize naturally updates the
+    // aspect ratio with no separate "update projection" step.
+    const Core::Math::Vec3 kCameraEye(0.0f, 0.0f, 3.0f);
+    const Core::Math::Mat4 view = Core::Math::LookAtRH(kCameraEye, Core::Math::Vec3(0.0f, 0.0f, 0.0f), Core::Math::kWorldUp);
+
+    constexpr float kFovYRadians = std::numbers::pi_v<float> / 3.0f; // 60 degrees
+    constexpr float kNearZ = 0.1f;
+    constexpr float kFarZ = 10.0f;
+
+    // The exact depth-testing proof (see docs/ARCHITECTURE.md, "Exact
+    // Visual Proof That Depth Testing Works (M8F)"): two copies of the
+    // same quad, placed at different world-space depths AND offset
+    // diagonally in X/Y, purely via their Model matrix's translation
+    // (the shared vertex data above never changes) - so the two quads
+    // partially, not fully, overlap on screen. This deliberately makes
+    // the proof unambiguous from a single screenshot: each quad also
+    // has a non-overlapping region that's independently visible
+    // regardless of depth testing, so a viewer can directly compare
+    // "what the overlap region shows" against "what each quad's own
+    // color looks like elsewhere" - a full nested overlap (same X/Y,
+    // only Z different) would make it impossible to tell the far quad
+    // was ever drawn at all.
+    //
+    // The near quad (z=-1.5, tinted white - i.e. untinted) is submitted
+    // FIRST; the far quad (offset to x=y=+0.4, z=-2.0, tinted red) is
+    // submitted SECOND. Without depth testing, the far quad's later
+    // draw would incorrectly paint its red tint over the near quad in
+    // the overlapping region; with depth testing (LESS, write-enabled),
+    // the near quad's already-written, smaller depth values correctly
+    // reject the far quad's fragments there instead - the overlap
+    // region must show near's untinted checkerboard, not far's red one.
+    const Core::Math::Mat4 modelNear = Core::Math::Mat4::Translation(Core::Math::Vec3(0.0f, 0.0f, -1.5f));
+    const Core::Math::Mat4 modelFar = Core::Math::Mat4::Translation(Core::Math::Vec3(0.4f, 0.4f, -2.0f));
+    constexpr Core::Math::Vec4 kNearTint(1.0f, 1.0f, 1.0f, 1.0f);
+    constexpr Core::Math::Vec4 kFarTint(1.0f, 0.35f, 0.35f, 1.0f);
 
     std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
     {
@@ -299,17 +368,26 @@ int main()
 
         vkDeviceWaitIdle(device.Get());
 
-        // Framebuffers before swapchain: they wrap the swapchain's
-        // image views, which must not be destroyed while a framebuffer
-        // built from them still exists. See docs/ARCHITECTURE.md,
-        // "Swapchain-Dependent Pipeline Resources (M8C)".
+        // Framebuffers before swapchain/depth image: they wrap the
+        // swapchain's image views AND the depth image's view, neither
+        // of which may be destroyed while a framebuffer built from them
+        // still exists. See docs/ARCHITECTURE.md, "Swapchain-Dependent
+        // Pipeline Resources (M8C)" and "Depth Lifetime (M8F)".
         framebuffers.reset();
+        depthImage.reset();
         swapchain.reset(); // destroy-before-construct: see VulkanSwapchain.hpp
         swapchain = std::make_unique<VulkanSwapchain>(
             physicalDevice.device, device.Get(), surface.Get(), physicalDevice.queueFamilies,
             window->GetWidth(), window->GetHeight());
+        // Depth image is extent-dependent (unlike a texture) - rebuilt
+        // at the swapchain's new extent every time. See
+        // docs/ARCHITECTURE.md, "Depth Lifetime (M8F)".
+        depthImage = std::make_unique<VulkanImage>(
+            physicalDevice.device, device.Get(), swapchain->GetExtent().width, swapchain->GetExtent().height,
+            depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
         framebuffers = std::make_unique<VulkanFramebuffers>(
-            device.Get(), renderPass.Get(), swapchain->GetImageViews(), swapchain->GetExtent());
+            device.Get(), renderPass.Get(), swapchain->GetImageViews(), depthImage->GetView(), swapchain->GetExtent());
 
         imagesInFlight.assign(swapchain->GetImageCount(), VK_NULL_HANDLE);
 
@@ -323,7 +401,7 @@ int main()
                                  swapchain->GetExtent().width, swapchain->GetExtent().height, swapchain->GetImageCount()));
     };
 
-    AR_LOG_INFO("AREngine M8E texture demo: close the window to exit.");
+    AR_LOG_INFO("AREngine M8F depth demo: close the window to exit.");
 
     int currentFrame = 0;
     while (!window->ShouldClose())
@@ -376,8 +454,12 @@ int main()
         // initial/finalLayout - see VulkanRenderPass.cpp) - M8B's
         // separate vkCmdClearColorImage + manual barrier pair is gone;
         // there is exactly one clear path now, not two competing ones.
-        VkClearValue clearValue{};
-        clearValue.color = kClearColor;
+        // Depth is cleared to 1.0 every frame too - the "farthest
+        // possible" value, paired with depthCompareOp=LESS (see
+        // docs/ARCHITECTURE.md, "Depth Compare / Clear Values (M8F)").
+        std::array<VkClearValue, 2> clearValues{};
+        clearValues[0].color = kClearColor;
+        clearValues[1].depthStencil = {1.0f, 0};
 
         VkRenderPassBeginInfo renderPassBegin{};
         renderPassBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -385,8 +467,8 @@ int main()
         renderPassBegin.framebuffer = framebuffers->Get(imageIndex);
         renderPassBegin.renderArea.offset = {0, 0};
         renderPassBegin.renderArea.extent = extent;
-        renderPassBegin.clearValueCount = 1;
-        renderPassBegin.pClearValues = &clearValue;
+        renderPassBegin.clearValueCount = static_cast<std::uint32_t>(clearValues.size());
+        renderPassBegin.pClearValues = clearValues.data();
 
         vkCmdBeginRenderPass(commandBuffer, &renderPassBegin, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -415,14 +497,40 @@ int main()
         // Real geometry from real GPU buffers: bind the quad's vertex
         // buffer at binding 0 (matching Vertex::GetBindingDescription())
         // and its index buffer, then the texture's descriptor set, then
-        // draw indexed. See docs/ARCHITECTURE.md, "Indexed Draw Path
-        // (M8D)" and "Command Recording (M8E)".
+        // draw indexed - twice, once per depth-proof object. See
+        // docs/ARCHITECTURE.md, "Indexed Draw Path (M8D)", "Command
+        // Recording (M8E)", and "Exact Visual Proof That Depth Testing
+        // Works (M8F)".
         VkBuffer vertexBuffers[] = {vertexBuffer->Get()};
         VkDeviceSize vertexOffsets[] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, vertexOffsets);
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer->Get(), 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
             0, 1, &descriptorSet, 0, nullptr);
+
+        // Projection is recomputed every frame from the CURRENT extent
+        // - this is what keeps the aspect ratio correct after a resize,
+        // with no separate "update projection" step anywhere else. See
+        // docs/ARCHITECTURE.md, "Vulkan Projection Convention (M8F)".
+        // Core::Math::PerspectiveRH_ZO builds the backend-neutral RH/
+        // zero-to-one-depth matrix; ApplyVulkanYFlip is the one,
+        // explicit place Vulkan's NDC Y-flip is applied - see
+        // docs/ARCHITECTURE.md, "Core/Vulkan Clip-Space Split".
+        const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        const Core::Math::Mat4 projection =
+            ApplyVulkanYFlip(Core::Math::PerspectiveRH_ZO(kFovYRadians, aspect, kNearZ, kFarZ));
+
+        // Near quad FIRST, far quad SECOND - the exact ordering the
+        // depth-testing proof depends on (see the comment where
+        // modelNear/modelFar are defined, above).
+        const MvpPushConstants nearPushConstants{projection * view * modelNear, kNearTint};
+        vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(MvpPushConstants), &nearPushConstants);
+        vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
+
+        const MvpPushConstants farPushConstants{projection * view * modelFar, kFarTint};
+        vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(MvpPushConstants), &farPushConstants);
         vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
 
         vkCmdEndRenderPass(commandBuffer);
@@ -467,16 +575,16 @@ int main()
     }
 
     // GPU idle before destroying anything - see docs/ARCHITECTURE.md,
-    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E
-    // Implementation Notes". This also covers the vertex/index buffers
-    // and the texture/descriptor resources: the last frame's draw
-    // commands may still be referencing all of them until the GPU
-    // actually finishes, which this wait guarantees. Everything else
-    // (sync objects, descriptor pool, sampler, texture image, index
-    // buffer, vertex buffer, command pool, framebuffers, pipeline,
-    // descriptor set layout, render pass, swapchain, device, surface,
-    // instance) unwinds automatically after this in reverse
-    // construction order.
+    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E"/"M8F
+    // Implementation Notes". This also covers the vertex/index buffers,
+    // the texture/descriptor resources, and the depth image: the last
+    // frame's draw commands may still be referencing all of them until
+    // the GPU actually finishes, which this wait guarantees. Everything
+    // else (sync objects, descriptor pool, sampler, texture image,
+    // index buffer, vertex buffer, command pool, depth image,
+    // framebuffers, pipeline, descriptor set layout, render pass,
+    // swapchain, device, surface, instance) unwinds automatically after
+    // this in reverse construction order.
     vkDeviceWaitIdle(device.Get());
 
     for (FrameSyncObjects& sync : frameSync)

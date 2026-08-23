@@ -11,12 +11,17 @@ namespace AREngine::Rendering::Vulkan
 {
     // Owns one VkImage, the VkDeviceMemory backing it, and one
     // VkImageView over it — the minimum needed to sample a 2D texture
-    // in a fragment shader. One mip level, one array layer, no
-    // mipmapping. Deliberately small and generic, same "one dedicated
-    // allocation, no VMA" discipline as VulkanBuffer. Never exposed
-    // outside Rendering's Vulkan backend — no VkImage/VkImageView
-    // appears on any public Rendering header. See
-    // docs/ARCHITECTURE.md, "Vulkan Image Ownership (M8E)".
+    // in a fragment shader, or (as of M8F, with `aspectMask` set to
+    // VK_IMAGE_ASPECT_DEPTH_BIT) to back a depth attachment. One mip
+    // level, one array layer, no mipmapping. Deliberately small and
+    // generic, same "one dedicated allocation, no VMA" discipline as
+    // VulkanBuffer. Never exposed outside Rendering's Vulkan backend —
+    // no VkImage/VkImageView appears on any public Rendering header.
+    // See docs/ARCHITECTURE.md, "Vulkan Image Ownership (M8E)" and
+    // "Depth Image Ownership (M8F)" (reusing this same class for the
+    // depth image, rather than writing a near-duplicate one, since the
+    // only real difference is the aspect mask/format/usage passed in —
+    // not the ownership shape).
     //
     // The VkSampler is deliberately NOT owned here — see
     // VulkanSampler.hpp for why keeping it separate is the simpler
@@ -28,9 +33,13 @@ namespace AREngine::Rendering::Vulkan
     class VulkanImage
     {
     public:
+        // `aspectMask` defaults to VK_IMAGE_ASPECT_COLOR_BIT, preserving
+        // every existing (M8E texture) call site exactly. Pass
+        // VK_IMAGE_ASPECT_DEPTH_BIT for a depth attachment image.
         VulkanImage(VkPhysicalDevice physicalDevice, VkDevice device,
                      std::uint32_t width, std::uint32_t height, VkFormat format,
-                     VkImageUsageFlags usage, VkMemoryPropertyFlags properties);
+                     VkImageUsageFlags usage, VkMemoryPropertyFlags properties,
+                     VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_COLOR_BIT);
         ~VulkanImage();
 
         VulkanImage(const VulkanImage&) = delete;

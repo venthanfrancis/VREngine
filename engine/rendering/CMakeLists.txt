@@ -46,6 +46,8 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanSampler.cpp
             src/vulkan/VulkanDescriptorSetLayout.cpp
             src/vulkan/VulkanDescriptorPool.cpp
+            src/vulkan/VulkanDepthFormat.cpp
+            src/vulkan/VulkanClipSpace.cpp
             src/vulkan/VulkanVersion.hpp
             src/vulkan/VulkanResult.hpp
             src/vulkan/VulkanPhysicalDevice.hpp
@@ -70,6 +72,9 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanSampler.hpp
             src/vulkan/VulkanDescriptorSetLayout.hpp
             src/vulkan/VulkanDescriptorPool.hpp
+            src/vulkan/VulkanDepthFormat.hpp
+            src/vulkan/VulkanClipSpace.hpp
+            src/vulkan/VulkanPushConstants.hpp
     )
     target_link_libraries(arengine_rendering PRIVATE Vulkan::Vulkan AREngine::Platform)
 

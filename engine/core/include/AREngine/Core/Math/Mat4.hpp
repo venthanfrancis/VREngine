@@ -2,6 +2,7 @@
 
 #include "AREngine/Core/Math/Quaternion.hpp"
 #include "AREngine/Core/Math/Vec3.hpp"
+#include "AREngine/Core/Math/Vec4.hpp"
 
 #include <array>
 #include <cstddef>
@@ -147,14 +148,35 @@ namespace AREngine::Core::Math
 
     // Treats `point` as a homogeneous point (w = 1) and returns the
     // transformed x/y/z, dropping w. Sufficient for M5's needs (reading
-    // "where did this point end up" out of a world matrix in tests); a
-    // general Vec4 transform is added if/when something needs one.
+    // "where did this point end up" out of a world matrix in tests) and
+    // for any purely affine transform (translation/rotation/scale),
+    // where the result's w is always exactly 1 anyway. NOT valid for a
+    // projection matrix, whose output w is generally not 1 — use
+    // `operator*(Mat4, Vec4)` below for that (added in M8F, once a
+    // projection matrix — PerspectiveRH_ZO, ViewProjection.hpp —
+    // genuinely needed a full 4-component transform).
     [[nodiscard]] constexpr Vec3 TransformPoint(const Mat4& m, const Vec3& point)
     {
         return Vec3(
             m.At(0, 0) * point.x + m.At(0, 1) * point.y + m.At(0, 2) * point.z + m.At(0, 3),
             m.At(1, 0) * point.x + m.At(1, 1) * point.y + m.At(1, 2) * point.z + m.At(1, 3),
             m.At(2, 0) * point.x + m.At(2, 1) * point.y + m.At(2, 2) * point.z + m.At(2, 3)
+        );
+    }
+
+    // Full 4-component matrix-vector transform — the general case
+    // TransformPoint deliberately isn't (see above). This is exactly
+    // what a vertex shader's `mvp * vec4(position, 1.0)` computes;
+    // AREngine's column-major Mat4 storage (see the struct comment
+    // above) makes this the same operation GLSL performs, with no
+    // transpose needed anywhere in between.
+    [[nodiscard]] constexpr Vec4 operator*(const Mat4& m, const Vec4& v)
+    {
+        return Vec4(
+            m.At(0, 0) * v.x + m.At(0, 1) * v.y + m.At(0, 2) * v.z + m.At(0, 3) * v.w,
+            m.At(1, 0) * v.x + m.At(1, 1) * v.y + m.At(1, 2) * v.z + m.At(1, 3) * v.w,
+            m.At(2, 0) * v.x + m.At(2, 1) * v.y + m.At(2, 2) * v.z + m.At(2, 3) * v.w,
+            m.At(3, 0) * v.x + m.At(3, 1) * v.y + m.At(3, 2) * v.z + m.At(3, 3) * v.w
         );
     }
 }

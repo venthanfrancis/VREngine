@@ -22,17 +22,30 @@ namespace AREngine::Rendering::Vulkan
     // (M8C)".
     //
     // One descriptor set (the combined-image-sampler layout the caller
-    // passes in — see VulkanDescriptorSetLayout.hpp), no push constants.
-    // One vertex input binding, three attributes (position, color, uv) -
-    // matches Vertex exactly (VulkanVertex.hpp/.cpp); M8C's
-    // gl_VertexIndex-generated positions are gone as of M8D - see
-    // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)" and "Pipeline
-    // Layout Change (M8E)". Viewport and scissor are dynamic state, so
-    // this pipeline does not need to be recreated when the swapchain
-    // extent changes on resize - only VulkanFramebuffers does.
+    // passes in — see VulkanDescriptorSetLayout.hpp) and, as of M8F,
+    // one push constant range (VulkanPushConstants.hpp's
+    // MvpPushConstants — see docs/ARCHITECTURE.md, "Transform Upload
+    // Method (M8F)"). One vertex input binding, three attributes
+    // (position, color, uv) - matches Vertex exactly
+    // (VulkanVertex.hpp/.cpp); M8C's gl_VertexIndex-generated positions
+    // are gone as of M8D - see docs/ARCHITECTURE.md, "Vertex Input
+    // Layout (M8D)" and "Pipeline Layout Change (M8E)". Viewport and
+    // scissor are dynamic state, so this pipeline does not need to be
+    // recreated when the swapchain extent changes on resize - only
+    // VulkanFramebuffers (and the depth image) does.
+    //
+    // Depth testing enabled as of M8F: depthTestEnable/depthWriteEnable
+    // both true, depthCompareOp = LESS, no depth bounds, no stencil
+    // test — see docs/ARCHITECTURE.md, "Depth Compare / Clear Values
+    // (M8F)". Back-face culling stays disabled (cullMode = NONE,
+    // unchanged since M8C) - M8F's depth proof doesn't need it, and
+    // the brief explicitly allowed leaving it off rather than risking
+    // a winding-order bug obscuring the actual depth-testing proof.
     //
     // Independent of swapchain extent/image count, same as
-    // VulkanRenderPass — does NOT need to be recreated on resize.
+    // VulkanRenderPass — does NOT need to be recreated on resize (the
+    // render pass it's compiled against doesn't change format on
+    // resize either — see VulkanRenderPass.hpp).
     //
     // Not copyable or movable: exactly one VkPipeline (and its layout)
     // per VulkanGraphicsPipeline, destroyed exactly once, by this

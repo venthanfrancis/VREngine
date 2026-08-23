@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8E (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures) complete.** `Core`
+**M0 through M7 complete; M8A through M8F (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -132,13 +132,58 @@ sRGB vs. linear encoding) but deliberately left unchanged, for the same
 reason as M8D's `BufferDesc` review. Zero validation errors on the
 final run — see `docs/ARCHITECTURE.md` Section 20 for full details.
 
+**M8F adds genuine 3D** on top of M8E: `Vertex::position` changed from
+`Vec2` to `Vec3`. `Core::Math` gained `LookAtRH` (a general-purpose,
+non-Vulkan-specific right-handed view matrix) and `PerspectiveVulkanRH`
+(Vulkan's `[0,1]`-depth, Y-flipped clip-space convention, baked into
+one matrix as AREngine's single explicit place for that correction —
+see `docs/ARCHITECTURE.md` Section 21, "Vulkan Projection Convention
+(M8F)"), plus `Mat4::operator*(Vec4)` for full 4-component transforms.
+Rendering's Vulkan backend gained `VulkanDepthFormat::FindSupportedDepthFormat`
+(prefers `D32_SFLOAT` → `D32_SFLOAT_S8_UINT` → `D24_UNORM_S8_UINT`,
+pure-logic-tested selection), a depth image (reusing `VulkanImage` with
+a new `aspectMask` parameter rather than a near-duplicate class),
+`VulkanRenderPass`/`VulkanFramebuffers` extended with a depth
+attachment, depth testing enabled in the pipeline
+(`depthCompareOp = LESS`, clear depth 1.0), and `VulkanPushConstants::MvpPushConstants`
+(one `Mat4` MVP + one `Vec4` tint, 80 bytes — the deliberately temporary
+transform-upload mechanism for M8F's two fixed objects). One fixed
+camera at `(0,0,3)` looking at the origin — no movable camera, no
+`Input` integration, no `Camera` component. `tests/vulkan_present_demo.cpp`
+now draws two overlapping quads at different depths (offset diagonally
+so each has both a shared and an independent screen region), the nearer
+one submitted first, proving the depth buffer — not draw order —
+decides visibility. **The depth image IS swapchain/extent-dependent
+(unlike a texture)** and is recreated alongside the swapchain on
+resize; `recreateSwapchain()` was extended accordingly. Zero validation
+errors on the final run — see `docs/ARCHITECTURE.md` Section 21 for
+full details, including the exact visual proof and why an initial
+same-XY, Z-only version of the two quads was revised (the far quad was
+fully hidden behind the near one, making the proof visually
+ambiguous).
+
+**A Core/Vulkan clip-space cleanup landed right after M8F, before M8G**:
+M8F's original `Core::Math::PerspectiveVulkanRH` baked Vulkan's NDC
+Y-flip into a Core function — a graphics-backend concept leaking into
+`Core`, which must stay backend-independent. Fixed by splitting it:
+`Core::Math::PerspectiveRH_ZO` (renamed, `Camera.hpp` → `ViewProjection.hpp`
+— Core doesn't own a `Camera` system) now builds only the backend-
+neutral right-handed/zero-to-one-depth matrix, with no Y-flip; the flip
+itself moved to a new, small, unit-tested Vulkan-private function,
+`AREngine::Rendering::Vulkan::ApplyVulkanYFlip`
+(`engine/rendering/src/vulkan/VulkanClipSpace.hpp/.cpp`), which the demo
+now calls explicitly. The resulting matrix — and the demo's visible
+output, including the M8F depth-testing proof — are unchanged; only the
+internal organization moved. See `docs/ARCHITECTURE.md` Section 21,
+"Core/Vulkan Clip-Space Split", for the full reasoning.
+
 There is still no mesh abstraction, no real image loading (PNG/JPEG/
-stb_image), no uniform buffers, no camera, no depth buffer, no frame
-limiting, no ECS/component system, and no analog/XR/controller input —
-see Sections 11–15. Everything else (`XR`, `Editor`) is still an
-M0-style stub with no functionality. Next up is M8F+ (real image
-loading, then a textured mesh). See `docs/ROADMAP.md` for the full
-plan.
+stb_image), no uniform buffers, no movable camera, no frame limiting,
+no ECS/component system, and no analog/XR/controller input — see
+Sections 11–15. Everything else (`XR`, `Editor`) is still an M0-style
+stub with no functionality. Next up is M8G+ (a proper camera
+abstraction, then Scene integration and a textured mesh). See
+`docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -147,10 +192,10 @@ plan.
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
 3. **Vulkan bring-up + presentation + first triangle + vertex/index
-   buffers + textures only (M8A–M8E)**: no mesh abstraction, no real
-   image loading, no uniform buffers, no camera yet — see
-   `docs/ROADMAP.md`'s M8F+ row for what's still pending within M8.
-   **No OpenXR code** before milestone M9.
+   buffers + textures + genuine 3D/depth only (M8A–M8F)**: no mesh
+   abstraction, no real image loading, no uniform buffers, no movable
+   camera yet — see `docs/ROADMAP.md`'s M8G+ row for what's still
+   pending within M8. **No OpenXR code** before milestone M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

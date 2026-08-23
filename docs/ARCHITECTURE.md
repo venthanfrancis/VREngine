@@ -2300,3 +2300,381 @@ No other architectural issues were discovered — image creation, staging
 upload, layout transitions, descriptor binding, and textured indexed
 drawing all worked correctly on the first real hardware run, with zero
 validation warnings to investigate.
+
+## 21. M8F Implementation Notes
+
+M8F moves AREngine from flat 2D demo geometry into genuine 3D: real
+`Vec3` vertex positions, a fixed camera, a Vulkan-conforming perspective
+projection, a depth buffer, and depth testing — proven by two
+overlapping quads at different depths, the nearer one submitted first,
+where correct occlusion can only happen if the depth buffer (not draw
+order) is deciding visibility.
+
+### Vec3 Vertex Layout (M8F)
+
+`Vertex::position` changed from `Vec2` to `Vec3`
+(`VulkanVertex.hpp/.cpp`); `color` and `uv` are unchanged. Attribute 0's
+format changed from `VK_FORMAT_R32G32_SFLOAT` to
+`VK_FORMAT_R32G32B32_SFLOAT` accordingly; `color`/`uv`'s offsets shift
+automatically since they're computed via `offsetof`, not hand-counted —
+the same reason `offsetof` was used from the start back in M8D. New
+stride: 32 bytes (`3+3+2` floats × 4 bytes). Both the binding-stride and
+attribute-format/offset assertions are covered by updated pure-logic
+tests in `tests/vulkan_tests.cpp`.
+
+### Camera Convention (M8F)
+
+One hard-coded camera for the whole demo: positioned at `(0, 0, 3)`,
+looking at the world origin — i.e. looking down world `-Z`, exactly
+AREngine's `Forward` convention (see `docs/WORLD_CONVENTIONS.md`). No
+keyboard/mouse control, no `Camera` component, no `Input` integration —
+all explicitly deferred to M8G, which will need to answer what a real
+camera abstraction looks like with actual evidence from a movable one,
+not guessed at here.
+
+### View Matrix Convention (M8F)
+
+`Core::Math::LookAtRH(eye, target, up)` (new,
+`engine/core/include/AREngine/Core/Math/ViewProjection.hpp` — see
+"Core/Vulkan Clip-Space Split" below for why this file is not named
+`Camera.hpp`) builds a standard right-handed "look at" view matrix,
+following the same `+Y` up / `-Z` forward convention every other piece
+of Core math already uses. This is **not** a Vulkan-specific function —
+the view matrix's job (expressing world points relative to the camera)
+is identical regardless of target graphics API; only the *projection*
+step differs between APIs (see below). Added to Core (not
+Vulkan-private) specifically so it's directly unit-tested
+(`tests/core_tests.cpp`, `TestLookAtRH`) without needing a GPU, and so
+it's available to any future backend without duplication.
+
+### Vulkan Projection Convention (M8F)
+
+**Updated shortly after M8F's approval — see "Core/Vulkan Clip-Space
+Split" immediately below for the full reasoning; this subsection
+describes the current, final design, not M8F's original one.**
+
+`Core::Math::PerspectiveRH_ZO(fovYRadians, aspect, nearZ, farZ)`
+(`ViewProjection.hpp`) builds a right-handed perspective projection
+matrix with NDC depth in `[0, 1]` ("ZO") rather than OpenGL's
+`[-1, 1]` — the convention shared by Vulkan, Direct3D, and Metal. This
+depth-range choice is genuinely backend-neutral math (OpenGL is the
+outlier, not Vulkan), so it lives in Core, on the same footing as
+`LookAtRH`. Verified by `TestPerspectiveRH_ZO` in `tests/core_tests.cpp`,
+which checks that view-space `z = -near` maps to NDC depth `0` and
+`z = -far` maps to NDC depth `1` numerically, not just "it compiles."
+
+**The Y flip is a separate, Vulkan-layer step, not part of this
+function.** Vulkan's NDC `+Y` points down the framebuffer, opposite
+AREngine's `+Y`-up world convention — but that mapping is a property of
+Vulkan's specific screen-space convention, not of the RH/ZO depth
+convention itself (OpenGL needs no such flip despite also supporting a
+right-handed view). `AREngine::Rendering::Vulkan::ApplyVulkanYFlip`
+(`engine/rendering/src/vulkan/VulkanClipSpace.hpp/.cpp`) is where
+AREngine actually performs it: negates the projection matrix's Y-scale
+term, applied by the demo as
+`ApplyVulkanYFlip(PerspectiveRH_ZO(...))`. AREngine deliberately does
+**not** use the alternative (a negative-height viewport, available via
+`VK_KHR_maintenance1`/core 1.1): baking the flip into one small,
+explicit Vulkan-layer function keeps the correction in exactly one
+place, doesn't depend on any extra feature check, and is proven correct
+directly by `tests/vulkan_tests.cpp`'s
+`TestApplyVulkanYFlipComposesWithProjection` (a world-up point gets
+negative NDC y after the flip) — not merely inferred from a
+non-upside-down screenshot.
+
+Both the depth-range and Y-flip corrections, composed together, are
+proven end to end by `TestModelViewProjectionComposition`
+(`tests/core_tests.cpp`, using Core's unflipped `PerspectiveRH_ZO`) and
+`TestApplyVulkanYFlipComposesWithProjection`
+(`tests/vulkan_tests.cpp`, proving the Vulkan-layer flip). Composing
+`Projection * View * Model` end to end and checking the result lands
+centered on screen with a valid depth needed `Mat4::operator*(Vec4)`
+(new in M8F, `Mat4.hpp`) — `TransformPoint`'s existing w=1-assuming
+shortcut is not valid for a projection matrix's output.
+
+### Core/Vulkan Clip-Space Split
+
+M8F's original `PerspectiveVulkanRH` baked both the depth-range
+conversion *and* the Vulkan-specific Y-flip into one Core function —
+approved and shipped that way, but flagged immediately afterward as a
+layering violation: **Core must remain graphics-backend independent**,
+and a function literally named after Vulkan, living in Core, was a
+concrete instance of that boundary leaking. Fixed as a dedicated
+cleanup before M8G:
+
+- `PerspectiveVulkanRH` → **`PerspectiveRH_ZO`**, named after the
+  mathematical convention it implements (right-handed, zero-to-one
+  depth) rather than a graphics API. It no longer performs the Y flip.
+- The Y flip moved to a new, small, Vulkan-private function,
+  `ApplyVulkanYFlip` (`engine/rendering/src/vulkan/VulkanClipSpace.hpp/.cpp`)
+  — pure logic (no Vulkan API calls), directly unit-tested. The demo
+  now calls `ApplyVulkanYFlip(PerspectiveRH_ZO(...))` instead of a
+  single combined call; the resulting matrix, and the demo's visible
+  output, are bit-for-bit identical to before.
+- `Core/Math/Camera.hpp` → **`Core/Math/ViewProjection.hpp`**. Core does
+  not own (and this file does not implement) a `Camera` system —
+  `Camera.hpp` implied more than two free functions actually provide.
+  `ViewProjection.hpp` names exactly what's inside: a view-matrix
+  helper and a projection-matrix helper.
+
+Restated, for reference, the conventions this boundary now keeps
+cleanly separated:
+
+- **AREngine world coordinates** (`Core`, all of them): right-handed,
+  `+Y` up, `-Z` forward — see `docs/WORLD_CONVENTIONS.md`. Fixed,
+  engine-wide, and what `LookAtRH`/`PerspectiveRH_ZO` both honor.
+- **Projection depth convention used by the current renderer**: `0..1`
+  (Vulkan's NDC depth range) — a choice `PerspectiveRH_ZO` makes
+  explicit in its name, but which is itself graphics-API-adjacent
+  (shared by Vulkan/D3D/Metal, not OpenGL) rather than a pure world
+  convention; it stays in Core because the *math* for it is backend-
+  neutral, not because Core is Vulkan-aware.
+- **Vulkan-specific framebuffer/rendering choices** (the Y flip, and
+  anything like it in the future): stay in
+  `engine/rendering/src/vulkan/`, never in `Core`.
+
+No complicated clip-space abstraction (no `GraphicsAPI` enum, no
+per-backend projection factory) was introduced — the split is exactly
+two small functions in two files, chosen to be the minimal change that
+restores the boundary. Rebuilt, re-tested (`/W4 /WX` clean, `ctest`
+9/9, `ARENGINE_ENABLE_VULKAN=OFF` still 8/8), and the manual Vulkan demo
+re-run and re-screenshotted to confirm the visible output — including
+the M8F depth-testing proof — is unchanged, with zero validation
+errors.
+
+### Depth Format Selection (M8F)
+
+`FindSupportedDepthFormat(physicalDevice)`
+(`VulkanDepthFormat.hpp/.cpp`) queries AREngine's preferred order —
+`VK_FORMAT_D32_SFLOAT`, `VK_FORMAT_D32_SFLOAT_S8_UINT`,
+`VK_FORMAT_D24_UNORM_S8_UINT` — against real device format properties,
+and hands the results to `SelectDepthFormat`, which picks the first
+candidate whose optimal-tiling features include
+`VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT` — pure logic over
+already-queried data, directly unit-tested with synthetic
+`VkFormatProperties` (including a case proving a candidate lacking the
+feature is correctly skipped). M8F only requires depth capability; a
+selected format that happens to carry a stencil component (both
+fallback candidates do) is never used for stencil operations anywhere
+in this backend. **On the development machine's GPU (NVIDIA GeForce RTX
+3060 Laptop), the first preference, `VK_FORMAT_D32_SFLOAT`, was
+selected directly** (format value `126`).
+
+### Depth Image Ownership (M8F)
+
+The depth image reuses `VulkanImage` (M8E) rather than a new,
+near-duplicate class — it already owns exactly the right triple
+(`VkImage` + `VkDeviceMemory` + `VkImageView`), and the only real
+differences a depth image needs are its format, usage
+(`VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT`), and view aspect mask.
+`VulkanImage`'s constructor gained an `aspectMask` parameter
+(defaulting to `VK_IMAGE_ASPECT_COLOR_BIT`, so every M8E texture call
+site is unaffected) — the demo passes `VK_IMAGE_ASPECT_DEPTH_BIT`
+explicitly for the depth image. `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`,
+one mip level, one array layer — no depth data ever needs CPU access,
+so no staging/upload path applies here at all.
+
+### Depth Lifetime (M8F)
+
+**The depth image IS swapchain/extent-dependent — unlike a texture.**
+Extending the swapchain-dependent/not-dependent split from M8D/M8E:
+
+- **Swapchain-dependent** (recreated on every resize): `VulkanSwapchain`
+  (images/views), the depth image (`VulkanImage`, sized to the current
+  extent), `VulkanFramebuffers` (which wraps both).
+- **Not swapchain-dependent** (created once, survive every resize): the
+  vertex buffer, the index buffer, `VulkanGraphicsPipeline`,
+  `VulkanRenderPass` (its depth *format* is fixed at startup, same as
+  the color format — only the depth *image itself* is extent-bound),
+  the texture image/view/sampler, the descriptor pool/set.
+
+`recreateSwapchain()` in `vulkan_present_demo.cpp` destroys, in order,
+`framebuffers` → `depthImage` → `swapchain` (framebuffers first,
+since it references both the other two's views), then reconstructs
+`swapchain` → `depthImage` (at the new extent) → `framebuffers` — the
+same destroy-before-construct policy every swapchain-dependent resource
+in this backend already follows.
+
+### Render-Pass Depth Attachment (M8F)
+
+`VulkanRenderPass` gained a second constructor parameter, `depthFormat`,
+and a second `VkAttachmentDescription` (attachment index 1): `loadOp =
+CLEAR`, `storeOp = DONT_CARE` (nothing needs the previous frame's depth
+contents), no stencil load/store regardless of whether the chosen
+format happens to carry a stencil component, `initialLayout =
+UNDEFINED`, `finalLayout = DEPTH_STENCIL_ATTACHMENT_OPTIMAL`. The
+subpass's `pDepthStencilAttachment` references it. The existing subpass
+dependency was extended to also gate on
+`VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT` (where the depth clear/
+test/write actually happens) and
+`VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT`, for the same reason the
+original color-only dependency existed: the implicit layout transition
+must not be allowed to happen before the depth image is genuinely ready
+to be written to.
+
+### Framebuffers With Depth (M8F)
+
+`VulkanFramebuffers` gained a `depthImageView` parameter: every
+framebuffer now attaches `{colorView, depthImageView}` in that order
+(matching `VulkanRenderPass`'s attachment order exactly). Unlike the
+color view (one per swapchain image), the **same single depth image
+view is shared across every framebuffer** — only one frame is ever
+being rasterized at a time, so one depth image suffices regardless of
+swapchain image count.
+
+### Depth Compare / Clear Values (M8F)
+
+Standard, deliberate pairing: clear depth **1.0** (the farthest
+possible value) with `depthCompareOp = VK_COMPARE_OP_LESS`. A fragment
+passes the depth test only if its depth is *less than* what's currently
+stored — so the first thing drawn at a pixel always passes (anything is
+less than the 1.0 it was cleared to), and anything drawn later at that
+same pixel only overwrites it if it's genuinely closer. No depth bounds
+test, no stencil test — neither is needed. `depthWriteEnable = true`,
+so every passing fragment updates the stored depth, which is what lets
+the *next* draw call correctly test against it.
+
+### Transform Upload Method (M8F)
+
+**Push constants**, not a uniform buffer — `MvpPushConstants`
+(`VulkanPushConstants.hpp`): one `Mat4 mvp` (already multiplied down on
+the CPU: `Projection * View * Model`) plus one `Vec4 tint`, 80 bytes
+total, safely under the 128-byte minimum every Vulkan implementation
+guarantees for push constants. Chosen because it keeps M8F
+significantly simpler than a uniform buffer would (no additional
+descriptor binding, no buffer allocation/update dance for data that's
+recomputed every draw anyway) while still being fully correct for
+exactly what this milestone needs: two draws, two different (Model,
+tint) pairs, updated via `vkCmdPushConstants` immediately before each
+`vkCmdDrawIndexed`. **This is deliberately temporary** — real per-object
+model transforms and per-frame camera data will very likely eventually
+need a uniform buffer (Model changes per-object far more often, and per-
+frame camera data is naturally shared across many draws, neither of
+which push constants scale well to), but that design wants real
+evidence from more than two fixed objects to get right, the same
+reasoning M8D/M8E already applied to `BufferDesc`/`TextureDesc`. The
+pipeline layout gained one `VkPushConstantRange`
+(`VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT`, since the
+vertex shader reads `mvp` and the fragment shader reads `tint`).
+
+### Resize Behavior (M8F)
+
+Projection is **recomputed every frame** from the swapchain's *current*
+extent (`aspect = extent.width / extent.height`, inside the render
+loop) — there is no separate "update the stored projection" step to
+forget after a resize; the very next frame's projection is simply
+already correct, by construction. The view matrix and both quads'
+model matrices, in contrast, never change (the camera and the two
+objects are all fixed for the whole demo). Depth-dependent resources
+(the depth image, the framebuffers) are destroyed and rebuilt inside
+`recreateSwapchain()`, at the new extent, exactly like the swapchain
+itself. Minimize handling is unchanged from M8B — the existing wait-
+for-nonzero-extent loop, which already runs before any swapchain (and
+now depth image) recreation, means a zero-sized depth image is never
+attempted; nothing new was needed for this.
+
+### Exact Visual Proof That Depth Testing Works (M8F)
+
+Two copies of the same shared quad (same vertex/index buffers, same
+texture), each placed by its own Model matrix:
+
+- **Near**: translated to `(0, 0, -1.5)`, tint `(1, 1, 1, 1)`
+  (untinted), submitted **first**.
+- **Far**: translated to `(0.4, 0.4, -2.0)`, tint `(1, 0.35, 0.35, 1)`
+  (red), submitted **second**.
+
+The diagonal `(0.4, 0.4)` offset on the far quad is deliberate, not
+incidental: an earlier version of this demo placed both quads at the
+same `(x, y)`, differing only in `z`. That version's far quad ended up
+*entirely* hidden behind the (larger, since closer) near quad's
+on-screen footprint — a technically valid but visually ambiguous proof,
+since "nothing red-tinted is visible" is a much weaker signal to a
+human viewer than "the near quad's own color is visible everywhere the
+two overlap, and the far quad's red tint is independently visible where
+they don't." The diagonal offset guarantees a genuine partial overlap:
+each quad has both a shared region and its own independent, non-
+overlapping region, confirmed by screenshot — the lower-left region
+shows the near quad's untinted checkerboard/color gradient (including
+across the entire overlap area, where the far quad's red tint is
+correctly absent), and the upper-right region shows the far quad's
+red-tinted checkerboard on its own. Without depth testing, submitting
+near first and far second would let far's later draw paint its red tint
+over near in the overlap region; with depth testing (LESS, write-
+enabled), near's already-written, smaller depth values correctly reject
+far's fragments there instead — exactly what the screenshot shows, both
+before and after two resizes and two full minimize/restore cycles.
+
+### Culling (M8F)
+
+Unchanged from M8C: `cullMode = VK_CULL_MODE_NONE`. The brief explicitly
+allowed leaving culling disabled if it would complicate the depth
+proof; since M8F's actual goal is proving depth testing (not winding
+order), and introducing culling risks a winding-order bug masquerading
+as (or obscuring) a depth-testing bug, it stays off. No winding-order
+verification was performed this milestone as a result — deferred to
+whichever future milestone actually turns culling on.
+
+### NullRenderDevice / Runtime / Generic API
+
+All untouched, exactly as the brief required. `RenderingTests` still
+pass unchanged; `AREngineSandbox.exe` still runs on `NullRenderDevice`.
+No generic depth-texture abstraction was added to the public
+`Rendering` API — the depth attachment is Vulkan rendering
+infrastructure specific to this backend's render pass, not an asset
+texture a `TextureDesc`/`CreateTexture` caller would ever request
+directly, and no evidence from M8F suggests otherwise.
+
+### Validation Results (M8F)
+
+`ARENGINE_ENABLE_VULKAN=ON` (default): full `/W4 /WX` clean build,
+`ctest` 9/9 (`VulkanTests` gained 2 new depth-format-selection checks
+and an updated position-attribute-format check; `CoreTests` gained 3
+new checks — `TestLookAtRH`, `TestPerspectiveRH_ZO` (renamed from
+`TestPerspectiveVulkanRH` in the post-M8F Core/Vulkan clip-space split
+— see that section above), `TestModelViewProjectionComposition`).
+`ARENGINE_ENABLE_VULKAN=OFF`: full build succeeds, no Vulkan/shader
+targets present, `ctest` 8/8 (no `VulkanTests`; `CoreTests`, which is
+not Vulkan-gated, still includes and passes the new camera-math checks).
+
+`arengine_vulkan_present_demo` run against real hardware (NVIDIA
+GeForce RTX 3060 Laptop GPU): window opens, two overlapping quads at
+different depths render with the near quad correctly in front
+everywhere the two overlap (see "Exact Visual Proof" above), confirmed
+by screenshot both initially and after two resizes plus two full
+minimize/restore cycles (with the depth proof still holding correctly
+after every recreation, and the texture unaffected), closes cleanly.
+**Zero validation errors or warnings** — nothing needed fixing during
+M8F's development; depth image memory binding, the render pass's
+depth-attachment layout transitions, the depth-compare/write pipeline
+state, and object destruction order were all correct on the first real
+hardware run (after the visual-clarity adjustment to the depth-proof
+geometry described above, which was a scene-design change, not a
+validation fix — the original nested-overlap version also produced zero
+validation errors).
+
+- Selected depth format: **`VK_FORMAT_D32_SFLOAT`** (value 126)
+- Transform upload method: **push constants** (`MvpPushConstants`: one
+  `Mat4` + one `Vec4`, 80 bytes)
+- Near/far/FOV: **near = 0.1, far = 10.0, vertical FOV = 60°**
+  (`π/3` radians)
+
+### What's Deferred to M8G+
+
+No movable camera, no `Input` camera control, no `Scene` integration,
+no `MeshAsset`, no model loading, no glTF, no lighting, no normals, no
+PBR, no shadow mapping, no OpenXR, no MSAA, no mipmaps, no anisotropy,
+no material system, no render graph. `Core::Math::LookAtRH`/
+`PerspectiveRH_ZO` are genuinely general-purpose (not Vulkan-private)
+and are expected to be reused as-is by a future camera abstraction;
+`ApplyVulkanYFlip` and everything else new this milestone
+(`VulkanDepthFormat`, `MvpPushConstants`, the depth-testing pipeline
+state) stays Vulkan-private, same reasoning as every other
+backend-specific addition
+since M8C — two fixed objects and one fixed camera is not enough
+evidence to design a generic camera/transform-upload system from.
+
+No other architectural issues were discovered — depth format selection,
+depth image creation, the render pass's depth attachment, depth-tested
+rendering, and push-constant transform upload all worked correctly on
+the first real hardware run, with zero validation warnings to
+investigate.

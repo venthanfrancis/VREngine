@@ -22,6 +22,7 @@ target_sources(arengine_core
         include/AREngine/Core/Math/Vec4.hpp
         include/AREngine/Core/Math/Quaternion.hpp
         include/AREngine/Core/Math/Mat4.hpp
+        include/AREngine/Core/Math/ViewProjection.hpp
 )
 
 target_include_directories(arengine_core

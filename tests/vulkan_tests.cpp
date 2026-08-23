@@ -15,7 +15,11 @@
 // part of this suite, since CTest must not depend on a GPU being
 // present.
 
+#include "AREngine/Core/Math/ViewProjection.hpp"
+
 #include "vulkan/VulkanCheckerboard.hpp"
+#include "vulkan/VulkanClipSpace.hpp"
+#include "vulkan/VulkanDepthFormat.hpp"
 #include "vulkan/VulkanMemory.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
@@ -27,6 +31,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <limits>
+#include <numbers>
 
 namespace
 {
@@ -42,6 +47,7 @@ namespace
     }
 
     using namespace AREngine::Rendering::Vulkan;
+    using namespace AREngine::Core::Math;
 
     VkQueueFamilyProperties MakeQueueFamily(VkQueueFlags flags)
     {
@@ -272,7 +278,7 @@ namespace
         Check(attributes.size() == 3, "Vertex has exactly 3 attributes (position, color, uv)");
 
         Check(attributes[0].location == 0, "Position is at shader location 0");
-        Check(attributes[0].format == VK_FORMAT_R32G32_SFLOAT, "Position is a 2-component float format (Vec2)");
+        Check(attributes[0].format == VK_FORMAT_R32G32B32_SFLOAT, "Position is a 3-component float format (Vec3, as of M8F)");
         Check(attributes[0].offset == offsetof(Vertex, position), "Position offset matches the real struct layout");
 
         Check(attributes[1].location == 1, "Color is at shader location 1");
@@ -322,6 +328,67 @@ namespace
         }
         Check(allOpaque, "Every checkerboard pixel's alpha channel is fully opaque (255)");
     }
+
+    // --- M8F pure-logic checks ---
+
+    DepthFormatCandidate MakeCandidate(VkFormat format, bool supportsDepthStencilAttachment)
+    {
+        DepthFormatCandidate candidate;
+        candidate.format = format;
+        candidate.properties.optimalTilingFeatures =
+            supportsDepthStencilAttachment ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+        return candidate;
+    }
+
+    void TestSelectDepthFormatPrefersFirstSupported()
+    {
+        const std::vector<DepthFormatCandidate> candidates{
+            MakeCandidate(VK_FORMAT_D32_SFLOAT, true),
+            MakeCandidate(VK_FORMAT_D32_SFLOAT_S8_UINT, true),
+            MakeCandidate(VK_FORMAT_D24_UNORM_S8_UINT, true),
+        };
+        Check(SelectDepthFormat(candidates) == VK_FORMAT_D32_SFLOAT,
+              "SelectDepthFormat picks the first candidate when all are supported");
+    }
+
+    void TestSelectDepthFormatSkipsUnsupported()
+    {
+        const std::vector<DepthFormatCandidate> candidates{
+            MakeCandidate(VK_FORMAT_D32_SFLOAT, false), // not supported on this synthetic device
+            MakeCandidate(VK_FORMAT_D32_SFLOAT_S8_UINT, false),
+            MakeCandidate(VK_FORMAT_D24_UNORM_S8_UINT, true),
+        };
+        Check(SelectDepthFormat(candidates) == VK_FORMAT_D24_UNORM_S8_UINT,
+              "SelectDepthFormat skips candidates lacking DEPTH_STENCIL_ATTACHMENT_BIT and picks the first that has it");
+    }
+
+    void TestApplyVulkanYFlipNegatesOnlyYScale()
+    {
+        Mat4 m = Mat4::Identity();
+        m.Set(0, 0, 3.0f);
+        m.Set(1, 1, 2.5f);
+        m.Set(2, 3, 7.0f);
+
+        const Mat4 flipped = ApplyVulkanYFlip(m);
+        Check(flipped.At(1, 1) == -2.5f, "ApplyVulkanYFlip negates the Y-scale term");
+        Check(flipped.At(0, 0) == 3.0f, "ApplyVulkanYFlip leaves the X-scale term unchanged");
+        Check(flipped.At(2, 3) == 7.0f, "ApplyVulkanYFlip leaves unrelated entries unchanged");
+    }
+
+    void TestApplyVulkanYFlipComposesWithProjection()
+    {
+        // Reproduces the exact check M8F originally had baked into
+        // Core's projection helper, now split across two layers: Core
+        // builds the plain RH/ZO matrix (no flip - see
+        // TestPerspectiveRH_ZO in tests/core_tests.cpp), and this
+        // Vulkan-layer flip is what makes a world-space "up" point
+        // land at negative NDC y, as Vulkan's framebuffer convention
+        // requires.
+        const Mat4 proj = ApplyVulkanYFlip(PerspectiveRH_ZO(std::numbers::pi_v<float> / 2.0f, 1.0f, 1.0f, 10.0f));
+        const Vec4 upPoint = proj * Vec4(0.0f, 1.0f, -1.0f, 1.0f);
+        Check(upPoint.y / upPoint.w < 0.0f,
+              "ApplyVulkanYFlip composed with PerspectiveRH_ZO gives a world-space 'up' point negative NDC y");
+    }
 }
 
 int main()
@@ -355,6 +422,11 @@ int main()
     TestCheckerboardByteSize();
     TestCheckerboardAlternatesTiles();
     TestCheckerboardFullyOpaque();
+
+    TestSelectDepthFormatPrefersFirstSupported();
+    TestSelectDepthFormatSkipsUnsupported();
+    TestApplyVulkanYFlipNegatesOnlyYScale();
+    TestApplyVulkanYFlipComposesWithProjection();
 
     if (g_failureCount == 0)
     {

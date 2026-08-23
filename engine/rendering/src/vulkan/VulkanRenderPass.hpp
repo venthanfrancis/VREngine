@@ -7,25 +7,27 @@
 namespace AREngine::Rendering::Vulkan
 {
     // Owns the smallest possible VkRenderPass: one color attachment
-    // (the swapchain's format), cleared on load, presentable on
-    // completion. No depth attachment, no multisampling, one subpass.
-    // See docs/ARCHITECTURE.md, "Render Pass vs. Dynamic Rendering
-    // (M8C)" for why a traditional render pass was chosen over Vulkan
-    // 1.3 dynamic rendering (AREngine targets Vulkan 1.2).
+    // (the swapchain's format) and, as of M8F, one depth attachment
+    // (see docs/ARCHITECTURE.md, "Render-Pass Depth Attachment (M8F)"),
+    // both cleared on load. No multisampling, one subpass, no stencil
+    // behavior. See docs/ARCHITECTURE.md, "Render Pass vs. Dynamic
+    // Rendering (M8C)" for why a traditional render pass was chosen
+    // over Vulkan 1.3 dynamic rendering (AREngine targets Vulkan 1.2).
     //
     // Independent of swapchain extent and image count - only the
-    // swapchain's *format* matters here, and that doesn't change
-    // across a resize (see docs/ARCHITECTURE.md, "Swapchain-Dependent
-    // Pipeline Resources (M8C)"). So unlike VulkanSwapchain/
-    // VulkanFramebuffers, this does NOT need to be recreated on
-    // resize.
+    // swapchain's color *format* and the chosen depth *format* matter
+    // here, and neither changes across a resize (the depth format is
+    // fixed once, from device capabilities, at startup — see
+    // docs/ARCHITECTURE.md, "Depth Format Selection (M8F)"). So unlike
+    // VulkanSwapchain/VulkanFramebuffers/the depth image itself, this
+    // does NOT need to be recreated on resize.
     //
     // Not copyable or movable: exactly one VkRenderPass per
     // VulkanRenderPass, destroyed exactly once, by this object alone.
     class VulkanRenderPass
     {
     public:
-        VulkanRenderPass(VkDevice device, VkFormat swapchainImageFormat);
+        VulkanRenderPass(VkDevice device, VkFormat swapchainImageFormat, VkFormat depthFormat);
         ~VulkanRenderPass();
 
         VulkanRenderPass(const VulkanRenderPass&) = delete;

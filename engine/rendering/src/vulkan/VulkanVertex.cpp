@@ -19,7 +19,7 @@ namespace AREngine::Rendering::Vulkan
 
         attributes[0].binding = 0;
         attributes[0].location = 0;
-        attributes[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT; // Vec3 as of M8F
         attributes[0].offset = offsetof(Vertex, position);
 
         attributes[1].binding = 0;

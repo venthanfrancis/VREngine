@@ -149,6 +149,86 @@ namespace
         Check(!(pointA == pointB), "Matrix multiplication order changes the result, as expected");
     }
 
+    void TestLookAtRH()
+    {
+        // Camera at (0,0,3) looking at the origin, matching the world
+        // convention's -Z forward: the target should end up exactly 3
+        // meters in front of the camera in view space (0,0,-3), and the
+        // camera's own position should map to the view-space origin.
+        const Vec3 eye(0.0f, 0.0f, 3.0f);
+        const Vec3 target(0.0f, 0.0f, 0.0f);
+        const Mat4 view = LookAtRH(eye, target, kWorldUp);
+
+        const Vec3 targetInView = TransformPoint(view, target);
+        CheckNearlyEqual(targetInView.x, 0.0f, "LookAtRH: target.x is centered in view space");
+        CheckNearlyEqual(targetInView.y, 0.0f, "LookAtRH: target.y is centered in view space");
+        CheckNearlyEqual(targetInView.z, -3.0f, "LookAtRH: target is 3 meters in front (forward = -Z)");
+
+        const Vec3 eyeInView = TransformPoint(view, eye);
+        CheckNearlyEqual(eyeInView.x, 0.0f, "LookAtRH: the eye itself maps to the view-space origin (x)");
+        CheckNearlyEqual(eyeInView.y, 0.0f, "LookAtRH: the eye itself maps to the view-space origin (y)");
+        CheckNearlyEqual(eyeInView.z, 0.0f, "LookAtRH: the eye itself maps to the view-space origin (z)");
+    }
+
+    void TestPerspectiveRH_ZO()
+    {
+        // fovY = 90deg, aspect = 1 -> focalLength = 1/tan(45deg) = 1,
+        // chosen so the resulting matrix entries are easy to verify by
+        // hand.
+        const float fovY = std::numbers::pi_v<float> / 2.0f;
+        const Mat4 proj = PerspectiveRH_ZO(fovY, /*aspect=*/1.0f, /*nearZ=*/1.0f, /*farZ=*/10.0f);
+
+        CheckNearlyEqual(proj.At(0, 0), 1.0f, "PerspectiveRH_ZO: X scale is focalLength/aspect");
+        // No graphics-API-specific Y flip here — that's a Vulkan-layer
+        // concern (VulkanClipSpace::ApplyVulkanYFlip), not part of the
+        // RH/ZO convention itself. See docs/ARCHITECTURE.md,
+        // "Core/Vulkan Clip-Space Split".
+        CheckNearlyEqual(proj.At(1, 1), 1.0f, "PerspectiveRH_ZO: Y scale is POSITIVE focalLength - no API-specific flip in Core");
+
+        // Zero-to-one depth range ("ZO"), not OpenGL's [-1,1]: a point
+        // on the near plane (view-space z = -near) must map to NDC
+        // depth 0; a point on the far plane (view-space z = -far) must
+        // map to NDC depth 1.
+        const Vec4 nearPoint = proj * Vec4(0.0f, 0.0f, -1.0f, 1.0f); // view-space near plane
+        CheckNearlyEqual(nearPoint.w, 1.0f, "PerspectiveRH_ZO: near-plane point has clip w = -viewZ = 1");
+        CheckNearlyEqual(nearPoint.z / nearPoint.w, 0.0f, "PerspectiveRH_ZO: near plane maps to NDC depth 0");
+
+        const Vec4 farPoint = proj * Vec4(0.0f, 0.0f, -10.0f, 1.0f); // view-space far plane
+        CheckNearlyEqual(farPoint.w, 10.0f, "PerspectiveRH_ZO: far-plane point has clip w = -viewZ = 10");
+        CheckNearlyEqual(farPoint.z / farPoint.w, 1.0f, "PerspectiveRH_ZO: far plane maps to NDC depth 1");
+
+        // Without any API-specific flip, a point straight "up" from the
+        // camera (positive view-space Y) lands at POSITIVE NDC Y - the
+        // ordinary, un-flipped mathematical result. (Vulkan's backend-
+        // specific flip is tested separately, in
+        // tests/vulkan_tests.cpp, alongside ApplyVulkanYFlip itself.)
+        const Vec4 upPoint = proj * Vec4(0.0f, 1.0f, -1.0f, 1.0f);
+        Check(upPoint.y / upPoint.w > 0.0f, "PerspectiveRH_ZO: a world-space 'up' point has POSITIVE NDC y (no flip)");
+    }
+
+    void TestModelViewProjectionComposition()
+    {
+        // The exact fixed camera M8F's demo uses: eye at (0,0,3),
+        // looking at the origin. Composing Model (identity - the point
+        // is already at the world origin) * View * Projection and
+        // transforming the world origin should land it centered on
+        // screen (NDC x=y=0) with a valid depth strictly between the
+        // near and far planes. Uses Core's PerspectiveRH_ZO directly
+        // (no Vulkan Y-flip) - that flip is a Vulkan-layer concern, not
+        // part of what this Core-level composition test is proving.
+        const Mat4 model = Mat4::Identity();
+        const Mat4 view = LookAtRH(Vec3(0.0f, 0.0f, 3.0f), Vec3(0.0f, 0.0f, 0.0f), kWorldUp);
+        const Mat4 proj = PerspectiveRH_ZO(std::numbers::pi_v<float> / 2.0f, 1.0f, 1.0f, 10.0f);
+        const Mat4 mvp = proj * view * model;
+
+        const Vec4 clip = mvp * Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        Check(clip.w > 0.0f, "MVP composition: a point in front of the camera has positive clip w");
+        CheckNearlyEqual(clip.x / clip.w, 0.0f, "MVP composition: world origin projects to NDC x=0");
+        CheckNearlyEqual(clip.y / clip.w, 0.0f, "MVP composition: world origin projects to NDC y=0");
+        const float ndcDepth = clip.z / clip.w;
+        Check(ndcDepth > 0.0f && ndcDepth < 1.0f, "MVP composition: NDC depth lies within [0,1] between near and far");
+    }
+
     void TestEvent()
     {
         struct DummyEvent : AREngine::Core::Event {};
@@ -167,6 +247,9 @@ int main()
     TestQuaternion();
     TestQuaternionFromAxisAngle();
     TestMat4TransformFactories();
+    TestLookAtRH();
+    TestPerspectiveRH_ZO();
+    TestModelViewProjectionComposition();
     TestEvent();
 
     if (g_failureCount == 0)
