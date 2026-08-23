@@ -36,11 +36,12 @@ namespace AREngine::Rendering::Vulkan
         const std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
 
         // One binding, three attributes (position, color, uv) - matches
-        // Vertex exactly (VulkanVertex.hpp/.cpp) and triangle.vert's
-        // `layout(location = 0/1/2) in ...` declarations. See
-        // docs/ARCHITECTURE.md, "Vertex Input Layout (M8D)".
-        const VkVertexInputBindingDescription bindingDescription = Vertex::GetBindingDescription();
-        const std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = Vertex::GetAttributeDescriptions();
+        // Rendering::MeshVertex exactly (VulkanVertex.hpp/.cpp) and
+        // triangle.vert's `layout(location = 0/1/2) in ...`
+        // declarations. See docs/ARCHITECTURE.md, "Vertex Input Layout
+        // (M8D)" and "Vertex Format Review (M8H)".
+        const VkVertexInputBindingDescription bindingDescription = GetVertexBindingDescription();
+        const std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = GetVertexAttributeDescriptions();
 
         VkPipelineVertexInputStateCreateInfo vertexInput{};
         vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -64,10 +65,19 @@ namespace AREngine::Rendering::Vulkan
         viewportState.viewportCount = 1;
         viewportState.scissorCount = 1;
 
+        // Back-face culling enabled as of M8H (was NONE through M8G) -
+        // see docs/ARCHITECTURE.md, "Back-Face Culling (M8H)" for the
+        // full winding-convention derivation. frontFace stays CLOCKWISE,
+        // unchanged since M8C: every procedural mesh
+        // (ProceduralMesh.cpp) winds its faces counter-clockwise as
+        // seen from outside/in front, which the Vulkan Y-flip
+        // (ApplyVulkanYFlip, applied to the projection matrix) turns
+        // into clockwise in actual screen space - exactly this
+        // frontFace value.
         VkPipelineRasterizationStateCreateInfo rasterization{};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterization.cullMode = VK_CULL_MODE_NONE;
+        rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
         rasterization.frontFace = VK_FRONT_FACE_CLOCKWISE;
         rasterization.lineWidth = 1.0f;
 

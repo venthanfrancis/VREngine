@@ -1,22 +1,22 @@
-// Manual M8G validation demo — NOT part of the automated CTest suite,
+// Manual M8H validation demo — NOT part of the automated CTest suite,
 // since it requires a real Vulkan-capable GPU/driver and opens a real
 // window, neither of which CI/headless systems have. Built by CMake
 // but deliberately not registered with add_test. Run it manually.
 //
-// Extends M8F's fixed-camera depth demo with AREngine's first real
-// Camera (Scene::Camera + Scene::Transform, backend-independent — see
-// docs/ARCHITECTURE.md, "Camera Ownership / Module Placement (M8G)")
-// and a free-fly controller (ARDemo::DemoCameraController,
-// DemoCameraController.hpp — demo-private, mixes Input policy with
-// motion math, deliberately NOT part of the permanent engine) driven by
-// AREngine's existing InputSystem: WASD to move (following wherever the
-// camera is currently looking, not always world -Z), Space/Ctrl for
-// up/down, hold the right mouse button and move the mouse to look
-// around. A small hard-coded scene (a floor plus several upright quads
-// at different distances, including M8F's original near/far depth-proof
-// pair) replaces M8F's single quad pair, so movement has real depth and
-// perspective to observe. Depth testing remains enabled throughout. See
-// docs/ARCHITECTURE.md, "M8G Implementation Notes" for full details.
+// Extends M8G's free-fly camera demo with AREngine's first reusable
+// mesh representation: CPU-side geometry (Rendering::MeshData,
+// backend-independent — see docs/ARCHITECTURE.md, "CPU Mesh Data
+// Placement (M8H)") uploaded once to a single GPU mesh
+// (Vulkan::VulkanMesh) and drawn many times with different Model
+// transforms. The old hard-coded "one shared quad" demo geometry is
+// gone; the scene is now a floor plus several 1-meter cubes (see
+// Rendering::CreateCubeMesh), all of them the SAME uploaded mesh — see
+// docs/ARCHITECTURE.md, "Multiple Instances (M8H)". The M8G free-fly
+// Camera + DemoCameraController are unchanged: WASD to move, Space/Ctrl
+// for up/down, hold the right mouse button and move the mouse to look
+// around. Depth testing remains enabled, and back-face culling is now
+// enabled too (see "Back-Face Culling (M8H)"). See
+// docs/ARCHITECTURE.md, "M8H Implementation Notes" for full details.
 //
 // This demo reaches directly into Rendering's private src/vulkan/
 // implementation (not through any public Rendering API), same as
@@ -27,12 +27,12 @@
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Input/Input.hpp"
 #include "AREngine/Platform/Platform.hpp"
+#include "AREngine/Rendering/ProceduralMesh.hpp"
 #include "AREngine/Scene/Camera.hpp"
 #include "AREngine/Scene/Transform.hpp"
 
 #include "DemoCameraController.hpp"
 
-#include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCheckerboard.hpp"
 #include "vulkan/VulkanClipSpace.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
@@ -44,6 +44,7 @@
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
+#include "vulkan/VulkanMesh.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
@@ -54,14 +55,12 @@
 #include "vulkan/VulkanSwapchain.hpp"
 #include "vulkan/VulkanSwapchainSupport.hpp"
 #include "vulkan/VulkanVersion.hpp"
-#include "vulkan/VulkanVertex.hpp"
 
 #include <array>
 #include <cstdint>
 #include <format>
 #include <limits>
 #include <memory>
-#include <numbers>
 #include <vector>
 
 using namespace AREngine;
@@ -108,52 +107,54 @@ namespace
         return fence;
     }
 
-    // One piece of M8G's hard-coded demo world: a shared quad, placed
-    // and colored by its own Transform + tint. Temporary test content,
-    // not a general world/level system - see docs/ARCHITECTURE.md,
-    // "Demo World (M8G)".
-    struct SceneObject
+    // One piece of M8H's hard-coded demo world: the SAME uploaded cube
+    // mesh, placed/scaled/colored by its own Transform + tint + a
+    // non-owning pointer back to the one mesh it draws. Temporary,
+    // demo-only content — not MeshComponent, not RenderableComponent,
+    // not a general world/level system. See docs/ARCHITECTURE.md,
+    // "Scene Separation (M8H)".
+    struct DemoObject
     {
         Scene::Transform transform;
         Core::Math::Vec4 tint;
+        const VulkanMesh* mesh = nullptr;
     };
 
-    // A floor plus several upright quads at different distances/
-    // positions - enough for movement to have real depth/perspective to
-    // observe, without implementing MeshAsset/model loading or a
-    // general world system. Includes M8F's original near/far
-    // depth-testing pair unchanged (still proves the same occlusion
-    // fact — see docs/ARCHITECTURE.md, "Exact Visual Proof That Depth
-    // Testing Works (M8F)" — now just two objects among several the
-    // user can walk around and view from any angle).
-    [[nodiscard]] std::vector<SceneObject> BuildDemoScene()
+    // A floor plus several 1-meter cubes at different distances/lateral
+    // positions - enough for movement, look-around, depth, and
+    // occlusion to all be visible while walking through the scene.
+    // Every entry below reuses the SAME `cubeMesh` pointer: this is the
+    // whole point of M8H - one GPU upload, many draws with different
+    // Model transforms. See docs/ARCHITECTURE.md, "Multiple Instances
+    // (M8H)".
+    [[nodiscard]] std::vector<DemoObject> BuildDemoScene(const VulkanMesh* cubeMesh)
     {
         using namespace AREngine::Core::Math;
         using AREngine::Scene::Transform;
 
-        const float halfPi = std::numbers::pi_v<float> / 2.0f;
-
         return {
-            // Floor: local quad (facing +Z) rotated 90deg around Right
-            // so its plane becomes horizontal (XZ), then scaled up into
-            // a 20x20m ground plane. Scale is applied before rotation
-            // (TRS order), so scaling X/Y (not Z) here is what ends up
-            // stretching the horizontal plane's X/Z extent once rotated.
-            {Transform{Vec3(0.0f, -1.0f, -5.0f), Quaternion::FromAxisAngle(kWorldRight, halfPi), Vec3(20.0f, 20.0f, 1.0f)},
-             Vec4(1.0f, 1.0f, 1.0f, 1.0f)},
+            // Floor: the same 1x1x1 cube, scaled into a thin, wide slab
+            // (20m x 0.1m x 20m) - no rotation needed, unlike M8G's flat
+            // quad, since a cube already has extent on all three axes.
+            // Top surface lands at y = -0.5, matching the cubes below's
+            // resting height.
+            {Transform{Vec3(0.0f, -0.55f, -6.0f), Quaternion::Identity(), Vec3(20.0f, 0.1f, 20.0f)},
+             Vec4(1.0f, 1.0f, 1.0f, 1.0f), cubeMesh},
 
-            // M8F's original depth-testing pair, positions unchanged.
-            {Transform{Vec3(-2.0f, 0.5f, -3.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
-             Vec4(1.0f, 1.0f, 1.0f, 1.0f)}, // near, untinted
-            {Transform{Vec3(-1.6f, 0.5f, -5.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
-             Vec4(1.0f, 0.35f, 0.35f, 1.0f)}, // far, red
-
-            // A couple more, farther out, so there is real scene depth
-            // to walk through and look around.
-            {Transform{Vec3(2.0f, 0.5f, -6.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
-             Vec4(0.4f, 1.0f, 0.4f, 1.0f)}, // green
-            {Transform{Vec3(3.5f, 0.5f, -9.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
-             Vec4(0.4f, 0.4f, 1.0f, 1.0f)}, // blue
+            // Five unit cubes, all resting on the floor (center y = 0 ->
+            // bottom at y = -0.5), spread across depth and both lateral
+            // directions so movement/look-around and back-face culling
+            // are all easy to observe from any angle.
+            {Transform{Vec3(-2.0f, 0.0f, -4.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(1.0f, 1.0f, 1.0f, 1.0f), cubeMesh}, // untinted
+            {Transform{Vec3(0.0f, 0.0f, -5.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(0.9f, 0.4f, 0.4f, 1.0f), cubeMesh}, // red
+            {Transform{Vec3(2.0f, 0.0f, -6.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(0.4f, 0.9f, 0.4f, 1.0f), cubeMesh}, // green
+            {Transform{Vec3(-3.5f, 0.0f, -8.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(0.4f, 0.4f, 0.9f, 1.0f), cubeMesh}, // blue
+            {Transform{Vec3(3.5f, 0.0f, -9.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(0.9f, 0.9f, 0.4f, 1.0f), cubeMesh}, // yellow
         };
     }
 }
@@ -173,7 +174,7 @@ int main()
     Input::InputSystem inputSystem;
 
     Platform::WindowDesc desc;
-    desc.title = "AREngine M8G Vulkan Camera Demo";
+    desc.title = "AREngine M8H Vulkan Mesh Demo";
     desc.width = 1280;
     desc.height = 720;
     auto window = Platform::CreateAppWindow(desc);
@@ -257,55 +258,30 @@ int main()
 
     VulkanCommandPool commandPool(device.Get(), physicalDevice.queueFamilies.graphicsFamily);
 
-    // One shared quad (4 vertices, 6 indices, 2 triangles), drawn TWICE
-    // per frame at two different depths via two different Model
-    // matrices (see the fixed camera/depth-proof setup below) - proves
-    // both vertex-buffer and index-buffer infrastructure (a triangle
-    // alone wouldn't need an index buffer to be meaningful). Neither
-    // buffer is swapchain-dependent - both are created once here and
-    // survive every swapchain recreation untouched. See
-    // docs/ARCHITECTURE.md, "Resource Lifetime: Swapchain-Dependent vs.
-    // Geometry (M8D)".
+    // M8H's whole reusable-mesh proof: ONE CPU-side MeshData
+    // (Rendering::CreateCubeMesh - a backend-independent 1x1x1 cube,
+    // see docs/ARCHITECTURE.md, "Procedural Test Meshes (M8H)")
+    // uploaded ONCE into ONE GPU mesh (VulkanMesh - owns the vertex and
+    // index buffers together, see "VulkanMesh Ownership (M8H)"). Not
+    // swapchain-dependent - created once here, survives every
+    // swapchain recreation untouched, same discipline the old vertex/
+    // index buffers followed through M8G. See docs/ARCHITECTURE.md,
+    // "Resource Lifetime (M8H)".
     //
-    //   0 ---- 1
-    //   |    / |
-    //   |   /  |
-    //   |  /   |
-    //   | /    |
-    //   3 ---- 2
-    //
-    // Positions are local/object-space (z=0 - depth comes entirely from
-    // the Model matrix's translation, not baked into the vertex data;
-    // see docs/ARCHITECTURE.md, "Vec3 Vertex Layout (M8F)"). UVs map
-    // each corner to the matching corner of the texture (0,0) top-left
-    // to (1,1) bottom-right - the same corner order as position, so the
-    // whole texture covers the whole quad exactly once, with no
-    // cropping or repetition.
-    const std::vector<Vertex> vertices = {
-        {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // 0
-        {{ 0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}}, // 1
-        {{ 0.5f,  0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}}, // 2
-        {{-0.5f,  0.5f, 0.0f}, {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}, // 3
-    };
-    const std::vector<std::uint32_t> indices = {0, 1, 2, 2, 3, 0};
-
-    auto vertexBuffer = CreateDeviceLocalBuffer(
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
-        vertices.data(), sizeof(Vertex) * vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    auto indexBuffer = CreateDeviceLocalBuffer(
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
-        indices.data(), sizeof(std::uint32_t) * indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    AR_LOG_INFO(std::format("Vertex buffer: {} vertices, {} bytes, stride {} bytes",
-                             vertices.size(), vertexBuffer->GetSize(), sizeof(Vertex)));
-    AR_LOG_INFO(std::format("Index buffer: {} indices (uint32_t), {} bytes",
-                             indices.size(), indexBuffer->GetSize()));
+    // Every object in the demo scene below (the floor AND every cube)
+    // reuses this exact same VulkanMesh, scaled/positioned/tinted
+    // differently per object - see "Multiple Instances (M8H)".
+    const Rendering::MeshData cubeMeshData = Rendering::CreateCubeMesh();
+    auto cubeMesh = CreateVulkanMesh(
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(), cubeMeshData);
+    AR_LOG_INFO(std::format("Cube mesh: {} vertices, {} indices, uploaded once (GPU mesh uploads: 1)",
+                             cubeMeshData.vertices.size(), cubeMeshData.indices.size()));
 
     // A tiny procedural checkerboard - M8E's whole "texture asset",
     // deliberately generated rather than decoded from a file (no PNG/
     // JPEG support exists yet). Not swapchain-dependent - created once,
-    // survives every resize untouched, same as the vertex/index
-    // buffers above. See docs/ARCHITECTURE.md, "Resource Lifetime
-    // (M8E)".
+    // survives every resize untouched, same as the cube mesh above.
+    // See docs/ARCHITECTURE.md, "Resource Lifetime (M8E)".
     constexpr std::uint32_t kTextureWidth = 64;
     constexpr std::uint32_t kTextureHeight = 64;
     constexpr std::uint32_t kTextureTileSize = 8;
@@ -329,18 +305,18 @@ int main()
     // M8G's real Camera: backend-independent projection parameters
     // (Scene::Camera) driving a view matrix built from a Transform's
     // pose - no Vulkan type anywhere in either. near/far widened from
-    // M8F's 0.1/10.0 to comfortably contain the larger demo world below
-    // (the floor alone spans roughly Z in [-15,5]). See
+    // M8F's 0.1/10.0 to comfortably contain the demo world below (the
+    // floor alone spans roughly Z in [-16,4]). See
     // docs/ARCHITECTURE.md, "Camera Data (M8G)".
     Scene::Camera camera;
     camera.nearZ = 0.1f;
     camera.farZ = 100.0f;
 
-    // Starting pose: 1m above the floor (floor sits at y=-1), a few
-    // meters back from the demo scene, facing -Z (identity rotation) -
-    // i.e. looking straight into the scene, matching
-    // DemoCameraController's own yaw=pitch=0 default so the very first
-    // frame's orientation and this Transform agree.
+    // Starting pose: roughly 1.5m above the floor (floor's top surface
+    // sits at y=-0.5), a few meters back from the demo scene, facing -Z
+    // (identity rotation) - i.e. looking straight into the scene,
+    // matching DemoCameraController's own yaw=pitch=0 default so the
+    // very first frame's orientation and this Transform agree.
     Scene::Transform cameraTransform;
     cameraTransform.position = Core::Math::Vec3(0.0f, 1.0f, 5.0f);
 
@@ -357,8 +333,8 @@ int main()
     AR_ASSERT_MSG(physicalDevice.properties.limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
         "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
 
-    const std::vector<SceneObject> sceneObjects = BuildDemoScene();
-    AR_LOG_INFO(std::format("Demo scene: {} objects (1 floor + {} upright quads)",
+    const std::vector<DemoObject> sceneObjects = BuildDemoScene(cubeMesh.get());
+    AR_LOG_INFO(std::format("Demo scene: {} objects (1 floor + {} cube instances, all sharing 1 mesh)",
                              sceneObjects.size(), sceneObjects.size() - 1));
 
     Platform::SteadyClock clock;
@@ -473,7 +449,7 @@ int main()
                                  swapchain->GetExtent().width, swapchain->GetExtent().height, swapchain->GetImageCount()));
     };
 
-    AR_LOG_INFO("AREngine M8G camera demo: WASD to move, Space/Ctrl for up/down, "
+    AR_LOG_INFO("AREngine M8H mesh demo: WASD to move, Space/Ctrl for up/down, "
                 "hold Right Mouse Button and move the mouse to look around. Close the window to exit.");
 
     int currentFrame = 0;
@@ -588,17 +564,15 @@ int main()
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
 
-        // Real geometry from real GPU buffers: bind the quad's vertex
-        // buffer at binding 0 (matching Vertex::GetBindingDescription())
-        // and its index buffer, then the texture's descriptor set once
-        // for the whole frame, then draw indexed once per scene object.
-        // See docs/ARCHITECTURE.md, "Indexed Draw Path (M8D)", "Command
+        // Real geometry from a real GPU mesh: bind the cube mesh's
+        // vertex buffer (binding 0, matching GetVertexBindingDescription())
+        // and index buffer ONCE for the whole frame - every object below
+        // reuses this exact same binding, since every object IS the same
+        // mesh. The texture's descriptor set is likewise bound once. See
+        // docs/ARCHITECTURE.md, "Multiple Instances (M8H)", "Command
         // Recording (M8E)", and "Exact Visual Proof That Depth Testing
         // Works (M8F)".
-        VkBuffer vertexBuffers[] = {vertexBuffer->Get()};
-        VkDeviceSize vertexOffsets[] = {0};
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, vertexOffsets);
-        vkCmdBindIndexBuffer(commandBuffer, indexBuffer->Get(), 0, VK_INDEX_TYPE_UINT32);
+        cubeMesh->Bind(commandBuffer);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
             0, 1, &descriptorSet, 0, nullptr);
 
@@ -621,14 +595,15 @@ int main()
         // (Model varies per object; View/Projection are this frame's,
         // shared by all of them) and pushed immediately before each
         // draw - see docs/ARCHITECTURE.md, "Push Constant Review
-        // (M8G)". Still no vertex buffer of its own per object - every
-        // object reuses the one shared quad bound above.
-        for (const SceneObject& object : sceneObjects)
+        // (M8G)". No vertex/index buffer of its own per object - every
+        // object draws through its own `mesh` pointer, which for every
+        // object in this demo is the one cube mesh bound above.
+        for (const DemoObject& object : sceneObjects)
         {
             const MvpPushConstants pushConstants{viewProjection * object.transform.ToMatrix(), object.tint};
             vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                 0, sizeof(MvpPushConstants), &pushConstants);
-            vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
+            object.mesh->Draw(commandBuffer);
         }
 
         vkCmdEndRenderPass(commandBuffer);
@@ -673,18 +648,17 @@ int main()
     }
 
     // GPU idle before destroying anything - see docs/ARCHITECTURE.md,
-    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E"/"M8F"/"M8G
-    // Implementation Notes". This also covers the vertex/index buffers,
-    // the texture/descriptor resources, and the depth image: the last
+    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E"/"M8F"/"M8G"/
+    // "M8H Implementation Notes". This also covers the cube mesh, the
+    // texture/descriptor resources, and the depth image: the last
     // frame's draw commands may still be referencing all of them until
     // the GPU actually finishes, which this wait guarantees. Everything
     // else (sync objects, descriptor pool, sampler, texture image,
-    // index buffer, vertex buffer, command pool, depth image,
-    // framebuffers, pipeline, descriptor set layout, render pass,
-    // swapchain, device, surface, instance, window, inputSystem)
-    // unwinds automatically after this in reverse construction order —
-    // inputSystem last of all, per the ordering comment where it's
-    // declared, above.
+    // cube mesh, command pool, depth image, framebuffers, pipeline,
+    // descriptor set layout, render pass, swapchain, device, surface,
+    // instance, window, inputSystem) unwinds automatically after this
+    // in reverse construction order — inputSystem last of all, per the
+    // ordering comment where it's declared, above.
     vkDeviceWaitIdle(device.Get());
 
     for (FrameSyncObjects& sync : frameSync)

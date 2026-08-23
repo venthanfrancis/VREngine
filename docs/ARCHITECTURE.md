@@ -3042,3 +3042,317 @@ composition, input integration, delta-time-based movement, resize
 handling, and the focus-loss key-clear interaction with the new
 controller all worked correctly on the first real-hardware run, with
 zero validation warnings to investigate.
+
+## 23. M8H Implementation Notes
+
+M8H introduces AREngine's first reusable mesh representation: CPU-side
+geometry (`Rendering::MeshData`) separated from Vulkan GPU mesh
+resources (`Vulkan::VulkanMesh`), so geometry can be defined once and
+drawn many times with different Model transforms — replacing the
+hard-coded "one shared quad" the Vulkan demo had used since M8D with a
+1-meter cube uploaded once and drawn six times (a floor plus five
+instances).
+
+### CPU Mesh Data Placement (M8H)
+
+`Rendering::MeshVertex`/`MeshData`
+(`engine/rendering/include/AREngine/Rendering/MeshData.hpp`) live in
+`Rendering`, not `Assets`. The deciding factor: this is purely runtime
+geometry data with no file format, no `AssetId`, and no loading step —
+exactly what `Assets` (`AssetId`, `TextAsset`/`BinaryAsset`, caching by
+path) is not about. `Rendering` was already the layer that had (until
+now, privately) needed exactly this shape of data
+(`Vulkan::Vertex` — see "Vertex Format Review" below), and placing the
+now-generic version in the same module it was extracted from, rather
+than in a module that has never touched geometry, keeps the layering
+simple: `Rendering` depends only on `Core`, same as before, and gains
+no new dependency. `MeshData` has zero Vulkan types, zero Scene
+dependency, and zero `AssetId` requirement — a future `MeshAsset`
+(loaded from glTF/OBJ) would most likely *produce* a `MeshData` as its
+in-memory representation, not replace it.
+
+### Vertex Format Review (M8H)
+
+Through M8G, `Vulkan::Vertex` (`src/vulkan/VulkanVertex.hpp`) was a
+Vulkan-private struct: `Vec3 position; Vec3 color; Vec2 uv;`. M8H's
+`Rendering::MeshVertex` needed exactly the same three fields — the
+same shape independently required twice is the actual evidence this
+milestone needed. Rather than keep two identical structs and convert
+between them (copying every vertex into a throwaway Vulkan-private
+array on every mesh upload, for zero benefit), `Vulkan::Vertex` was
+retired: `VulkanVertex.hpp/.cpp` now exports two free functions,
+`GetVertexBindingDescription()`/`GetVertexAttributeDescriptions()`,
+that operate directly on `Rendering::MeshVertex` via `offsetof`. No
+`VkFormat` or byte offset is exposed on any public `Rendering`
+header — `MeshVertex` itself stays plain engine data; only these two
+Vulkan-private functions (and the shaders' `layout(location = ...)`
+declarations, which they must keep matching) know Vulkan's vertex-input
+description shape. `VulkanGraphicsPipeline` was updated to call the
+renamed free functions instead of `Vertex::GetBindingDescription()`/
+`Vertex::GetAttributeDescriptions()`.
+
+### Mesh Validation (M8H)
+
+`MeshData::IsValid()` (inline, in `MeshData.hpp`) is deliberately
+minimal — not a general mesh validator (no degenerate-triangle checks,
+no duplicate-vertex detection, no winding/manifold checks): just
+`vertices` non-empty, `indices` non-empty, and every index `<
+vertices.size()`. `Vulkan::VulkanMesh`'s constructor asserts this
+(`AR_ASSERT_MSG`) before touching the data — invalid geometry is a
+programmer error to catch immediately, not a runtime condition an
+upload path should try to recover from.
+
+### Procedural Test Meshes (M8H)
+
+`Rendering::CreateQuadMesh()`/`CreateCubeMesh()`
+(`engine/rendering/include/AREngine/Rendering/ProceduralMesh.hpp`,
+implemented in `src/ProceduralMesh.cpp`, built unconditionally — no
+Vulkan dependency) generate geometry in-memory; no downloaded models,
+no glTF/OBJ, no `MeshAsset`. `CreateQuadMesh()` reproduces the exact
+1x1m quad (4 vertices, 6 indices, same UV mapping) the Vulkan demo
+hard-coded from M8D through M8G — now reusable and backend-independent
+instead of demo-private. `CreateCubeMesh()` builds a 1x1x1 meter cube
+(see `docs/WORLD_CONVENTIONS.md` for "1 unit = 1 meter"), centered on
+the origin (`x`/`y`/`z` each spanning exactly `-0.5..+0.5`), with **24
+vertices, not 8**: each of the 6 faces gets its own 4 corners, because
+sharing corner vertices across faces would force one shared UV per
+corner, which cannot correctly map a texture independently onto the 2
+or 3 faces meeting at that corner. 36 indices (6 faces x 2 triangles x
+3). Every vertex color is white (`(1,1,1)`) — these are neutral,
+reusable primitives; the M8D-era per-vertex color gradient was specific
+to that one now-retired demo quad, proven separately, and unrelated to
+these generators. Every face is built with a consistent right-handed
+`R x U = N` corner ordering (`R`/`U` are the face's local right/up
+axes, `N` its outward normal), matching `CreateQuadMesh`'s own +Z-face
+winding exactly — see "Back-Face Culling" below for why this specific
+convention matters.
+
+### VulkanMesh Ownership (M8H)
+
+`Vulkan::VulkanMesh` (`src/vulkan/VulkanMesh.hpp/.cpp`) owns exactly
+two `VulkanBuffer`s (vertex, index — reusing the existing class, not a
+new one) plus the index count needed to draw. No `VkBuffer` is exposed
+on any public `Rendering` header — reached only through Rendering's
+private `src/vulkan/` implementation, same as `VulkanBuffer`/
+`VulkanImage` before it. Not copyable or movable, same discipline as
+every other owned Vulkan resource in this backend. The conceptual
+pipeline this milestone introduces:
+
+```
+MeshData (CPU, backend-independent)
+    |  upload (CreateVulkanMesh)
+    v
+VulkanMesh (GPU, Vulkan-private)
+    |
+    v
+Bind() + Draw()
+```
+
+`Bind()` issues `vkCmdBindVertexBuffers`/`vkCmdBindIndexBuffer`;
+`Draw()` issues one `vkCmdDrawIndexed` covering the mesh's full index
+range. Splitting these (rather than one combined `Draw()`) is what
+lets the demo bind once per frame and draw many times — see "Multiple
+Instances" below.
+
+### Upload Flow (M8H)
+
+`CreateVulkanMesh(physicalDevice, device, commandPool, queue,
+meshData)` is a thin factory mirroring `CreateDeviceLocalBuffer`/
+`CreateTextureFromPixels`'s existing shape: validate, upload, return an
+owned resource via `std::unique_ptr` (`VulkanMesh` is non-movable, same
+reasoning as those). `VulkanMesh`'s constructor does the actual work:
+asserts `meshData.IsValid()`, then calls the existing
+`CreateDeviceLocalBuffer` (M8D's staging-buffer upload path,
+unchanged) twice — once for vertices, once for indices. Synchronous,
+like every other upload in this backend; no async upload was added.
+
+### Multiple Instances (M8H)
+
+The whole point of this milestone: **one** `MeshData` → **one**
+`CreateVulkanMesh` call → **one** GPU-resident vertex/index buffer
+pair → **many** draws, each with its own Model matrix (and tint) via
+push constants. The demo's render loop calls `cubeMesh->Bind()` once
+per frame (binding the vertex/index buffers and the texture's
+descriptor set is redundant to repeat per-object when every object is
+the same mesh), then loops over `sceneObjects`, pushing a fresh
+`MvpPushConstants{viewProjection * object.transform.ToMatrix(),
+object.tint}` and calling `object.mesh->Draw()` for each. Confirmed via
+the manual demo's log: `Cube mesh: 24 vertices, 36 indices, uploaded
+once (GPU mesh uploads: 1)` appears exactly once per run, regardless of
+resize/minimize/restore cycles (see "Validation Results" below) —
+proving the mesh is genuinely uploaded once, not once per object and
+not re-uploaded on any subsequent event.
+
+### Back-Face Culling (M8H)
+
+Enabled: `cullMode = VK_CULL_MODE_BACK_BIT`, `frontFace =
+VK_FRONT_FACE_CLOCKWISE` (unchanged since M8C — was inert with
+`cullMode = NONE` through M8G). The winding convention was derived,
+not guessed: AREngine's view space for an identity-orientation camera
+keeps world axes unchanged (only translated), and `PerspectiveRH_ZO`
+does not flip X or Y — only `ApplyVulkanYFlip` (the Vulkan-layer Y
+flip applied to the projection matrix, see section 21's "Core/Vulkan
+Clip-Space Split") does. Flipping one screen-space axis reverses
+apparent winding, so a triangle wound counter-clockwise in view space
+(as seen from the outward-normal side, matching every
+`ProceduralMesh.cpp` face by construction) becomes clockwise in actual
+Vulkan screen space after the Y flip — exactly matching
+`VK_FRONT_FACE_CLOCKWISE`. This was verified two ways: (1) the existing
+quad geometry (vertex order `0,1,2,2,3,0` at `(-0.5,-0.5)`,
+`(0.5,-0.5)`, `(0.5,0.5)`, `(-0.5,0.5)`) is CCW as seen from `+Z`,
+matching this exact derivation, and had already been rendering
+correctly (front-facing, undisturbed by culling being off) since M8D;
+(2) `CreateCubeMesh`'s six faces were built with the identical `R x U
+= N` corner-ordering rule applied consistently to every face, not
+independently guessed per face. No winding or projection convention
+was changed to "fix" a disappearing-face problem — culling was enabled
+once the derivation held, not adjusted reactively.
+
+### Normals (M8H)
+
+Deliberately not added. There is no lighting yet, so no shader stage
+would consume a normal attribute — adding one now would be an unused
+vertex attribute carried purely in anticipation of a future milestone,
+which the project's stated style explicitly avoids. Normals belong to
+whichever future milestone introduces lighting.
+
+### Generic RenderDevice Review (M8H)
+
+Reviewed against real evidence from this milestone (buffer uploads,
+vertex/index usage, repeated-geometry reuse, indexed draws) — and
+concluded the current split is still correct, so nothing was changed:
+
+- **Should `Mesh` be a generic `RenderDevice` concept?** Not yet.
+  `RenderDevice::CreateBuffer` already exists and is sufficient in
+  principle; the missing piece M8D/M8E's reviews already found (no way
+  to supply initial data to a generic buffer/texture) is still
+  unaddressed, and M8H doesn't add new evidence about what that upload
+  API should look like — it's still exactly one demo's worth of
+  evidence (one Vulkan backend, one mesh shape) for a generic upload
+  API that would need to work for buffers, textures, *and* meshes
+  consistently.
+- **Should `RenderDevice` expose `CreateMesh`?** Not yet, for the same
+  reason M4 deferred a pipeline/shader API: a generic `RenderDevice`
+  method needs evidence from more than one backend's real requirements
+  to shape correctly, and Vulkan is still the only backend with real
+  geometry. Bundling vertex+index buffers into one handle is a
+  reasonable-looking shape, but "reasonable-looking" isn't the bar this
+  project has held itself to elsewhere (see M8D/M8E's buffer/texture
+  reviews) — a second backend or a real multi-mesh scene (M8I/M8J)
+  would be the actual evidence needed.
+- **Conclusion**: mesh upload stays a higher-level, Vulkan-private
+  concern (`VulkanMesh`/`CreateVulkanMesh`), built *on top of* the
+  existing private `VulkanBuffer`/`CreateDeviceLocalBuffer` — exactly
+  the same layering `VulkanImage`'s texture upload already uses. `Mesh`
+  is a genuinely evidence-based *generic Rendering concept* now (see
+  "CPU Mesh Data Placement" above) — that's new. It is **not yet** a
+  `RenderDevice` concept — that remains deferred, unchanged from M4's
+  original reasoning, now with one more milestone's worth of evidence
+  still pointing the same direction rather than a new direction.
+
+### Scene Separation (M8H)
+
+Unchanged from the milestone's explicit requirement: `Scene` does not
+depend on `Mesh` or `Rendering`. No `MeshComponent`, no
+`RenderableComponent`, no ECS. The Vulkan demo's temporary
+`DemoObject{ Scene::Transform transform; Core::Math::Vec4 tint; const
+VulkanMesh* mesh; }` (non-owning pointer — the demo's `cubeMesh`
+`unique_ptr` is the sole owner) is demo-only, matching the exact shape
+the milestone suggested, kept only because it lets the render loop
+demonstrate mesh reuse (`object.mesh->Draw(...)`) without introducing
+any permanent Scene/Rendering coupling.
+
+### Resource Lifetime (M8H)
+
+The cube mesh's GPU buffers are **not** swapchain-dependent: created
+once (alongside the command pool, before the render loop), survive
+every `recreateSwapchain()` call untouched, and are destroyed only at
+demo shutdown (via `vkDeviceWaitIdle` followed by automatic
+destruction in reverse construction order) — the exact same lifetime
+category M8D/M8E's vertex/index/texture resources already occupied.
+Resize/minimize/restore never rebuilds mesh buffers; confirmed
+directly by the manual run's log (see "Validation Results" below).
+
+### Validation Results (M8H)
+
+`ARENGINE_ENABLE_VULKAN=ON` (default): full `/W4 /WX` clean build,
+`ctest` **11/11** (new `MeshTests` — 10 pure-logic checks covering
+`MeshData::IsValid()`'s four validation rules plus valid-input
+acceptance, `CreateQuadMesh`'s vertex/index counts, and
+`CreateCubeMesh`'s vertex/index counts, index-range check, and exact
+1-meter centered bounds; `VulkanTests`' vertex tests updated to call
+the renamed `GetVertexBindingDescription`/`GetVertexAttributeDescriptions`
+against `Rendering::MeshVertex`, unchanged in what they verify).
+`ARENGINE_ENABLE_VULKAN=OFF`: full build succeeds, no Vulkan/shader
+targets present, `ctest` **10/10** (no `VulkanTests`; `MeshTests` is
+registered unconditionally in `tests/CMakeLists.txt`, not gated behind
+`ARENGINE_ENABLE_VULKAN`, since neither `MeshData` nor
+`ProceduralMesh` depend on Vulkan — this is why the no-Vulkan total
+grew from M8G's 9/9 to 10/10).
+
+`arengine_vulkan_present_demo` (title: "AREngine M8H Vulkan Mesh
+Demo") run against real hardware (NVIDIA GeForce RTX 3060 Laptop
+GPU): startup log confirms `Cube mesh: 24 vertices, 36 indices,
+uploaded once (GPU mesh uploads: 1)` and `Demo scene: 6 objects (1
+floor + 5 cube instances, all sharing 1 mesh)` — matching
+`CreateCubeMesh`'s expected 24/36 counts exactly. A resize/minimize/
+restore cycle (640x480 -> 1000x700 -> minimized -> restored) produced
+six `Swapchain recreated` log lines with **zero validation errors or
+warnings**, and — critically — the `Cube mesh:` upload line appears
+exactly **once** in the full log, never repeated across any of those
+events, directly confirming the mesh buffers are not rebuilt on
+resize. The demo closed cleanly via its window's close button both
+times it was run, logging `Vulkan presentation demo complete -
+shutting down` with no hang and no leftover process.
+
+**Visual on-screen confirmation (cube visibility at different depths,
+texture mapping, culling correctness, camera movement/depth from
+multiple viewpoints) could not be captured this session**: the
+development machine had another application running in exclusive
+fullscreen for the full duration of manual validation, which — unlike
+a normal windowed application — renders directly to the display and
+cannot be screenshotted or brought forward via the usual
+window-capture approach without forcibly interrupting that foreground
+application. Rather than force focus away from it, visual verification
+was skipped in favor of the log-based evidence above (exact expected
+vertex/index/object counts, single mesh upload confirmed both at
+startup and held steady across every resize/minimize/restore event,
+zero validation-layer errors throughout). The geometry and culling
+convention were independently derived mathematically (see "Back-Face
+Culling" above) rather than tuned to match a screenshot, which reduces
+but does not eliminate the risk of an on-screen defect the log
+wouldn't reveal (e.g., a texture appearing upside-down, though UV
+mapping is unchanged from M8D/M8E's already-visually-confirmed
+convention). A follow-up visual pass is recommended once the display
+is free, before treating M8H as fully closed out.
+
+- CPU mesh data module: **`AREngine::Rendering`**
+  (`MeshData.hpp`/`ProceduralMesh.hpp`)
+- Cube vertex count: **24** (6 faces x 4, not shared across faces)
+- Cube index count: **36** (6 faces x 2 triangles x 3)
+- GPU mesh uploads: **1** (confirmed via log, held steady across
+  resize/minimize/restore)
+- Cube instances drawn: **5** (plus 1 floor instance, all 6 sharing the
+  same uploaded mesh)
+- Culling: **`VK_CULL_MODE_BACK_BIT`**, front face
+  **`VK_FRONT_FACE_CLOCKWISE`** (unchanged value, now actually enabled)
+
+### What's Deferred to M8I+
+
+No glTF, no OBJ, no model loading, no `MeshAsset`, no normals, no
+lighting, no material system, no uniform-buffer architecture, no
+`SceneRenderer`, no Scene integration, no ECS, no OpenXR, no physics,
+no instancing API (`vkCmdDrawIndexed`'s instance count stays 1 — the
+"multiple instances" this milestone proves is multiple *draw calls*
+reusing one mesh, not GPU instancing), no indirect draws, no batching,
+no GPU-driven rendering. `Rendering::MeshData`/`ProceduralMesh` are
+genuinely general-purpose and expected to be reused as-is by future
+milestones; `Vulkan::VulkanMesh` stays Vulkan-private, same reasoning
+every other backend-specific addition since M8C has followed.
+
+No architectural issues were discovered in the implementation itself —
+the CPU/GPU mesh split, upload path, multi-instance draw loop, and
+culling all matched their derivations exactly, with zero validation
+warnings on the log-confirmed hardware run. The one open item is the
+visual-confirmation gap noted above, which is an environmental
+limitation of this session, not a defect found in the code.

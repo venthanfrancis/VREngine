@@ -26,7 +26,7 @@ namespace AREngine::Rendering::Vulkan
     // one push constant range (VulkanPushConstants.hpp's
     // MvpPushConstants — see docs/ARCHITECTURE.md, "Transform Upload
     // Method (M8F)"). One vertex input binding, three attributes
-    // (position, color, uv) - matches Vertex exactly
+    // (position, color, uv) - matches Rendering::MeshVertex exactly
     // (VulkanVertex.hpp/.cpp); M8C's gl_VertexIndex-generated positions
     // are gone as of M8D - see docs/ARCHITECTURE.md, "Vertex Input
     // Layout (M8D)" and "Pipeline Layout Change (M8E)". Viewport and
@@ -37,10 +37,9 @@ namespace AREngine::Rendering::Vulkan
     // Depth testing enabled as of M8F: depthTestEnable/depthWriteEnable
     // both true, depthCompareOp = LESS, no depth bounds, no stencil
     // test — see docs/ARCHITECTURE.md, "Depth Compare / Clear Values
-    // (M8F)". Back-face culling stays disabled (cullMode = NONE,
-    // unchanged since M8C) - M8F's depth proof doesn't need it, and
-    // the brief explicitly allowed leaving it off rather than risking
-    // a winding-order bug obscuring the actual depth-testing proof.
+    // (M8F)". Back-face culling enabled as of M8H (cullMode =
+    // BACK_BIT, frontFace = CLOCKWISE, unchanged) — see
+    // docs/ARCHITECTURE.md, "Back-Face Culling (M8H)".
     //
     // Independent of swapchain extent/image count, same as
     // VulkanRenderPass — does NOT need to be recreated on resize (the

@@ -16,6 +16,8 @@
 // present.
 
 #include "AREngine/Core/Math/ViewProjection.hpp"
+#include "AREngine/Rendering/MeshData.hpp"
+#include "AREngine/Rendering/ProceduralMesh.hpp"
 
 #include "vulkan/VulkanCheckerboard.hpp"
 #include "vulkan/VulkanClipSpace.hpp"
@@ -266,28 +268,30 @@ namespace
 
     void TestVertexBindingDescription()
     {
-        const VkVertexInputBindingDescription binding = Vertex::GetBindingDescription();
-        Check(binding.binding == 0, "Vertex uses binding 0");
-        Check(binding.stride == sizeof(Vertex), "Vertex binding stride equals sizeof(Vertex)");
-        Check(binding.inputRate == VK_VERTEX_INPUT_RATE_VERTEX, "Vertex binding input rate is per-vertex, not per-instance");
+        const VkVertexInputBindingDescription binding = GetVertexBindingDescription();
+        Check(binding.binding == 0, "MeshVertex uses binding 0");
+        Check(binding.stride == sizeof(AREngine::Rendering::MeshVertex), "MeshVertex binding stride equals sizeof(MeshVertex)");
+        Check(binding.inputRate == VK_VERTEX_INPUT_RATE_VERTEX, "MeshVertex binding input rate is per-vertex, not per-instance");
     }
 
     void TestVertexAttributeDescriptions()
     {
-        const auto attributes = Vertex::GetAttributeDescriptions();
-        Check(attributes.size() == 3, "Vertex has exactly 3 attributes (position, color, uv)");
+        using AREngine::Rendering::MeshVertex;
+
+        const auto attributes = GetVertexAttributeDescriptions();
+        Check(attributes.size() == 3, "MeshVertex has exactly 3 attributes (position, color, uv)");
 
         Check(attributes[0].location == 0, "Position is at shader location 0");
-        Check(attributes[0].format == VK_FORMAT_R32G32B32_SFLOAT, "Position is a 3-component float format (Vec3, as of M8F)");
-        Check(attributes[0].offset == offsetof(Vertex, position), "Position offset matches the real struct layout");
+        Check(attributes[0].format == VK_FORMAT_R32G32B32_SFLOAT, "Position is a 3-component float format (Vec3)");
+        Check(attributes[0].offset == offsetof(MeshVertex, position), "Position offset matches the real struct layout");
 
         Check(attributes[1].location == 1, "Color is at shader location 1");
         Check(attributes[1].format == VK_FORMAT_R32G32B32_SFLOAT, "Color is a 3-component float format (Vec3)");
-        Check(attributes[1].offset == offsetof(Vertex, color), "Color offset matches the real struct layout");
+        Check(attributes[1].offset == offsetof(MeshVertex, color), "Color offset matches the real struct layout");
 
         Check(attributes[2].location == 2, "UV is at shader location 2");
         Check(attributes[2].format == VK_FORMAT_R32G32_SFLOAT, "UV is a 2-component float format (Vec2)");
-        Check(attributes[2].offset == offsetof(Vertex, uv), "UV offset matches the real struct layout");
+        Check(attributes[2].offset == offsetof(MeshVertex, uv), "UV offset matches the real struct layout");
     }
 
     // --- M8E pure-logic checks ---

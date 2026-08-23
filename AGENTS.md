@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8G (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -205,13 +205,55 @@ see `docs/ARCHITECTURE.md` Section 22 for full details, including the
 exact yaw/pitch sign convention and why a diagonal floor edge seen
 during mouse-look testing is correct perspective, not a bug.
 
-There is still no mesh abstraction, no real image loading (PNG/JPEG/
-stb_image), no uniform buffers, no `SceneRenderer`/Scene integration,
-no frame limiting, no ECS/component system, and no analog/XR/controller
-input — see Sections 11–15. Everything else (`XR`, `Editor`) is still
-an M0-style stub with no functionality. Next up is M8H+ (Scene
-integration and a textured mesh). See `docs/ROADMAP.md` for the full
-plan.
+**M8H adds AREngine's first reusable mesh representation** on top of
+M8G: `Rendering::MeshData`/`MeshVertex`
+(`engine/rendering/include/AREngine/Rendering/MeshData.hpp`) — a
+backend-independent CPU geometry description (no Vulkan types, no
+Scene dependency, no `AssetId`) — plus `Rendering::CreateQuadMesh`/
+`CreateCubeMesh` (`ProceduralMesh.hpp`, unconditionally built, no
+Vulkan dependency) for in-memory test geometry. Vulkan's old private
+`Vertex` struct was retired in favor of operating directly on
+`Rendering::MeshVertex` (`VulkanVertex.hpp/.cpp` now export free
+functions, `GetVertexBindingDescription`/`GetVertexAttributeDescriptions`,
+rather than a duplicate struct) — the same three fields being needed
+twice independently was the evidence that justified merging them.
+Rendering's Vulkan backend gained `Vulkan::VulkanMesh`
+(`src/vulkan/VulkanMesh.hpp/.cpp`): owns one vertex + one index
+`VulkanBuffer` pair plus an index count, uploaded once via
+`CreateVulkanMesh` (mirroring `CreateDeviceLocalBuffer`/
+`CreateTextureFromPixels`'s existing factory shape), with `Bind()`/
+`Draw()` methods so one mesh can be bound once per frame and drawn many
+times with different push-constant Model transforms. `tests/vulkan_present_demo.cpp`
+now uploads exactly one `CreateCubeMesh()` (a 1x1x1m cube, 24 vertices/
+36 indices — 4 per face, not shared, so each face's UVs map
+independently) and draws it 6 times (a flattened floor instance plus 5
+upright cube instances) — replacing the old hard-coded shared quad.
+Back-face culling was enabled (`VK_CULL_MODE_BACK_BIT`, `frontFace`
+unchanged at `VK_FRONT_FACE_CLOCKWISE`) after deriving, not guessing,
+that every `ProceduralMesh` face's construction-time winding already
+matches that front-face convention once the existing Vulkan Y-flip is
+applied. The generic `RenderDevice` API was reviewed again with this
+milestone's real evidence and deliberately left unchanged — mesh
+upload stays a `Rendering`-private, Vulkan-only concern layered on the
+existing private buffer/upload path, not yet a `RenderDevice` concept;
+see `docs/ARCHITECTURE.md` Section 23, "Generic RenderDevice Review
+(M8H)" for the full reasoning. Zero validation errors on the final
+run, and the log confirms the mesh is uploaded exactly once and never
+rebuilt across a resize/minimize/restore cycle — see
+`docs/ARCHITECTURE.md` Section 23 for full details, including a noted
+gap: this session's manual validation could not capture on-screen
+visual confirmation (another application was in exclusive fullscreen
+on the development machine throughout), so the CPU/GPU counts and
+zero-validation-error result are log-confirmed, but a visual pass is
+still recommended before treating M8H as fully closed out.
+
+There is still no real image loading (PNG/JPEG/stb_image), no uniform
+buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
+loading, no normals/lighting, no frame limiting, no ECS/component
+system, and no analog/XR/controller input — see Sections 11–15.
+Everything else (`XR`, `Editor`) is still an M0-style stub with no
+functionality. Next up is M8I+ (Scene integration). See
+`docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -220,11 +262,12 @@ plan.
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
 3. **Vulkan bring-up + presentation + first triangle + vertex/index
-   buffers + textures + genuine 3D/depth + a movable camera only
-   (M8A–M8G)**: no mesh abstraction, no real image loading, no uniform
-   buffers, no `SceneRenderer`/Scene integration yet — see
-   `docs/ROADMAP.md`'s M8H+ row for what's still pending within M8.
-   **No OpenXR code** before milestone M9.
+   buffers + textures + genuine 3D/depth + a movable camera + a
+   reusable mesh representation only (M8A–M8H)**: no real image
+   loading, no uniform buffers, no `SceneRenderer`/Scene integration,
+   no `MeshAsset`/model loading yet — see `docs/ROADMAP.md`'s M8I+ row
+   for what's still pending within M8. **No OpenXR code** before
+   milestone M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

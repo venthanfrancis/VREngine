@@ -64,6 +64,17 @@ target_link_libraries(arengine_input_tests PRIVATE AREngine::Core AREngine::Plat
 target_compile_features(arengine_input_tests PRIVATE cxx_std_20)
 add_test(NAME InputTests COMMAND arengine_input_tests)
 
+# Pure-logic tests for AREngine::Rendering's generic mesh data
+# (MeshData.hpp/ProceduralMesh.hpp) — M8H. Built unconditionally, not
+# gated behind ARENGINE_ENABLE_VULKAN: none of this depends on Vulkan.
+# See docs/ARCHITECTURE.md, "CPU Mesh Data Placement (M8H)".
+add_executable(arengine_mesh_tests
+    mesh_tests.cpp
+)
+target_link_libraries(arengine_mesh_tests PRIVATE AREngine::Core AREngine::Rendering)
+target_compile_features(arengine_mesh_tests PRIVATE cxx_std_20)
+add_test(NAME MeshTests COMMAND arengine_mesh_tests)
+
 # Pure-logic tests for ARDemo::DemoCameraController (DemoCameraController.hpp)
 # — M8G's manual-Vulkan-demo camera controller. Built unconditionally,
 # not gated behind ARENGINE_ENABLE_VULKAN: the controller itself has no

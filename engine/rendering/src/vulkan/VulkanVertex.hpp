@@ -2,8 +2,7 @@
 
 // Private Vulkan bring-up implementation — see VulkanVersion.hpp.
 
-#include "AREngine/Core/Math/Vec2.hpp"
-#include "AREngine/Core/Math/Vec3.hpp"
+#include "AREngine/Rendering/MeshData.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -11,30 +10,30 @@
 
 namespace AREngine::Rendering::Vulkan
 {
-    // A minimal Vulkan-demo vertex: a real 3D position, an RGB color,
-    // and a 2D texture coordinate. Deliberately private to Rendering's
-    // Vulkan backend and its manual demo, not a generic Mesh/
-    // VertexFormat abstraction — one vertex shape with no evidence of
-    // what a second one would need is not enough to design that
-    // abstraction from. See docs/ARCHITECTURE.md, "Vertex Structure
-    // (M8D)", "Vertex Format (M8E)", and "Vec3 Vertex Layout (M8F)"
-    // (position changed from Vec2 to Vec3 in M8F for genuine 3D).
-    struct Vertex
-    {
-        AREngine::Core::Math::Vec3 position;
-        AREngine::Core::Math::Vec3 color;
-        AREngine::Core::Math::Vec2 uv;
+    // Through M8G this file defined its own private `Vertex` struct
+    // (position/color/uv) — a near-duplicate of what M8H's
+    // Rendering::MeshVertex now is. As of M8H, this IS that evidence:
+    // the exact same three fields were independently needed twice (the
+    // old hard-coded demo geometry, and now generic mesh data), which
+    // is what justifies operating directly on the generic type here
+    // instead of converting a std::vector<MeshVertex> into a
+    // Vulkan-private duplicate on every mesh upload. See
+    // docs/ARCHITECTURE.md, "Vertex Format Review (M8H)".
+    //
+    // No VkFormat or byte offset is exposed on any public Rendering
+    // header — MeshVertex itself (Rendering/MeshData.hpp) stays plain
+    // engine data; only these two Vulkan-private functions know how to
+    // turn it into Vulkan's vertex-input description structs.
+    //
+    // One binding (binding 0), one vertex per draw call - not per
+    // instance (no instancing yet). See docs/ARCHITECTURE.md,
+    // "Vertex Input Layout (M8D)".
+    [[nodiscard]] VkVertexInputBindingDescription GetVertexBindingDescription();
 
-        // One binding (binding 0), one vertex per draw call - not per
-        // instance (no instancing yet). See docs/ARCHITECTURE.md,
-        // "Vertex Input Layout (M8D)".
-        [[nodiscard]] static VkVertexInputBindingDescription GetBindingDescription();
-
-        // location 0 = position (vec3 -> VK_FORMAT_R32G32B32_SFLOAT,
-        // as of M8F), location 1 = color (vec3 -> VK_FORMAT_R32G32B32_SFLOAT),
-        // location 2 = uv (vec2 -> VK_FORMAT_R32G32_SFLOAT) - matches
-        // triangle.vert's `layout(location = 0/1/2) in ...`
-        // declarations. Offsets computed via offsetof, not hand-counted.
-        [[nodiscard]] static std::array<VkVertexInputAttributeDescription, 3> GetAttributeDescriptions();
-    };
+    // location 0 = position (vec3 -> VK_FORMAT_R32G32B32_SFLOAT),
+    // location 1 = color (vec3 -> VK_FORMAT_R32G32B32_SFLOAT), location
+    // 2 = uv (vec2 -> VK_FORMAT_R32G32_SFLOAT) - matches triangle.vert's
+    // `layout(location = 0/1/2) in ...` declarations. Offsets computed
+    // via offsetof, not hand-counted.
+    [[nodiscard]] std::array<VkVertexInputAttributeDescription, 3> GetVertexAttributeDescriptions();
 }

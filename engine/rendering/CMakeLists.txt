@@ -5,6 +5,7 @@ endif()
 add_library(arengine_rendering STATIC
     src/Rendering.cpp
     src/NullRenderDevice.cpp
+    src/ProceduralMesh.cpp
 )
 add_library(AREngine::Rendering ALIAS arengine_rendering)
 
@@ -17,6 +18,8 @@ target_sources(arengine_rendering
         include/AREngine/Rendering/DrawCommand.hpp
         include/AREngine/Rendering/RenderDevice.hpp
         include/AREngine/Rendering/NullRenderDevice.hpp
+        include/AREngine/Rendering/MeshData.hpp
+        include/AREngine/Rendering/ProceduralMesh.hpp
 )
 
 if(ARENGINE_ENABLE_VULKAN)
@@ -40,6 +43,7 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanMemory.cpp
             src/vulkan/VulkanBuffer.cpp
             src/vulkan/VulkanOneTimeCommands.cpp
+            src/vulkan/VulkanMesh.cpp
             src/vulkan/VulkanCheckerboard.cpp
             src/vulkan/VulkanImageLayoutTransition.cpp
             src/vulkan/VulkanImage.cpp
@@ -66,6 +70,7 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanMemory.hpp
             src/vulkan/VulkanBuffer.hpp
             src/vulkan/VulkanOneTimeCommands.hpp
+            src/vulkan/VulkanMesh.hpp
             src/vulkan/VulkanCheckerboard.hpp
             src/vulkan/VulkanImageLayoutTransition.hpp
             src/vulkan/VulkanImage.hpp
