@@ -24,5 +24,28 @@ namespace AREngine::Scene
         {
             return Core::Math::Mat4::TRS(position, rotation, scale);
         }
+
+        // This transform's local axes, expressed in world space — i.e.
+        // `rotation` applied to the corresponding world basis vector.
+        // Added in M8G for the free-fly camera controller (forward/
+        // right define movement direction; a camera's own GetViewMatrix
+        // uses GetForward too) but meaningful for any Transform, not
+        // camera-specific — see docs/ARCHITECTURE.md, "Camera Vs
+        // Transform Responsibilities (M8G)". Ignores `scale` — a
+        // direction has no length to scale.
+        [[nodiscard]] Core::Math::Vec3 GetForward() const
+        {
+            return Core::Math::Rotate(rotation, Core::Math::kWorldForward);
+        }
+
+        [[nodiscard]] Core::Math::Vec3 GetRight() const
+        {
+            return Core::Math::Rotate(rotation, Core::Math::kWorldRight);
+        }
+
+        [[nodiscard]] Core::Math::Vec3 GetUp() const
+        {
+            return Core::Math::Rotate(rotation, Core::Math::kWorldUp);
+        }
     };
 }

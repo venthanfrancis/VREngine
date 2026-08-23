@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8F (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth) complete.** `Core`
+**M0 through M7 complete; M8A through M8G (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -177,13 +177,41 @@ output, including the M8F depth-testing proof — are unchanged; only the
 internal organization moved. See `docs/ARCHITECTURE.md` Section 21,
 "Core/Vulkan Clip-Space Split", for the full reasoning.
 
+**M8G adds AREngine's first `Camera` abstraction** on top of M8F:
+`Scene::Camera` (`engine/scene/include/AREngine/Scene/Camera.hpp`) —
+FOV/near/far/aspect only, no position/orientation of its own (reuses
+`Scene::Transform` for that), no Vulkan types anywhere, and no
+`VulkanCamera`. `GetViewMatrix(transform)` reuses M8F's `LookAtRH` via
+a synthetic look-at target; `GetProjectionMatrix()` returns the
+*unflipped* `PerspectiveRH_ZO`, with `ApplyVulkanYFlip` applied only in
+the demo layer. `Core::Math::Quaternion` gained `operator*` (Hamilton
+product) and `Rotate(Quaternion, Vec3)` — both genuinely needed now,
+previously deferred since M5. `Transform` gained
+`GetForward()`/`GetRight()`/`GetUp()`. A small, demo-private
+`ARDemo::DemoCameraController` (`tests/DemoCameraController.hpp`, zero
+Vulkan dependency) drives WASD movement (following the camera's full
+current orientation, not always world `-Z`), Space/Ctrl world-space up/
+down, and click-drag (right-mouse-held) mouse look — chosen over cursor
+capture since `Platform` has no raw-input support yet, and expanding it
+wasn't judged necessary. Movement is delta-time-based
+(`Platform::SteadyClock`, the smallest temporary integration since the
+demo isn't built on `Runtime`). Input reuses `InputSystem` exactly as
+`Runtime.cpp` does — no direct Win32 queries, and M7's focus-loss
+key-clear behavior was explicitly re-verified to still prevent stuck
+movement keys. `tests/vulkan_present_demo.cpp` now renders a small
+hard-coded scene (a floor + four upright quads) navigable in real time,
+still depth-tested per M8F. Zero validation errors on the final run —
+see `docs/ARCHITECTURE.md` Section 22 for full details, including the
+exact yaw/pitch sign convention and why a diagonal floor edge seen
+during mouse-look testing is correct perspective, not a bug.
+
 There is still no mesh abstraction, no real image loading (PNG/JPEG/
-stb_image), no uniform buffers, no movable camera, no frame limiting,
-no ECS/component system, and no analog/XR/controller input — see
-Sections 11–15. Everything else (`XR`, `Editor`) is still an M0-style
-stub with no functionality. Next up is M8G+ (a proper camera
-abstraction, then Scene integration and a textured mesh). See
-`docs/ROADMAP.md` for the full plan.
+stb_image), no uniform buffers, no `SceneRenderer`/Scene integration,
+no frame limiting, no ECS/component system, and no analog/XR/controller
+input — see Sections 11–15. Everything else (`XR`, `Editor`) is still
+an M0-style stub with no functionality. Next up is M8H+ (Scene
+integration and a textured mesh). See `docs/ROADMAP.md` for the full
+plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -192,10 +220,11 @@ abstraction, then Scene integration and a textured mesh). See
 2. **No third-party dependencies** until a milestone explicitly calls for
    one.
 3. **Vulkan bring-up + presentation + first triangle + vertex/index
-   buffers + textures + genuine 3D/depth only (M8A–M8F)**: no mesh
-   abstraction, no real image loading, no uniform buffers, no movable
-   camera yet — see `docs/ROADMAP.md`'s M8G+ row for what's still
-   pending within M8. **No OpenXR code** before milestone M9.
+   buffers + textures + genuine 3D/depth + a movable camera only
+   (M8A–M8G)**: no mesh abstraction, no real image loading, no uniform
+   buffers, no `SceneRenderer`/Scene integration yet — see
+   `docs/ROADMAP.md`'s M8H+ row for what's still pending within M8.
+   **No OpenXR code** before milestone M9.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

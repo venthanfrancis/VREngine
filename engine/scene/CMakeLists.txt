@@ -8,6 +8,7 @@ target_sources(arengine_scene
         include/AREngine/Scene/Scene.hpp
         include/AREngine/Scene/EntityId.hpp
         include/AREngine/Scene/Transform.hpp
+        include/AREngine/Scene/Camera.hpp
 )
 
 target_include_directories(arengine_scene

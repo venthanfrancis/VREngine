@@ -1,9 +1,11 @@
-// M5 automated tests for AREngine::Scene: entity identity, Transform,
-// parent/child hierarchy, and world-matrix composition. No human
+// Automated tests for AREngine::Scene: entity identity, Transform,
+// parent/child hierarchy, and world-matrix composition (M5), plus
+// Transform's forward/right/up accessors and Camera (M8G). No human
 // interaction, no window, no Rendering involved at all — proving Scene
 // and Rendering stay fully decoupled.
 
 #include "AREngine/Core/Math/MathUtil.hpp"
+#include "AREngine/Scene/Camera.hpp"
 #include "AREngine/Scene/Scene.hpp"
 
 #include <cstdio>
@@ -98,6 +100,70 @@ namespace
 
         const Mat4 expected = Mat4::TRS(transform.position, transform.rotation, transform.scale);
         Check(transform.ToMatrix() == expected, "Transform::ToMatrix delegates to Mat4::TRS with its own fields");
+    }
+
+    void TestTransformDefaultForwardRightUp()
+    {
+        const Transform transform; // identity rotation
+        Check(transform.GetForward() == kWorldForward, "Default Transform's forward is world Forward (-Z)");
+        Check(transform.GetRight() == kWorldRight, "Default Transform's right is world Right (+X)");
+        Check(transform.GetUp() == kWorldUp, "Default Transform's up is world Up (+Y)");
+    }
+
+    void TestTransformForwardAfterYaw()
+    {
+        // Same fact core_tests.cpp proves at the Mat4 and Quaternion
+        // levels: rotating Right 90deg around Up lands on Forward.
+        // Proving it once more through Transform::GetForward (starting
+        // from Right, after a 90deg yaw) confirms Transform's own
+        // accessor agrees, not just Quaternion::Rotate in isolation.
+        Transform transform;
+        transform.rotation = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f);
+
+        const Vec3 forward = transform.GetForward();
+        // At yaw=90deg, GetForward() rotates world Forward (-Z, not
+        // Right) by 90deg around Up. Rotating -Z by +90deg around +Y
+        // lands on -X (by the same cyclic rotation pattern
+        // Right(+X)->Forward(-Z)->-Right(-X)->-Forward(+Z)->Right(+X)).
+        CheckNearlyEqual(forward.x, -1.0f, "Transform::GetForward after a 90deg yaw: x");
+        CheckNearlyEqual(forward.y, 0.0f, "Transform::GetForward after a 90deg yaw: y");
+        CheckNearlyEqual(forward.z, 0.0f, "Transform::GetForward after a 90deg yaw: z");
+    }
+
+    void TestCameraDefaults()
+    {
+        const Camera camera;
+        Check(camera.nearZ > 0.0f && camera.nearZ < camera.farZ, "Default Camera has a sane near < far range");
+        Check(camera.verticalFovRadians > 0.0f && camera.verticalFovRadians < std::numbers::pi_v<float>,
+              "Default Camera's vertical FOV is a plausible radians value (0 < fov < pi)");
+        CheckNearlyEqual(camera.GetAspectRatio(), 16.0f / 9.0f, "Default Camera aspect ratio is a sane placeholder (16:9)");
+    }
+
+    void TestCameraSetAspectRatio()
+    {
+        Camera camera;
+        camera.SetAspectRatio(4.0f / 3.0f);
+        CheckNearlyEqual(camera.GetAspectRatio(), 4.0f / 3.0f, "SetAspectRatio updates GetAspectRatio");
+
+        const Mat4 proj = camera.GetProjectionMatrix();
+        const float expectedXScale = proj.At(1, 1) / (4.0f / 3.0f); // focalLength/aspect == proj.At(1,1)/aspect
+        CheckNearlyEqual(proj.At(0, 0), expectedXScale, "GetProjectionMatrix's X scale reflects the current aspect ratio");
+    }
+
+    void TestCameraViewMatrixFromTransform()
+    {
+        Camera camera;
+        Transform transform;
+        transform.position = Vec3(0.0f, 0.0f, 3.0f); // identity rotation -> looking down -Z, i.e. toward the origin
+
+        const Mat4 view = camera.GetViewMatrix(transform);
+        const Vec3 originInView = TransformPoint(view, Vec3(0.0f, 0.0f, 0.0f));
+        // Same fact M8F's TestLookAtRH already established directly for
+        // LookAtRH — this confirms Camera::GetViewMatrix, built purely
+        // from a Transform, reproduces it.
+        CheckNearlyEqual(originInView.x, 0.0f, "Camera::GetViewMatrix: world origin.x in view space");
+        CheckNearlyEqual(originInView.y, 0.0f, "Camera::GetViewMatrix: world origin.y in view space");
+        CheckNearlyEqual(originInView.z, -3.0f, "Camera::GetViewMatrix: world origin is 3m in front (forward = -Z)");
     }
 
     void TestRootWorldMatrixEqualsLocal()
@@ -309,6 +375,11 @@ int main()
     TestDefaultTransform();
     TestTransformStorage();
     TestTransformToMatrixMatchesMat4TRS();
+    TestTransformDefaultForwardRightUp();
+    TestTransformForwardAfterYaw();
+    TestCameraDefaults();
+    TestCameraSetAspectRatio();
+    TestCameraViewMatrixFromTransform();
     TestRootWorldMatrixEqualsLocal();
     TestParentChildComposition();
     TestThreeLevelHierarchy();
@@ -322,7 +393,7 @@ int main()
 
     if (g_failureCount == 0)
     {
-        std::printf("All Scene M5 checks passed\n");
+        std::printf("All Scene checks passed\n");
         return 0;
     }
 

@@ -2678,3 +2678,367 @@ depth image creation, the render pass's depth attachment, depth-tested
 rendering, and push-constant transform upload all worked correctly on
 the first real hardware run, with zero validation warnings to
 investigate.
+
+## 22. M8G Implementation Notes
+
+M8G introduces AREngine's first real `Camera` abstraction and uses it,
+via a small demo-private controller, to move through and look around
+the M8F 3D scene with WASD + click-drag mouse look — no `SceneRenderer`,
+no general mesh renderer, no model loading, and no OpenXR yet.
+
+### Camera Ownership and Module Placement (M8G)
+
+`Scene::Camera` (`engine/scene/include/AREngine/Scene/Camera.hpp`) is a
+plain, backend-independent struct: `verticalFovRadians`, `nearZ`,
+`farZ`, and a private `m_aspectRatio` behind `SetAspectRatio`/
+`GetAspectRatio`. It contains **no position or orientation of its
+own** — those live on a separate `Scene::Transform`, passed into
+`GetViewMatrix(transform)` as a parameter — and **no Vulkan types
+anywhere** (no `VkDevice`, `VkBuffer`, `VkDescriptorSet`). It lives in
+`Scene`, not `Core`: `Core` stays limited to math primitives/helpers
+(`Mat4`, `Quaternion`, `LookAtRH`, `PerspectiveRH_ZO`), and a `Camera`
+is a scene-level *concept* built out of those primitives, not a
+primitive itself — the same reasoning that already keeps `Transform`
+out of `Core`. There is no `VulkanCamera`; the Vulkan demo owns a plain
+`Scene::Camera` value directly.
+
+### Camera vs Transform (M8G)
+
+In simple English: **`Transform` is where the camera is and which way
+it's facing; `Camera` is what kind of lens it has.** Moving or rotating
+the camera means changing a `Transform` (`position`, `rotation`) —
+`Camera` itself never moves. `Camera` only holds the handful of
+numbers that describe the "lens": how wide a field of view it sees
+(`verticalFovRadians`), how close/far it can see (`nearZ`/`farZ`), and
+the aspect ratio of the screen it's rendering to. This split exists
+because a `Transform` is a generic, reusable "where and which way"
+building block already used for ordinary scene objects (the floor and
+quads in this same demo use one) — a `Camera` reuses it instead of
+duplicating position/orientation fields, so there is exactly one way
+to represent "where something is and which way it's facing" in the
+engine.
+
+### View Matrix Generation (M8G)
+
+`Camera::GetViewMatrix(transform)` does not implement its own
+quaternion-to-view-matrix formula. It instead computes a synthetic
+look-at target — `transform.position + transform.GetForward()` — and
+calls the existing `Core::Math::LookAtRH(eye, target, up)` from M8F,
+with `up = Core::Math::kWorldUp`. `Transform::GetForward()` (new this
+milestone, alongside `GetRight()`/`GetUp()`, in
+`engine/scene/include/AREngine/Scene/Transform.hpp`) is
+`Core::Math::Rotate(rotation, kWorldForward)` — the world-forward axis
+rotated by the transform's orientation. In simple English: **the view
+matrix answers "what does the world look like from here, facing this
+way?"** by re-expressing every point in the scene relative to the
+camera's position and facing direction, so that after the view
+transform, the camera is effectively sitting at the origin looking down
+its own forward axis — the same job `LookAtRH` already did for M8F's
+fixed camera, just fed a target computed from a rotating `Transform`
+instead of a hard-coded point.
+
+### Projection Ownership (M8G)
+
+`Camera::GetProjectionMatrix()` returns
+`Core::Math::PerspectiveRH_ZO(verticalFovRadians, m_aspectRatio, nearZ,
+farZ)` **unflipped** — the same generic, backend-neutral projection
+helper from the M8F Core/Vulkan clip-space split (see section 21
+above), not a Vulkan-named function, and `Camera` does not know Vulkan
+exists. The Vulkan-specific Y flip is applied only in the demo layer:
+`ApplyVulkanYFlip(camera.GetProjectionMatrix())`, exactly mirroring how
+M8F already called it on `PerspectiveRH_ZO`'s result directly. This
+keeps the same boundary the M8F cleanup established: `Camera` (like
+`Core`) stays graphics-API-agnostic; only the Vulkan demo composes it
+with a Vulkan-specific correction.
+
+### Resize Behavior (M8G)
+
+`SetAspectRatio` is called once per frame in the demo's render loop,
+from the swapchain's current extent (`aspect = extent.width /
+extent.height`) — the same "recomputed every frame from current state,
+nothing to remember to update after a resize" pattern M8F already used
+for projection. `GetProjectionMatrix()` then already reflects the
+correct aspect ratio on the very next frame after any resize, with no
+separate resize-handling code path.
+
+### Quaternion Composition and Rotation (M8G)
+
+Two small, genuinely-needed additions to
+`engine/core/include/AREngine/Core/Math/Quaternion.hpp`, both
+`constexpr`, both previously explicitly deferred since M5 pending an
+actual need:
+
+- `operator*(Quaternion, Quaternion)` — Hamilton product, `a * b`
+  meaning "`b` applied first, then `a`", matching `Mat4`'s existing
+  TRS composition convention.
+- `Rotate(Quaternion, Vec3)` — rotates a vector by a quaternion, using
+  the optimized `q * (0, v) * q⁻¹` expansion
+  (`t = Cross(qv, v) * 2; return v + t*q.w + Cross(qv, t);`) rather
+  than a naive full quaternion-quaternion multiply.
+
+`Transform::GetForward/GetRight/GetUp` and the demo controller's
+yaw/pitch-to-orientation composition (below) are what actually needed
+these; nothing was added speculatively.
+
+### Movement Controls and Speed (M8G)
+
+- **W/A/S/D** — move along the camera's **current full orientation**
+  (including pitch), not always world `-Z`: pressing W moves toward
+  wherever the camera is currently looking, even after turning or
+  looking up/down. This is the specific, explicitly-tested behavior
+  the milestone called out (see `TestComputeNewPositionFollowsRotatedOrientation`,
+  `tests/demo_camera_controller_tests.cpp`).
+- **Space / Left Ctrl** — move along **world** `+Y`/`-Y` regardless of
+  the camera's current pitch (verified by
+  `TestComputeNewPositionUpUsesWorldUpRegardlessOfPitch`) — the
+  standard "editor fly camera" convention, distinct from an
+  FPS-style character controller where up/down might instead be
+  jump/crouch.
+- Diagonal input (e.g. W+D held together) is normalized so combined
+  movement speed never exceeds `moveSpeedMetersPerSecond`
+  (`TestComputeNewPositionDiagonalIsNormalized`).
+- **`moveSpeedMetersPerSecond = 4.0`** — movement is
+  `position += direction * speed * deltaTimeSeconds`, so speed is
+  frame-rate independent by construction (`TestComputeNewPositionNoInputIsStationary`
+  confirms zero movement when no key is held, even at `dt = 1s`).
+
+### Mouse Look: Click-Drag, Not Cursor Capture (M8G)
+
+Look is driven only while the **right mouse button is held** (queried
+via `InputSystem::IsMouseButtonDown(MouseButton::Right)`), using
+`InputSystem::GetMouseDelta()` while held. AREngine's `Platform` layer
+does not currently support raw input or cursor capture/confinement
+cleanly, and the milestone explicitly permitted falling back to
+click-drag look rather than expanding `Platform` into raw-input
+territory for this — that expansion was explicitly out of scope unless
+genuinely necessary, and click-drag look is sufficient to prove camera
+movement/look-around works. **`lookSensitivityRadiansPerPixel =
+0.0025`.**
+
+**Sign convention** (`DemoCameraController::ApplyLook`):
+`yawRadians -= mouseDeltaX * sensitivity;` and `pitchRadians -=
+mouseDeltaY * sensitivity;`. Both are subtractions, not additions —
+derived from the already-proven fact (`core_tests.cpp`) that rotating
+world `Right` (`+X`) by `+90°` around `Up` lands on `Forward` (`-Z`).
+Making mouse-right feel like "the camera turns right" therefore
+requires *decreasing* yaw as `mouseDeltaX` increases; since
+`Platform`'s mouse-delta convention is `+Y = down`, making mouse-down
+feel like "look down" likewise requires *decreasing* pitch as
+`mouseDeltaY` increases. Verified both by reasoning from first
+principles and empirically during manual GPU validation (dragging the
+mouse right visibly turned the view right; dragging down visibly
+looked down).
+
+**Pitch is clamped to ±89°** (`kPitchLimitRadians ≈ 1.55334303f`,
+just under `π/2`) to avoid the camera flipping past straight up/down —
+verified by `TestApplyLookClampsPitch` with deliberately extreme
+(1,000,000-unit) deltas, checking the result lands exactly at the
+limit, not beyond it.
+
+### Quaternion Storage / Yaw-Pitch Composition (M8G)
+
+`Quaternion` remains the engine's one canonical rotation
+representation — `Transform::rotation` is a `Quaternion`, never a
+yaw/pitch pair. `yawRadians`/`pitchRadians` exist **only** as private
+construction inputs inside the demo-private `DemoCameraController`,
+converted to a `Quaternion` on demand via
+`GetOrientation()`:
+`Quaternion::FromAxisAngle(kWorldUp, yawRadians) *
+Quaternion::FromAxisAngle(kWorldRight, pitchRadians)` — pitch applied
+first (locally), yaw applied last (in world space), the standard
+FPS-camera composition. This composition cannot introduce roll by
+construction, which mattered when diagnosing an otherwise-unexpected
+diagonal line during manual testing (see "Validation Results" below).
+
+### Delta Time (M8G)
+
+The Vulkan demo is not built on `Runtime`/`Frame::FrameDriver` (it's a
+standalone manual-test executable, like the rest of the M8B+ demos),
+so per the milestone's own guidance to use "the smallest temporary
+integration" rather than restructuring `Runtime` just to satisfy the
+demo, `Platform::SteadyClock` is used directly:
+`clock.Tick()` once per loop iteration, and the resulting
+`deltaTimeSeconds` is passed straight into
+`DemoCameraController::Update`. No new abstraction was introduced.
+
+### Input Integration (M8G)
+
+The demo reuses `InputSystem` exactly the way `Runtime.cpp` already
+does — no direct Win32 queries, no `GetAsyncKeyState`, no duplicate
+Win32 input system in the demo:
+
+- `Input::InputSystem inputSystem;` is declared **first** in `main()`,
+  before `Window`, so it is destroyed **last** — the same ordering M7
+  established after discovering a late `WM_KILLFOCUS` during
+  `~WindowsWindow` could otherwise call `OnEvent` on an
+  already-destroyed `InputSystem`.
+- Every window event is forwarded unconditionally to
+  `inputSystem.OnEvent(event)` in the event callback, including
+  focus-loss events — `InputSystem` already clears all held keys on
+  focus loss (M7 behavior, untouched by M8G).
+- `inputSystem.BeginFrame()` is called before `PollEvents()` every
+  loop iteration, matching `Runtime.cpp`'s ordering.
+
+No reusable event-routing helper was extracted from `Runtime` — the
+few lines involved were small enough that copying the established
+pattern directly was the smaller, clearer change; extracting a shared
+helper was judged not genuinely needed for one demo call site.
+
+### Demo Scene (M8G)
+
+A small, hard-coded `SceneObject{ Scene::Transform transform; Vec4
+tint; }` list (`BuildDemoScene()`, `tests/vulkan_present_demo.cpp`),
+all sharing the same quad vertex/index buffer and texture from M8D/M8E
+— **temporary test content only**, not `MeshAsset`/model loading or a
+general world/level system:
+
+- **Floor**: one large quad, laid flat (rotated to lie in the
+  `X`/`Z` plane), tinted white.
+- **Four upright quads** at different distances and lateral offsets
+  from the camera's start position, each with a distinct tint, so
+  movement and look-around visibly change occlusion/relative size/
+  perspective between them as the camera passes through the scene.
+
+Camera starts at `position = (0, 1, 5)`, identity orientation (looking
+down world `-Z`, toward the quads), `nearZ = 0.1`, `farZ = 100.0`,
+default `verticalFovRadians` (60°, unchanged from `Camera`'s default).
+
+### Push-Constant Review (M8G)
+
+Still `MvpPushConstants { Mat4 mvp; Vec4 tint; }`, 80 bytes total,
+computed per-object on the CPU (`viewProjection *
+object.transform.ToMatrix()`) and pushed immediately before each
+object's draw call — unchanged in shape from M8F, just now looped over
+five objects instead of two, and fed a per-frame `viewProjection` that
+changes as the camera moves instead of a fixed one. Still safely under
+the 128-byte minimum every Vulkan implementation guarantees. Per the
+milestone's requirement to review against the device's actual limit
+(not just the guaranteed minimum), an `AR_ASSERT_MSG` checks
+`physicalDevice.properties.limits.maxPushConstantsSize >=
+sizeof(MvpPushConstants)` at startup — on the development machine's
+GPU this limit is far larger than 80 bytes, so the assert is
+effectively a documented safety margin, not a live constraint at this
+object count. No uniform-buffer migration was made — five fixed
+objects and one camera is still not enough evidence to design that,
+same reasoning M8F already applied.
+
+### Temporary Demo-Controller Decisions (M8G)
+
+`ARDemo::DemoCameraController`
+(`tests/DemoCameraController.hpp`, demo-private, zero Vulkan
+dependency, only `Core`/`Platform`/`Scene`/`Input`) intentionally
+stays **separate from `Scene::Camera`** rather than folding its
+yaw/pitch/WASD logic into the permanent `Camera` class — `Camera` is
+meant to stay small and reusable as pure lens data
+(`GetViewMatrix()`, `GetProjectionMatrix()`, `SetAspectRatio(...)`,
+explicitly no more than that this milestone: no frustum culling, no
+orthographic mode, no jitter, no stereo views, no camera stack, no
+post-processing settings), while `DemoCameraController` mixes in
+`Input` *policy* (which keys mean what, mouse sensitivity, movement
+convention) that is specific to this one manual-test demo and has no
+reason to constrain how a future gameplay/editor camera controller —
+or an XR head-pose-driven "camera" — might want to move instead. Its
+pure-logic pieces (`ApplyLook`, `GetOrientation`, `ComputeNewPosition`)
+deliberately take no `InputSystem` parameter, so they're directly
+unit-testable without a real window or GPU; only `Update` touches
+`InputSystem`, translating raw input into calls to the pure methods.
+
+### Future XR Head Pose vs. Desktop Camera (M8G)
+
+Documented distinction, not implemented this milestone: today, the
+desktop `Camera`'s paired `Transform` **is** the viewer's pose — moved
+by `DemoCameraController` reading keyboard/mouse. A future OpenXR
+integration will **not** work this way: head pose will come from
+`XRFrameDriver`/OpenXR's own per-frame tracked pose, not from any
+keyboard/mouse controller pretending to be a headset. `Camera` was
+deliberately kept free of any assumption that its `Transform` is
+always driven by `DemoCameraController` specifically — it only ever
+consumes whatever `Transform` it's given. The eventual render path
+should be capable of receiving view matrices **from a `FrameDriver`**
+(desktop or XR) rather than *always* deriving them from a scene
+`Camera` object; this routing is not built yet (no `SceneRenderer`
+exists to route into), and `Camera`/`DemoCameraController` were not
+contorted to simulate it prematurely.
+
+### Validation Results (M8G)
+
+`ARENGINE_ENABLE_VULKAN=ON` (default): full `/W4 /WX` clean build,
+`ctest` 10/10 (new `DemoCameraControllerTests` — 8 pure-logic checks
+covering default orientation, yaw/pitch sign convention, pitch
+clamping, stationary-when-idle, forward movement at default and
+rotated orientation, diagonal-movement normalization, and
+pitch-independent world-up movement; `CoreTests` gained
+`TestQuaternionMultiplication`/`TestQuaternionRotate`; `SceneTests`
+gained `TestTransformDefaultForwardRightUp`,
+`TestTransformForwardAfterYaw`, `TestCameraDefaults`,
+`TestCameraSetAspectRatio`, `TestCameraViewMatrixFromTransform`).
+`ARENGINE_ENABLE_VULKAN=OFF`: full build succeeds, no Vulkan/shader
+targets present, `ctest` **9/9** (no `VulkanTests`;
+`DemoCameraControllerTests` is registered unconditionally in
+`tests/CMakeLists.txt`, not gated behind `ARENGINE_ENABLE_VULKAN`,
+since `DemoCameraController` itself has no Vulkan dependency — this is
+why the no-Vulkan total grew from M8F's 8/8 to 9/9 rather than staying
+the same).
+
+`arengine_vulkan_present_demo` (title: "AREngine M8G Vulkan Camera
+Demo") run against real hardware (NVIDIA GeForce RTX 3060 Laptop
+GPU): window opens showing the floor and four quads with correct
+perspective/depth from the starting position; holding **W** moves the
+camera forward into the scene (objects grow larger/closer, a farther
+quad becomes visible) with movement visibly proportional to elapsed
+time, not frame count; holding the **right mouse button** and dragging
+correctly turns the view (drag right → view turns right; drag down →
+view looks down) with pitch never overshooting past-vertical; window
+resize, minimize, and restore all correctly recompute the aspect ratio
+and preserve the camera's current position/orientation, with the
+depth-tested scene continuing to render correctly at the new size (no
+distortion, no stale swapchain state). **Zero validation errors or
+warnings** throughout every test — mouse look, movement, resize, and
+minimize/restore all validated clean on the first real-hardware run.
+
+**Focus-loss stuck-key scenario explicitly tested and confirmed
+correct**: W held down, focus deliberately stolen to another window
+mid-press (triggering `WM_KILLFOCUS` while W was still logically
+"held"), W then released while the demo window did not have focus,
+focus returned to the demo, and two screenshots taken one second apart
+after regaining focus were pixel-identical — proving the camera did
+not drift forward either while unfocused or after regaining focus,
+i.e. M7's existing focus-loss key-clear behavior continues to prevent
+a stuck-movement-key bug with the new camera controller layered on
+top, with no changes needed to `InputSystem` itself.
+
+**One non-bug observation worth recording**: during the mouse-look
+test, after a combined yaw+pitch drag, the floor's far edge appeared as
+a diagonal line on screen rather than staying horizontal. Reasoned
+through without any code change: yaw-then-pitch quaternion composition
+cannot introduce roll by construction (verified above), and the floor
+is a *finite* rectangular quad, not an infinite ground plane — viewing
+a finite rectangle's straight edge at an oblique combined yaw+pitch
+angle correctly produces a diagonal line in screen space under
+perspective projection. This is expected, correct projected geometry,
+not a rendering or rotation bug.
+
+- Movement speed: **4.0 m/s** (`moveSpeedMetersPerSecond`)
+- Look sensitivity: **0.0025 radians/pixel** (`lookSensitivityRadiansPerPixel`)
+- Pitch clamp: **±89°** (`kPitchLimitRadians ≈ 1.55334303` rad)
+- Push-constant size: **80 bytes** (`MvpPushConstants`: `Mat4` + `Vec4`),
+  asserted against the device's actual `maxPushConstantsSize`, not just
+  the 128-byte guaranteed minimum
+
+### What's Deferred to M8H+
+
+No `SceneRenderer`, no general mesh renderer, no model loading, no
+glTF, no lighting, no PBR, no shadow maps, no physics, no collision, no
+OpenXR, no cursor raw-input/capture system, no camera component
+registry, no ECS, no frustum culling, no uniform-buffer architecture.
+`Scene::Camera` and `Transform::GetForward/GetRight/GetUp` are
+genuinely general-purpose and expected to be reused as-is by future
+milestones; `DemoCameraController` stays demo-private, same reasoning
+M8B–M8F already applied to every other manual-test-only piece of this
+demo.
+
+No architectural issues were discovered — camera math, view/projection
+composition, input integration, delta-time-based movement, resize
+handling, and the focus-loss key-clear interaction with the new
+controller all worked correctly on the first real-hardware run, with
+zero validation warnings to investigate.

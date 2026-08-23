@@ -101,6 +101,41 @@ namespace
         CheckNearlyEqual(quarterTurnAroundY.z, 0.0f, "FromAxisAngle(Up, 90deg) leaves z at 0");
     }
 
+    void TestQuaternionMultiplication()
+    {
+        const Quaternion identity = Quaternion::Identity();
+        const float halfPi = std::numbers::pi_v<float> / 2.0f;
+        const Quaternion yaw90 = Quaternion::FromAxisAngle(kWorldUp, halfPi);
+
+        Check(identity * yaw90 == yaw90, "identity * q == q");
+        Check(yaw90 * identity == yaw90, "q * identity == q");
+
+        // Two 90-degree turns around the same axis compose into one
+        // 180-degree turn — an easy-to-verify concrete case.
+        const Quaternion yaw180 = yaw90 * yaw90;
+        const Quaternion expectedYaw180 = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float>);
+        CheckNearlyEqual(yaw180.w, expectedYaw180.w, "Two composed 90deg yaws: w matches one 180deg yaw");
+        CheckNearlyEqual(yaw180.y, expectedYaw180.y, "Two composed 90deg yaws: y matches one 180deg yaw");
+    }
+
+    void TestQuaternionRotate()
+    {
+        // Reuses the exact fact already proven at the Mat4 level in
+        // TestMat4TransformFactories: rotating Right (+X) by 90deg
+        // around Up (+Y) lands on Forward (-Z). Proving Quaternion's
+        // own Rotate() gives the same answer confirms the two rotation
+        // representations agree, not just that each is internally
+        // consistent.
+        const float halfPi = std::numbers::pi_v<float> / 2.0f;
+        const Quaternion yaw90 = Quaternion::FromAxisAngle(kWorldUp, halfPi);
+        const Vec3 rotatedRight = Rotate(yaw90, kWorldRight);
+        CheckNearlyEqual(rotatedRight.x, kWorldForward.x, "Quaternion Rotate: Right rotated 90deg around Up lands on Forward.x");
+        CheckNearlyEqual(rotatedRight.y, kWorldForward.y, "Quaternion Rotate: Right rotated 90deg around Up lands on Forward.y");
+        CheckNearlyEqual(rotatedRight.z, kWorldForward.z, "Quaternion Rotate: Right rotated 90deg around Up lands on Forward.z");
+
+        Check(Rotate(Quaternion::Identity(), kWorldForward) == kWorldForward, "Rotate by identity leaves a vector unchanged");
+    }
+
     void TestMat4TransformFactories()
     {
         const Mat4 translation = Mat4::Translation(Vec3(2.0f, 3.0f, 4.0f));
@@ -246,6 +281,8 @@ int main()
     TestMat4();
     TestQuaternion();
     TestQuaternionFromAxisAngle();
+    TestQuaternionMultiplication();
+    TestQuaternionRotate();
     TestMat4TransformFactories();
     TestLookAtRH();
     TestPerspectiveRH_ZO();

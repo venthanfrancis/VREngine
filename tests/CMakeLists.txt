@@ -64,6 +64,19 @@ target_link_libraries(arengine_input_tests PRIVATE AREngine::Core AREngine::Plat
 target_compile_features(arengine_input_tests PRIVATE cxx_std_20)
 add_test(NAME InputTests COMMAND arengine_input_tests)
 
+# Pure-logic tests for ARDemo::DemoCameraController (DemoCameraController.hpp)
+# — M8G's manual-Vulkan-demo camera controller. Built unconditionally,
+# not gated behind ARENGINE_ENABLE_VULKAN: the controller itself has no
+# Vulkan dependency, only Core/Scene/Input, so there is no reason its
+# tests should require a Vulkan-capable machine. See
+# docs/ARCHITECTURE.md, "Temporary Demo-Controller Decisions (M8G)".
+add_executable(arengine_demo_camera_controller_tests
+    demo_camera_controller_tests.cpp
+)
+target_link_libraries(arengine_demo_camera_controller_tests PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input)
+target_compile_features(arengine_demo_camera_controller_tests PRIVATE cxx_std_20)
+add_test(NAME DemoCameraControllerTests COMMAND arengine_demo_camera_controller_tests)
+
 # Everything Vulkan-specific is gated on ARENGINE_ENABLE_VULKAN (top-
 # level option, default ON) — when OFF, none of this is added: no
 # find_package(Vulkan) call, no Vulkan targets at all. See
@@ -105,7 +118,7 @@ if(ARENGINE_ENABLE_VULKAN)
     add_executable(arengine_vulkan_present_demo
         vulkan_present_demo.cpp
     )
-    target_link_libraries(arengine_vulkan_present_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Rendering Vulkan::Vulkan)
+    target_link_libraries(arengine_vulkan_present_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering Vulkan::Vulkan)
     target_include_directories(arengine_vulkan_present_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
     target_compile_features(arengine_vulkan_present_demo PRIVATE cxx_std_20)
 endif()

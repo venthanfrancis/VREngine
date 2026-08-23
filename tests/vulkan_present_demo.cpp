@@ -1,19 +1,22 @@
-// Manual M8F validation demo — NOT part of the automated CTest suite,
+// Manual M8G validation demo — NOT part of the automated CTest suite,
 // since it requires a real Vulkan-capable GPU/driver and opens a real
 // window, neither of which CI/headless systems have. Built by CMake
 // but deliberately not registered with add_test. Run it manually.
 //
-// Extends M8E's textured quad into genuine 3D: real Vec3 positions, a
-// fixed camera (Core::Math::LookAtRH), a right-handed/zero-to-one-depth
-// perspective projection (Core::Math::PerspectiveRH_ZO) with Vulkan's
-// NDC Y-flip applied as a separate, explicit Vulkan-layer step
-// (VulkanClipSpace::ApplyVulkanYFlip - see docs/ARCHITECTURE.md,
-// "Core/Vulkan Clip-Space Split"), a depth buffer, and depth testing -
-// proven by drawing two overlapping, differently-tinted copies of the
-// same quad at different depths, the nearer one submitted FIRST, and
-// confirming it still renders in front. See docs/ARCHITECTURE.md,
-// "Exact Visual Proof That Depth Testing Works (M8F)". No movable
-// camera, no Scene integration, no lighting - see docs/ROADMAP.md, M8F.
+// Extends M8F's fixed-camera depth demo with AREngine's first real
+// Camera (Scene::Camera + Scene::Transform, backend-independent — see
+// docs/ARCHITECTURE.md, "Camera Ownership / Module Placement (M8G)")
+// and a free-fly controller (ARDemo::DemoCameraController,
+// DemoCameraController.hpp — demo-private, mixes Input policy with
+// motion math, deliberately NOT part of the permanent engine) driven by
+// AREngine's existing InputSystem: WASD to move (following wherever the
+// camera is currently looking, not always world -Z), Space/Ctrl for
+// up/down, hold the right mouse button and move the mouse to look
+// around. A small hard-coded scene (a floor plus several upright quads
+// at different distances, including M8F's original near/far depth-proof
+// pair) replaces M8F's single quad pair, so movement has real depth and
+// perspective to observe. Depth testing remains enabled throughout. See
+// docs/ARCHITECTURE.md, "M8G Implementation Notes" for full details.
 //
 // This demo reaches directly into Rendering's private src/vulkan/
 // implementation (not through any public Rendering API), same as
@@ -22,7 +25,12 @@
 // deliberately NOT used to drive this yet.
 
 #include "AREngine/Core/Core.hpp"
+#include "AREngine/Input/Input.hpp"
 #include "AREngine/Platform/Platform.hpp"
+#include "AREngine/Scene/Camera.hpp"
+#include "AREngine/Scene/Transform.hpp"
+
+#include "DemoCameraController.hpp"
 
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCheckerboard.hpp"
@@ -99,19 +107,88 @@ namespace
         CheckVkResult(vkCreateFence(device, &createInfo, nullptr, &fence), "vkCreateFence");
         return fence;
     }
+
+    // One piece of M8G's hard-coded demo world: a shared quad, placed
+    // and colored by its own Transform + tint. Temporary test content,
+    // not a general world/level system - see docs/ARCHITECTURE.md,
+    // "Demo World (M8G)".
+    struct SceneObject
+    {
+        Scene::Transform transform;
+        Core::Math::Vec4 tint;
+    };
+
+    // A floor plus several upright quads at different distances/
+    // positions - enough for movement to have real depth/perspective to
+    // observe, without implementing MeshAsset/model loading or a
+    // general world system. Includes M8F's original near/far
+    // depth-testing pair unchanged (still proves the same occlusion
+    // fact — see docs/ARCHITECTURE.md, "Exact Visual Proof That Depth
+    // Testing Works (M8F)" — now just two objects among several the
+    // user can walk around and view from any angle).
+    [[nodiscard]] std::vector<SceneObject> BuildDemoScene()
+    {
+        using namespace AREngine::Core::Math;
+        using AREngine::Scene::Transform;
+
+        const float halfPi = std::numbers::pi_v<float> / 2.0f;
+
+        return {
+            // Floor: local quad (facing +Z) rotated 90deg around Right
+            // so its plane becomes horizontal (XZ), then scaled up into
+            // a 20x20m ground plane. Scale is applied before rotation
+            // (TRS order), so scaling X/Y (not Z) here is what ends up
+            // stretching the horizontal plane's X/Z extent once rotated.
+            {Transform{Vec3(0.0f, -1.0f, -5.0f), Quaternion::FromAxisAngle(kWorldRight, halfPi), Vec3(20.0f, 20.0f, 1.0f)},
+             Vec4(1.0f, 1.0f, 1.0f, 1.0f)},
+
+            // M8F's original depth-testing pair, positions unchanged.
+            {Transform{Vec3(-2.0f, 0.5f, -3.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(1.0f, 1.0f, 1.0f, 1.0f)}, // near, untinted
+            {Transform{Vec3(-1.6f, 0.5f, -5.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(1.0f, 0.35f, 0.35f, 1.0f)}, // far, red
+
+            // A couple more, farther out, so there is real scene depth
+            // to walk through and look around.
+            {Transform{Vec3(2.0f, 0.5f, -6.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(0.4f, 1.0f, 0.4f, 1.0f)}, // green
+            {Transform{Vec3(3.5f, 0.5f, -9.0f), Quaternion::Identity(), Vec3(1.0f, 1.0f, 1.0f)},
+             Vec4(0.4f, 0.4f, 1.0f, 1.0f)}, // blue
+        };
+    }
 }
 
 int main()
 {
+    // Declared first, before `window`, for exactly the reason
+    // Runtime.hpp documents for its own m_inputSystem: Win32's
+    // DestroyWindow (reached via ~WindowsWindow, reached via ~window)
+    // can synchronously fire one last WM_KILLFOCUS *during window
+    // teardown*, which the event callback below forwards to
+    // inputSystem.OnEvent(). If inputSystem were declared (and
+    // therefore destroyed) after window, that late event would call
+    // OnEvent() on an already-destroyed InputSystem — see
+    // docs/ARCHITECTURE.md, "Input Integration (M8G)" and the original
+    // M7 incident this reasoning comes from (runtime/include/AREngine/Runtime/Runtime.hpp).
+    Input::InputSystem inputSystem;
+
     Platform::WindowDesc desc;
-    desc.title = "AREngine M8F Vulkan Depth Demo";
+    desc.title = "AREngine M8G Vulkan Camera Demo";
     desc.width = 1280;
     desc.height = 720;
     auto window = Platform::CreateAppWindow(desc);
 
     bool framebufferResized = false;
-    window->SetEventCallback([&framebufferResized](Core::Event& event)
+    window->SetEventCallback([&framebufferResized, &inputSystem](Core::Event& event)
     {
+        // Every event reaches InputSystem unconditionally — including
+        // WindowFocusLostEvent, which InputSystem uses to clear all
+        // held keys/buttons (see docs/ARCHITECTURE.md, "Focus Loss
+        // (M8G)"). This is the one place Platform's events reach
+        // InputSystem, same pattern Runtime::Runtime() already
+        // established.
+        inputSystem.OnEvent(event);
+
         if (dynamic_cast<Platform::WindowResizeEvent*>(&event) != nullptr)
         {
             framebufferResized = true;
@@ -249,47 +326,42 @@ int main()
     VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
     WriteCombinedImageSamplerDescriptor(device.Get(), descriptorSet, texture->GetView(), sampler.Get());
 
-    // M8F's fixed camera: positioned 3 meters back along +Z, looking
-    // toward the origin - i.e. looking down world -Z, exactly matching
-    // AREngine's Forward convention. No keyboard/mouse control, no
-    // Camera component - see docs/ARCHITECTURE.md, "Camera Convention
-    // (M8F)". View never changes once computed; projection is
-    // recomputed every frame from the swapchain's *current* extent
-    // (see the render loop below), so a resize naturally updates the
-    // aspect ratio with no separate "update projection" step.
-    const Core::Math::Vec3 kCameraEye(0.0f, 0.0f, 3.0f);
-    const Core::Math::Mat4 view = Core::Math::LookAtRH(kCameraEye, Core::Math::Vec3(0.0f, 0.0f, 0.0f), Core::Math::kWorldUp);
+    // M8G's real Camera: backend-independent projection parameters
+    // (Scene::Camera) driving a view matrix built from a Transform's
+    // pose - no Vulkan type anywhere in either. near/far widened from
+    // M8F's 0.1/10.0 to comfortably contain the larger demo world below
+    // (the floor alone spans roughly Z in [-15,5]). See
+    // docs/ARCHITECTURE.md, "Camera Data (M8G)".
+    Scene::Camera camera;
+    camera.nearZ = 0.1f;
+    camera.farZ = 100.0f;
 
-    constexpr float kFovYRadians = std::numbers::pi_v<float> / 3.0f; // 60 degrees
-    constexpr float kNearZ = 0.1f;
-    constexpr float kFarZ = 10.0f;
+    // Starting pose: 1m above the floor (floor sits at y=-1), a few
+    // meters back from the demo scene, facing -Z (identity rotation) -
+    // i.e. looking straight into the scene, matching
+    // DemoCameraController's own yaw=pitch=0 default so the very first
+    // frame's orientation and this Transform agree.
+    Scene::Transform cameraTransform;
+    cameraTransform.position = Core::Math::Vec3(0.0f, 1.0f, 5.0f);
 
-    // The exact depth-testing proof (see docs/ARCHITECTURE.md, "Exact
-    // Visual Proof That Depth Testing Works (M8F)"): two copies of the
-    // same quad, placed at different world-space depths AND offset
-    // diagonally in X/Y, purely via their Model matrix's translation
-    // (the shared vertex data above never changes) - so the two quads
-    // partially, not fully, overlap on screen. This deliberately makes
-    // the proof unambiguous from a single screenshot: each quad also
-    // has a non-overlapping region that's independently visible
-    // regardless of depth testing, so a viewer can directly compare
-    // "what the overlap region shows" against "what each quad's own
-    // color looks like elsewhere" - a full nested overlap (same X/Y,
-    // only Z different) would make it impossible to tell the far quad
-    // was ever drawn at all.
-    //
-    // The near quad (z=-1.5, tinted white - i.e. untinted) is submitted
-    // FIRST; the far quad (offset to x=y=+0.4, z=-2.0, tinted red) is
-    // submitted SECOND. Without depth testing, the far quad's later
-    // draw would incorrectly paint its red tint over the near quad in
-    // the overlapping region; with depth testing (LESS, write-enabled),
-    // the near quad's already-written, smaller depth values correctly
-    // reject the far quad's fragments there instead - the overlap
-    // region must show near's untinted checkerboard, not far's red one.
-    const Core::Math::Mat4 modelNear = Core::Math::Mat4::Translation(Core::Math::Vec3(0.0f, 0.0f, -1.5f));
-    const Core::Math::Mat4 modelFar = Core::Math::Mat4::Translation(Core::Math::Vec3(0.4f, 0.4f, -2.0f));
-    constexpr Core::Math::Vec4 kNearTint(1.0f, 1.0f, 1.0f, 1.0f);
-    constexpr Core::Math::Vec4 kFarTint(1.0f, 0.35f, 0.35f, 1.0f);
+    ARDemo::DemoCameraController cameraController;
+
+    // Push-constant size review (M8G): still one MvpPushConstants (80
+    // bytes) per draw call, computed fresh on the CPU per object -
+    // adding more scene objects didn't change the PER-DRAW payload
+    // size, only how many times it's pushed. Asserted against the
+    // device's actual limit rather than assumed - every Vulkan
+    // implementation guarantees at least 128 bytes, comfortably above
+    // 80, but this is queried/asserted, not just trusted. See
+    // docs/ARCHITECTURE.md, "Push Constant Review (M8G)".
+    AR_ASSERT_MSG(physicalDevice.properties.limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
+        "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
+
+    const std::vector<SceneObject> sceneObjects = BuildDemoScene();
+    AR_LOG_INFO(std::format("Demo scene: {} objects (1 floor + {} upright quads)",
+                             sceneObjects.size(), sceneObjects.size() - 1));
+
+    Platform::SteadyClock clock;
 
     std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
     {
@@ -401,20 +473,42 @@ int main()
                                  swapchain->GetExtent().width, swapchain->GetExtent().height, swapchain->GetImageCount()));
     };
 
-    AR_LOG_INFO("AREngine M8F depth demo: close the window to exit.");
+    AR_LOG_INFO("AREngine M8G camera demo: WASD to move, Space/Ctrl for up/down, "
+                "hold Right Mouse Button and move the mouse to look around. Close the window to exit.");
 
     int currentFrame = 0;
     while (!window->ShouldClose())
     {
+        // InputSystem::BeginFrame() must run before PollEvents()
+        // delivers this frame's new events - see
+        // docs/ARCHITECTURE.md, "Input Integration (M8G)" (same
+        // reasoning as Runtime::Run()'s identical ordering).
+        inputSystem.BeginFrame();
+
         window->PollEvents();
         if (window->ShouldClose())
         {
             break;
         }
+
+        // Ticked every loop iteration, even while minimized below, so
+        // elapsed wall-clock time never silently accumulates into one
+        // large jump the moment the window is restored. See
+        // docs/ARCHITECTURE.md, "Delta-Time Usage (M8G)".
+        const float deltaTimeSeconds = static_cast<float>(clock.Tick());
+
         if (window->GetWidth() == 0 || window->GetHeight() == 0)
         {
-            continue; // minimized - do no Vulkan work until restored
+            continue; // minimized - do no Vulkan (or camera) work until restored
         }
+
+        // The only place this demo touches camera movement/look - see
+        // docs/ARCHITECTURE.md, "Movement (M8G)" and "Mouse Look
+        // (M8G)". A held key surviving a focus-loss/regain cycle with
+        // no stuck movement is InputSystem's existing M7 behavior,
+        // exercised here for the first time by something that's
+        // actually visible (camera motion) rather than a log line.
+        cameraController.Update(cameraTransform, inputSystem, deltaTimeSeconds);
 
         vkWaitForFences(device.Get(), 1, &frameSync[currentFrame].inFlight, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
 
@@ -496,9 +590,9 @@ int main()
 
         // Real geometry from real GPU buffers: bind the quad's vertex
         // buffer at binding 0 (matching Vertex::GetBindingDescription())
-        // and its index buffer, then the texture's descriptor set, then
-        // draw indexed - twice, once per depth-proof object. See
-        // docs/ARCHITECTURE.md, "Indexed Draw Path (M8D)", "Command
+        // and its index buffer, then the texture's descriptor set once
+        // for the whole frame, then draw indexed once per scene object.
+        // See docs/ARCHITECTURE.md, "Indexed Draw Path (M8D)", "Command
         // Recording (M8E)", and "Exact Visual Proof That Depth Testing
         // Works (M8F)".
         VkBuffer vertexBuffers[] = {vertexBuffer->Get()};
@@ -508,30 +602,34 @@ int main()
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
             0, 1, &descriptorSet, 0, nullptr);
 
-        // Projection is recomputed every frame from the CURRENT extent
-        // - this is what keeps the aspect ratio correct after a resize,
-        // with no separate "update projection" step anywhere else. See
-        // docs/ARCHITECTURE.md, "Vulkan Projection Convention (M8F)".
-        // Core::Math::PerspectiveRH_ZO builds the backend-neutral RH/
-        // zero-to-one-depth matrix; ApplyVulkanYFlip is the one,
+        // Aspect ratio is set from the CURRENT extent every frame -
+        // this is what keeps projection correct after a resize, with no
+        // separate "update projection" step anywhere else. View comes
+        // straight from the camera's current Transform (moved/rotated
+        // by cameraController.Update above). Core::Math::PerspectiveRH_ZO
+        // (via Camera::GetProjectionMatrix) builds the backend-neutral
+        // RH/zero-to-one-depth matrix; ApplyVulkanYFlip is the one,
         // explicit place Vulkan's NDC Y-flip is applied - see
-        // docs/ARCHITECTURE.md, "Core/Vulkan Clip-Space Split".
-        const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-        const Core::Math::Mat4 projection =
-            ApplyVulkanYFlip(Core::Math::PerspectiveRH_ZO(kFovYRadians, aspect, kNearZ, kFarZ));
+        // docs/ARCHITECTURE.md, "Core/Vulkan Clip-Space Split" and
+        // "Projection Ownership (M8G)".
+        camera.SetAspectRatio(static_cast<float>(extent.width) / static_cast<float>(extent.height));
+        const Core::Math::Mat4 view = camera.GetViewMatrix(cameraTransform);
+        const Core::Math::Mat4 projection = ApplyVulkanYFlip(camera.GetProjectionMatrix());
+        const Core::Math::Mat4 viewProjection = projection * view;
 
-        // Near quad FIRST, far quad SECOND - the exact ordering the
-        // depth-testing proof depends on (see the comment where
-        // modelNear/modelFar are defined, above).
-        const MvpPushConstants nearPushConstants{projection * view * modelNear, kNearTint};
-        vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(MvpPushConstants), &nearPushConstants);
-        vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
-
-        const MvpPushConstants farPushConstants{projection * view * modelFar, kFarTint};
-        vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(MvpPushConstants), &farPushConstants);
-        vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
+        // One draw call per scene object: MVP computed fresh on the CPU
+        // (Model varies per object; View/Projection are this frame's,
+        // shared by all of them) and pushed immediately before each
+        // draw - see docs/ARCHITECTURE.md, "Push Constant Review
+        // (M8G)". Still no vertex buffer of its own per object - every
+        // object reuses the one shared quad bound above.
+        for (const SceneObject& object : sceneObjects)
+        {
+            const MvpPushConstants pushConstants{viewProjection * object.transform.ToMatrix(), object.tint};
+            vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(MvpPushConstants), &pushConstants);
+            vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(indices.size()), 1, 0, 0, 0);
+        }
 
         vkCmdEndRenderPass(commandBuffer);
 
@@ -575,7 +673,7 @@ int main()
     }
 
     // GPU idle before destroying anything - see docs/ARCHITECTURE.md,
-    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E"/"M8F
+    // "Exact Destruction Order (M8B)" and "M8C"/"M8D"/"M8E"/"M8F"/"M8G
     // Implementation Notes". This also covers the vertex/index buffers,
     // the texture/descriptor resources, and the depth image: the last
     // frame's draw commands may still be referencing all of them until
@@ -583,8 +681,10 @@ int main()
     // else (sync objects, descriptor pool, sampler, texture image,
     // index buffer, vertex buffer, command pool, depth image,
     // framebuffers, pipeline, descriptor set layout, render pass,
-    // swapchain, device, surface, instance) unwinds automatically after
-    // this in reverse construction order.
+    // swapchain, device, surface, instance, window, inputSystem)
+    // unwinds automatically after this in reverse construction order —
+    // inputSystem last of all, per the ordering comment where it's
+    // declared, above.
     vkDeviceWaitIdle(device.Get());
 
     for (FrameSyncObjects& sync : frameSync)

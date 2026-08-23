@@ -30,7 +30,8 @@ all come after that chain is proven.
 | — M8D | Real GPU geometry: `VulkanBuffer`, staging uploads, vertex + index buffers, indexed quad draw. | **Complete** | See `docs/ARCHITECTURE.md` Section 19 |
 | — M8E | Textured quad: `VulkanImage`/`VulkanSampler`, procedural checkerboard, descriptor set, UV sampling. | **Complete** | See `docs/ARCHITECTURE.md` Section 20 |
 | — M8F | Genuine 3D: Vec3 positions, fixed camera, Vulkan-conforming perspective, depth buffer/testing, push-constant MVP. | **Complete** | See `docs/ARCHITECTURE.md` Section 21 |
-| — M8G+ | A proper camera abstraction, then Scene integration and a textured mesh | Not started | |
+| — M8G | Backend-independent `Scene::Camera` abstraction, driven by a demo-private controller using `Input`: WASD move, click-drag mouse look, delta-time-based movement over a small hard-coded scene. | **Complete** | See `docs/ARCHITECTURE.md` Section 22 |
+| — M8H+ | Scene integration and a textured mesh | Not started | |
 | M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | Not started | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |

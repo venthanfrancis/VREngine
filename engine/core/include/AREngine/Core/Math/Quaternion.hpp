@@ -9,11 +9,12 @@ namespace AREngine::Core::Math
     // Represents a rotation. Kept minimal: construction, identity, and
     // (as of M5) axis-angle construction, which is genuinely needed to
     // build meaningful, testable rotations for Scene's transform tests.
-    // Rotation composition (quaternion * quaternion) and applying a
-    // quaternion directly to a Vec3 are still not implemented — M5's
-    // transform composition works entirely through Mat4 (see
-    // docs/ARCHITECTURE.md, "M5 Implementation Notes"), so neither was
-    // genuinely required. Added later if something actually needs them.
+    // Rotation composition (quaternion * quaternion, below) and applying
+    // a quaternion directly to a Vec3 (Rotate, below) were added in M8G,
+    // once a free-fly camera controller genuinely needed both (yaw and
+    // pitch composed into one orientation, and that orientation's
+    // forward/right vectors read back out — see
+    // docs/ARCHITECTURE.md, "Rotation Representation (M8G)").
     //
     // Stored in Hamilton (w, x, y, z) form; identity = (1, 0, 0, 0).
     struct Quaternion
@@ -53,5 +54,37 @@ namespace AREngine::Core::Math
     constexpr bool operator==(const Quaternion& a, const Quaternion& b)
     {
         return a.w == b.w && a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+
+    // Quaternion composition (the Hamilton product): `a * b` means "b
+    // applied first, then a" — matching Mat4's existing composition
+    // convention (TRS = T * R * S, applied to a point p as
+    // T * (R * (S * p))), so the two rotation representations agree on
+    // what "compose" means. Used by M8G's camera controller to build one
+    // orientation from separate yaw (world Up) and pitch (local Right)
+    // rotations: `yawQuat * pitchQuat` applies pitch first (in the
+    // not-yet-yawed local frame), then yaw — the standard FPS-camera
+    // composition order.
+    [[nodiscard]] constexpr Quaternion operator*(const Quaternion& a, const Quaternion& b)
+    {
+        return Quaternion(
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+        );
+    }
+
+    // Rotates `v` by `q`. Standard optimized form of q * (0,v) * q^-1
+    // that avoids constructing a full pure-quaternion intermediate.
+    // Added in M8G specifically so Transform can derive its
+    // forward/right/up directions straight from `rotation`, without
+    // needing to go through Mat4::Rotation first — see
+    // docs/ARCHITECTURE.md, "Rotation Representation (M8G)".
+    [[nodiscard]] constexpr Vec3 Rotate(const Quaternion& q, const Vec3& v)
+    {
+        const Vec3 qv(q.x, q.y, q.z);
+        const Vec3 t = Cross(qv, v) * 2.0f;
+        return v + t * q.w + Cross(qv, t);
     }
 }
