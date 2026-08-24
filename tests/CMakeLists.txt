@@ -221,6 +221,18 @@ if(ARENGINE_ENABLE_OPENXR)
         target_link_libraries(arengine_openxr_session_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_openxr_session_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
         target_compile_features(arengine_openxr_session_demo PRIVATE cxx_std_20)
+
+        # Manual-only, M9E: requires a real OpenXR loader/runtime with
+        # XR_KHR_vulkan_enable2 support (and ideally a real or simulated
+        # HMD) which CI/headless systems lack. Built by CMake but
+        # deliberately NOT registered with add_test. Run it directly
+        # instead. See docs/ARCHITECTURE.md, "M9E Implementation Notes".
+        add_executable(arengine_openxr_frame_demo
+            openxr_frame_demo.cpp
+        )
+        target_link_libraries(arengine_openxr_frame_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
+        target_include_directories(arengine_openxr_frame_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+        target_compile_features(arengine_openxr_frame_demo PRIVATE cxx_std_20)
     endif()
 endif()
 

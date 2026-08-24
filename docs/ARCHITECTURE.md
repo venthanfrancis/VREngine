@@ -4725,3 +4725,372 @@ device feature/extension requirement above — a real, evidence-based
 discovery this milestone's own real-runtime testing was specifically
 designed to surface, not a design flaw in M9D's own session-lifecycle
 code.
+
+## 28. M9E Implementation Notes
+
+M9E gives AREngine its first real OpenXR frame lifecycle: XR
+swapchains created from the runtime's own recommended dimensions,
+`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`, per-eye swapchain-image
+acquire/wait/release with a minimal Vulkan clear proving the
+OpenXR-owned images are genuinely usable, an environment blend mode
+selected from what the runtime actually reports, and zero composition
+layers submitted (real view pose/FOV data via `xrLocateViews` is
+formally deferred to M9F). No stereo scene rendering, no
+`XRFrameDriver`, no head tracking — see "What's Deferred to M9F+" below.
+
+### XR Swapchain Topology (M9E)
+
+**One `XrSwapchain` per view (two total for `PRIMARY_STEREO`), not one
+array swapchain with `arraySize = viewCount`.** Chosen for simplicity,
+not because of any SteamVR-specific quirk: two independent swapchains
+give two independent image lists, which maps directly onto M9E's own
+"one distinct clear color per eye" proof-of-life (`kEyeClearColors` in
+the demo) with no array-layer indexing to reason about, and defers the
+real efficiency argument for a single array swapchain (fewer runtime
+objects, natural fit for multiview rendering) to whichever future
+milestone (M9F+) actually implements real stereo rendering and has
+concrete evidence for which approach the renderer needs. This is a
+general simplicity/evidence argument that would apply against any
+conformant runtime, not a workaround for anything SteamVR-specific.
+
+### Swapchain Color Format Selection (M9E)
+
+`EnumerateSwapchainFormats`/`SelectSwapchainColorFormat`
+(`OpenXRSwapchain.hpp/.cpp`) — the `int64_t` values
+`xrEnumerateSwapchainFormats` returns are, for a Vulkan-backed session,
+directly `VkFormat` values (an OpenXR-spec-defined mapping, not a
+guess). `SelectSwapchainColorFormat` (pure logic, unit-tested) prefers
+`VK_FORMAT_B8G8R8A8_SRGB`, then `VK_FORMAT_R8G8B8A8_SRGB`, then falls
+back to whichever format the runtime lists first — **never** assumes
+`VK_FORMAT_B8G8R8A8_SRGB` is present, per the brief. Against SteamVR's
+null driver: 10 formats reported; `VK_FORMAT_B8G8R8A8_SRGB` was present
+and selected.
+
+### Recommended Dimensions/Sample Count (M9E)
+
+Swapchain `width`/`height`/`sampleCount` come directly from each
+view's own `XrViewConfigurationView` (`recommendedImageRectWidth`/
+`recommendedImageRectHeight`/`recommendedSwapchainSampleCount`,
+enumerated in M9D) — never hard-coded. Against SteamVR: both views
+1852x2056, sample count 1, confirmed identical to M9D's own
+observation of the same data. `faceCount`/`mipCount` are always 1 (one
+view per swapchain, no cubemap, no mipmapping for a compositor
+target).
+
+### VkImage / VkImageView Ownership (M9E)
+
+`OpenXRSwapchain` enumerates its images via `xrEnumerateSwapchainImages`
+into `XrSwapchainImageVulkan2KHR` (the two-call idiom, same pattern as
+every other `xrEnumerate*` wrapper in this codebase), then copies out
+just the `VkImage` handles into a `std::vector<VkImage>`. **These
+`VkImage`s are OpenXR-owned**: never destroyed by `OpenXRSwapchain` or
+the demo, never backed by application-allocated `VkDeviceMemory` (no
+`vkAllocateMemory`/`vkBindImageMemory` call exists anywhere in M9E's
+code for them — the runtime already did that itself before exposing
+the handles). **M9E creates zero `VkImageView`s**: `vkCmdClearColorImage`
+operates directly on a `VkImage`, so no view was needed for this
+milestone's minimal proof-of-life. If/when a future milestone needs a
+render-pass/framebuffer-based render path over these images, that is
+exactly where AREngine-owned `VkImageView`s would be created (and, per
+the brief, destroyed before the owning `XrSwapchain`) — not before,
+since M9E has no actual use for one yet.
+
+### Frame Lifecycle: Acquire / Wait / Clear / Release (M9E)
+
+Per rendered frame, per swapchain: `xrAcquireSwapchainImage` (returns
+an index into the swapchain's own image list) → `xrWaitSwapchainImage`
+(`timeout = XR_INFINITE_DURATION`) → [record Vulkan commands against
+that index's `VkImage`] → `xrReleaseSwapchainImage`. The Vulkan work
+itself: one shared, reusable command buffer (allocated once, `vkReset`+
+re-recorded every frame) records, for each acquired image in turn, a
+layout transition `UNDEFINED → TRANSFER_DST_OPTIMAL`, a
+`vkCmdClearColorImage` to that eye's own distinct solid color
+(`kEyeClearColors`: warm red for view 0, cool blue for view 1 — proof
+each acquired image is genuinely independent, not the same underlying
+image returned twice by mistake), then a second transition
+`TRANSFER_DST_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL` (the conventional
+layout a color swapchain image is expected to be left in for the
+compositor, matching its `COLOR_ATTACHMENT_BIT` usage flag, even though
+M9E's own zero-layer `xrEndFrame` means nothing reads it this frame).
+
+### Synchronization Before Release (M9E)
+
+**`xrReleaseSwapchainImage` is never called while GPU work targeting
+that image is still in flight.** One `VkFence` (created once, reused
+every frame) is `vkQueueSubmit`-attached to the frame's single command
+buffer submission; the demo then `vkWaitForFences` on it (infinite
+timeout) **before** calling `xrReleaseSwapchainImage` for either
+swapchain. A fence was used rather than `vkQueueWaitIdle` specifically
+because the brief asked for one where practical — it waits for exactly
+this frame's work, not the entire queue. This is fully synchronous (one
+frame's GPU work completes before the next frame's command buffer is
+even recorded, no multi-frame-in-flight pipelining) — adequate for
+M9E's diagnostic clear, and explicitly **temporary**: a future renderer
+doing real per-frame work will want double/triple-buffered command
+buffers and fences instead of stalling every frame on GPU completion.
+
+### `xrWaitFrame` Timing / `predictedDisplayTime` / `shouldRender` (M9E)
+
+**In simple English:** `xrWaitFrame` is OpenXR's frame-pacing
+heartbeat — the app calls it once per frame, it blocks until the
+runtime decides "now is a good time to start preparing the next
+frame," and hands back a `predictedDisplayTime` (when this frame's
+image is expected to actually reach the user's eyes — not "now") plus
+`shouldRender` (whether the runtime actually wants new content this
+frame, or would rather the app skip rendering — e.g. because nothing
+is currently visible to a user). `XrTimeToSeconds`
+(`OpenXRFrameTiming.hpp`, pure, unit-tested) converts the raw `XrTime`
+into seconds using the OpenXR spec's own fixed definition (a 64-bit
+count of nanoseconds) — exact arithmetic, not a guess; the epoch itself
+is runtime-defined and only meaningful relative to other `XrTime`
+values from the same runtime, never as an absolute wall-clock reading
+(this is why the logged values are large, runtime-internal numbers, not
+"seconds since app start").
+
+Observed against SteamVR's null driver: `shouldRender = true` on frame
+1 only, then `false` for every subsequent frame observed (50, 100, 150,
+200). This is a plausible, spec-consistent outcome, not a bug: the
+runtime never reported `VISIBLE`/`FOCUSED` during this run (see below),
+and `shouldRender` genuinely means "the runtime wants content right
+now" — a null/simulated HMD with no real display and no user attention
+signal has little reason to keep asking for new frames once its
+initial diagnostic frame is captured.
+
+### `xrWaitFrame` Requires A Running Session (M9E)
+
+**A real, empirically-discovered behavior correction, found the hard
+way — not assumed from the spec.** The first version of this loop
+called `xrWaitFrame` unconditionally every iteration, including before
+the session was ever running, on the (spec-plausible) theory that
+participating in frame timing as early as possible helps the runtime
+pace the session toward `SYNCHRONIZED`. This ran without error right
+up through 200 successful frames and `xrRequestExitSession` — but the
+very next `xrWaitFrame` call, made immediately after `STOPPING` →
+`xrEndSession` had already succeeded, failed with
+`XR_ERROR_SESSION_NOT_RUNNING` and crashed the demo (`AR_ASSERT_MSG`).
+**Fixed** by only calling `xrWaitFrame` (and everything downstream of
+it) while `session.IsRunning()` is true — checked *before* the call,
+not after. This also resolved a latent architectural gap: the "not
+running" branch now sleeps 16ms per iteration (matching M9D's own
+polling cadence) since it is no longer paced by a blocking OpenXR call.
+Re-run twice after the fix: both runs completed all 200 frames and
+exited cleanly (code 0), with no further `xrWaitFrame`-related errors.
+This demo never actually exercises "call `xrWaitFrame` before the
+*first* `xrBeginSession`" either, since on this runtime `READY` (and
+therefore `BeginSession`) arrives within the very first loop iteration
+— that specific pre-first-begin case remains an honestly-reported,
+unexercised gap, same practice as M9D's `LOSS_PENDING` gap.
+
+### Environment Blend Mode Selection (M9E)
+
+`EnumerateEnvironmentBlendModes`/`SelectEnvironmentBlendMode`
+(`OpenXREnvironmentBlendMode.hpp/.cpp`, pure logic where it matters,
+unit-tested) prefers `OPAQUE`, then `ALPHA_BLEND`, then `ADDITIVE`,
+never hard-coded without checking what the runtime actually reports.
+`OPAQUE` is preferred because AREngine has no real passthrough camera
+pipeline yet — an opaque background is the safest, most universally
+correct default for a runtime that could be a VR headset, a
+passthrough-capable AR headset, or (as in this milestone's actual test
+environment) a simulated/null HMD with no real-world view to blend
+with at all. Against SteamVR: `OPAQUE` was the only mode reported and
+was selected.
+
+### Zero Composition Layers Submitted (M9E)
+
+**Deliberate, and central to keeping M9E's scope honest.** A valid
+`XrCompositionLayerProjection` requires real per-view pose/FOV data
+from `xrLocateViews` against a real `XrSpace` — M9E does not call
+`xrLocateViews` (formally deferred to M9F) and will not fabricate pose/
+FOV data to manufacture a layer that looks complete but isn't. Every
+`xrEndFrame` this milestone calls therefore uses `layerCount = 0`,
+`layers = nullptr` — spec-legal, and means "the compositor shows
+nothing new from this application this frame." The frame lifecycle
+mechanics above (wait/begin/acquire/wait/clear/release/end) are fully
+exercised regardless of layer count; only the actual on-screen
+composition is deferred. A consequence worth noting for M9F: **no
+`XrSpace`/reference space is created anywhere in M9E** (unlike M9D's
+demo) — with zero layers submitted, nothing in the frame loop currently
+needs one; M9F's `xrLocateViews` call will be the first thing in this
+codebase that actually needs a real `XrSpace` again.
+
+### Observed Session-State Sequence (M9E)
+
+```
+XR_SESSION_STATE_READY -> XR_SESSION_STATE_SYNCHRONIZED -> XR_SESSION_STATE_STOPPING -> XR_SESSION_STATE_EXITING
+```
+
+**`SYNCHRONIZED` was reached for the first time in this project's
+history**, directly confirming M9D's own prediction ("M9E's frame loop
+is expected to be the reason `SYNCHRONIZED`+ become observable at all —
+worth confirming directly once that milestone exists"). Confirmed, not
+merely plausible: it happened consistently across repeated manual runs,
+always immediately after frame 1's `xrEndFrame`. **`VISIBLE`/`FOCUSED`
+were never reached**, across every run performed. This is reported as
+an honest, real limitation of the test environment, not silently
+assumed away: SteamVR's null/simulated HMD driver has no actual display
+surface and nothing resembling real user attention, and `VISIBLE`/
+`FOCUSED` describe exactly that kind of runtime-decided "is a real user
+currently looking at this" signal — a genuine headset (or a
+runtime/simulator that models user attention) would be needed to
+observe them, which is outside what M9E's development environment
+(established in M9B) can provide. This is not treated as a defect in
+M9E's own frame-loop implementation, since every state this environment
+is capable of granting was in fact reached.
+
+### SteamVR-Internal Vulkan Validation Noise (M9E)
+
+**Real validation-layer output was observed during every manual run —
+traced to its source, not dismissed, and confirmed to originate
+entirely from SteamVR's own compositor internals, not from any AREngine
+Vulkan call.** Two distinct error classes appeared, both tagged
+`[OpenXR/Vulkan]` (the runtime's own logging prefix, same convention
+established in M9C/M9D):
+
+1. During/after `xrBeginSession`, before AREngine's own first
+   `vkQueueSubmit`: `vkCreateImage()` complaining about a
+   `VkExternalMemoryImageCreateInfo` (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT`)
+   paired with `initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED`, and
+   `vkQueueSubmit()` complaining about an image debug-named
+   `BlankEyeBuffer` being in the wrong layout.
+2. During shutdown (after every OpenXR/Vulkan object this demo owns had
+   already been destroyed cleanly): `vkFreeMemory()` complaining a
+   `VkDeviceMemory` was still in use by an image that was still in use
+   by a command buffer.
+
+**Conclusive evidence this is not AREngine's code**: the image name
+(`BlankEyeBuffer`) was never set by any AREngine call — nothing in
+`OpenXRSwapchain` or the demo ever calls
+`vkSetDebugUtilsObjectNameEXT`. The command buffer handles named in
+these errors (multiple different addresses across a single run) never
+match the demo's own single, reused command buffer (allocated once,
+logged nowhere near these values). AREngine's code never calls
+`vkCreateImage`, `vkAllocateMemory`, or `vkFreeMemory` for *any* image
+in M9E — every image involved is either OpenXR-owned (the swapchain
+images) or entirely internal to SteamVR's own compositor
+(`BlankEyeBuffer`, evidently its own internal placeholder image shown
+in place of application content — plausibly exercised specifically
+*because* M9E submits zero composition layers, though confirming that
+hypothesis is left to M9F, once this codebase actually submits a real
+layer and can observe whether the behavior changes). This is the same
+category of finding as M9D's `ShaderViewportIndexLayerEXT` errors: a
+pre-existing quirk in SteamVR's own Vulkan usage, surfaced only because
+validation is enabled, not caused by or fixable through any change to
+AREngine's own Vulkan calls. **AREngine's own Vulkan usage in M9E
+produced zero validation errors or warnings** — confirmed by tracing
+every reported error to a handle this codebase never created.
+
+### `FrameDriver` Fit Evaluation (M9E)
+
+**Required by the brief to happen after the raw OpenXR lifecycle was
+proven out, not before — performed now, with real evidence in hand.**
+`Frame::FrameDriver` (`engine/frame/include/AREngine/Frame/FrameDriver.hpp`)
+is three methods: `WaitForNextFrame() -> FrameTiming`,
+`GetViews() -> std::vector<ViewInfo>`, `SubmitFrame()`. Mapped against
+what M9E actually built:
+
+- **`WaitForNextFrame()` maps cleanly onto `xrWaitFrame`.** `XrFrameState`'s
+  `predictedDisplayTime` converts losslessly into
+  `FrameTiming::predictedDisplayTimeSeconds` via `XrTimeToSeconds`
+  (exactly the field `FrameTiming.hpp`'s own comment already anticipated:
+  "the XR module will translate OpenXR's time representation into this
+  later"). `shouldRender`, however, has **no home in `FrameTiming`
+  today** — `FrameDriver`'s interface has no way for a caller to learn
+  "the driver would prefer you skip rendering this frame." A future
+  `XRFrameDriver` could route around this (e.g. return an empty
+  `GetViews()` when `shouldRender` is false, or extend `FrameTiming`
+  with a `bool shouldRender` field), but that is a real, concrete gap,
+  not a clean fit.
+- **`GetViews()` does not yet have a real implementation to evaluate.**
+  M9E deliberately does not call `xrLocateViews` (M9F's job), so there
+  is no real `ViewInfo` data to compare against `Frame::ViewInfo`'s
+  shape (`position`/`orientation`/`projection`) yet. The shape itself
+  looks plausible for what `xrLocateViews` (`XrView`: `XrPosef` +
+  `XrFovf`) will eventually provide, converted through world-convention
+  math — but this is deferred to M9F with real evidence, not confirmed
+  here.
+- **`SubmitFrame()` does not map onto a single OpenXR call cleanly.**
+  M9E's real per-frame body is *acquire → wait → [render] → release →
+  xrEndFrame* — a sequence with a natural midpoint (the acquired
+  `VkImage`s must be rendered into by the *caller*, between `GetViews()`
+  and `SubmitFrame()`, in whatever `FrameDriver`-based design eventually
+  exists) that `FrameDriver`'s current three-method shape has no explicit
+  place for. `DesktopFrameDriver` doesn't hit this problem because
+  desktop's swapchain-image acquire/present is handled entirely inside
+  `Runtime`'s existing render step, outside `FrameDriver` itself, in a
+  way M9E's OpenXR path cannot replicate (OpenXR's acquire/wait/release
+  happens *per swapchain*, not once per frame, and must interleave
+  with the caller's own render commands, not merely bookend them).
+
+**Conclusion**: `FrameDriver`'s three-method shape does **not** cleanly
+fit OpenXR's real frame lifecycle as built in M9E, for two concrete,
+evidence-based reasons — no home for `shouldRender`, and no explicit
+seam for interleaving per-swapchain acquire/render/release with
+`SubmitFrame()`'s single call. Per the brief, this is reported as a
+finding, not silently patched over with a premature `XRFrameDriver`
+implementation or a `FrameDriver` interface redesign — that decision is
+left to whichever future milestone actually needs `XRFrameDriver` to
+exist, once `xrLocateViews`-backed `GetViews()` data (M9F) makes the
+full shape of the problem clear. No production code in `engine/frame/`
+or `runtime/` was touched by M9E.
+
+### Desktop Path Unaffected (M9E)
+
+M9E touched only `engine/xr/` and `tests/`. No file under
+`engine/rendering/`, `engine/frame/`, or `runtime/` was changed.
+`RenderingTests`/`RuntimeTests`/`FrameTests` all continued passing
+across every build-option combination below, and
+`arengine_vulkan_present_demo`/`NullRenderDevice`/`AREngineSandbox` all
+still build unchanged.
+
+### Validation Results (M9E)
+
+All four `ARENGINE_ENABLE_OPENXR` × `ARENGINE_ENABLE_VULKAN` combinations:
+
+- **ON/ON**: full build succeeds, `ctest` **14/14** (new pure-logic
+  checks: 6 environment-blend-mode/`XrTimeToSeconds` checks added to
+  `OpenXRSessionTests`, 4 swapchain-color-format-selection checks added
+  to `OpenXRVulkanTests`).
+- **ON/ON, `/EHsc /W4 /WX`**: zero warnings, zero errors, across
+  `arengine_xr` and every OpenXR test/demo target.
+- **ON/OFF**: builds correctly — `arengine_openxr_frame_demo` and the
+  swapchain-format tests are correctly absent (Vulkan-coupled),
+  `OpenXRSessionTests` (Vulkan-independent, includes the new blend-mode/
+  timing checks) still builds and passes, `ctest` **12/12**.
+- **OFF/ON** (default `build/`): builds correctly, entirely unaffected,
+  `ctest` **11/11**.
+
+`arengine_openxr_frame_demo` run against the live SteamVR/OpenXR 2.16.7
+null-driver runtime (repeated twice after the `xrWaitFrame` fix below,
+both clean):
+
+```
+Selected swapchain format: VK_FORMAT_B8G8R8A8_SRGB
+Created swapchain for view 0: 1852x2056, 3 image(s)
+Created swapchain for view 1: 1852x2056, 3 image(s)
+Selected environment blend mode: OPAQUE
+Observed session state sequence: XR_SESSION_STATE_READY -> XR_SESSION_STATE_SYNCHRONIZED -> XR_SESSION_STATE_STOPPING -> XR_SESSION_STATE_EXITING
+Total completed frames: 200
+```
+
+Exit code 0 both times. **Zero validation errors or warnings traced to
+AREngine's own Vulkan usage** (see "SteamVR-Internal Vulkan Validation
+Noise" above for the SteamVR-internal errors that were observed, traced
+to their source, and confirmed unrelated). An earlier run (before the
+`xrWaitFrame`-requires-running fix) crashed via `AR_ASSERT_MSG`
+immediately after the 200th frame and `xrRequestExitSession` — a real
+bug, found by real testing, fixed, and re-verified, not swept under a
+"known issue" label.
+
+### What's Deferred to M9F+
+
+`xrLocateViews`, real per-view pose/FOV data, a real `XrSpace` for
+locating against, `XrCompositionLayerProjection` submission with actual
+content, stereo scene rendering, any `VkImageView`/render-pass/
+framebuffer path over the swapchain images, resolving the `shouldRender`/
+`FrameDriver` gap identified above, resolving the "does zero-layer
+submission cause the SteamVR `BlankEyeBuffer` errors" open hypothesis,
+`XRFrameDriver` itself, controllers/actions, hand/eye tracking,
+passthrough, spatial anchors, physics, PBR shading, Scene integration.
+`OpenXRSwapchain`, the environment-blend-mode selection, and the
+now-working `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` lifecycle are all
+genuinely ready for M9F to build on directly.

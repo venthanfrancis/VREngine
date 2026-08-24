@@ -14,6 +14,7 @@
 // arengine_openxr_vulkan_demo — not part of this suite, since CTest
 // must not depend on an XR runtime or headset being present.
 
+#include "openxr/OpenXRSwapchain.hpp"
 #include "openxr/OpenXRVulkanGraphicsBinding.hpp"
 
 #include <cstdio>
@@ -157,6 +158,51 @@ namespace
         binding.device = fakeDevice;
         Check(binding.IsValid(), "All three handles non-null makes the binding valid");
     }
+
+    // --- Swapchain color format selection (M9E) ---
+
+    void TestSelectSwapchainColorFormatPrefersBgraSrgb()
+    {
+        const std::vector<std::int64_t> supported{
+            static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_UNORM),
+            static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_SRGB),
+            static_cast<std::int64_t>(VK_FORMAT_B8G8R8A8_SRGB),
+        };
+        const auto selected = SelectSwapchainColorFormat(supported);
+        Check(selected.has_value() && *selected == static_cast<std::int64_t>(VK_FORMAT_B8G8R8A8_SRGB),
+              "Selects VK_FORMAT_B8G8R8A8_SRGB when it is supported, regardless of enumeration order");
+    }
+
+    void TestSelectSwapchainColorFormatFallsBackToRgbaSrgb()
+    {
+        const std::vector<std::int64_t> supported{
+            static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_UNORM),
+            static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_SRGB),
+        };
+        const auto selected = SelectSwapchainColorFormat(supported);
+        Check(selected.has_value() && *selected == static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_SRGB),
+              "Falls back to VK_FORMAT_R8G8B8A8_SRGB when VK_FORMAT_B8G8R8A8_SRGB is unsupported");
+    }
+
+    void TestSelectSwapchainColorFormatFallsBackToFirstWhenNoSrgb()
+    {
+        // Deliberately no sRGB format at all - never assumed present,
+        // per M9E's brief. Falls back to whatever the runtime reports
+        // first, rather than failing outright.
+        const std::vector<std::int64_t> supported{
+            static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_UNORM),
+            static_cast<std::int64_t>(VK_FORMAT_R16G16B16A16_SFLOAT),
+        };
+        const auto selected = SelectSwapchainColorFormat(supported);
+        Check(selected.has_value() && *selected == static_cast<std::int64_t>(VK_FORMAT_R8G8B8A8_UNORM),
+              "Falls back to the first reported format when no preferred sRGB format is available");
+    }
+
+    void TestSelectSwapchainColorFormatReturnsNulloptWhenEmpty()
+    {
+        const auto selected = SelectSwapchainColorFormat({});
+        Check(!selected.has_value(), "Returns std::nullopt when the runtime reports zero swapchain formats");
+    }
 }
 
 int main()
@@ -176,9 +222,14 @@ int main()
     TestVulkanGraphicsBindingDataDefaultIsInvalid();
     TestVulkanGraphicsBindingDataRequiresAllThreeHandles();
 
+    TestSelectSwapchainColorFormatPrefersBgraSrgb();
+    TestSelectSwapchainColorFormatFallsBackToRgbaSrgb();
+    TestSelectSwapchainColorFormatFallsBackToFirstWhenNoSrgb();
+    TestSelectSwapchainColorFormatReturnsNulloptWhenEmpty();
+
     if (g_failureCount == 0)
     {
-        std::printf("All OpenXR/Vulkan (pure-logic) M9C checks passed\n");
+        std::printf("All OpenXR/Vulkan (pure-logic) M9C/M9E checks passed\n");
         return 0;
     }
 

@@ -16,6 +16,8 @@
 // suite, since CTest must not depend on an XR runtime or headset being
 // present.
 
+#include "openxr/OpenXREnvironmentBlendMode.hpp"
+#include "openxr/OpenXRFrameTiming.hpp"
 #include "openxr/OpenXRReferenceSpace.hpp"
 #include "openxr/OpenXRSessionState.hpp"
 #include "openxr/OpenXRViewConfiguration.hpp"
@@ -153,6 +155,55 @@ namespace
         Check(pose.position.x == 0.0f && pose.position.y == 0.0f && pose.position.z == 0.0f,
               "IdentityPose's position is the origin (0,0,0)");
     }
+
+    // --- Environment blend mode (M9E) ---
+
+    void TestIsEnvironmentBlendModeSupported()
+    {
+        const std::vector<XrEnvironmentBlendMode> supported{XR_ENVIRONMENT_BLEND_MODE_OPAQUE, XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND};
+        Check(IsEnvironmentBlendModeSupported(supported, XR_ENVIRONMENT_BLEND_MODE_OPAQUE), "Finds OPAQUE when present");
+        Check(!IsEnvironmentBlendModeSupported(supported, XR_ENVIRONMENT_BLEND_MODE_ADDITIVE), "Does not find ADDITIVE when absent");
+    }
+
+    void TestSelectEnvironmentBlendModePrefersOpaque()
+    {
+        const std::vector<XrEnvironmentBlendMode> supported{
+            XR_ENVIRONMENT_BLEND_MODE_ADDITIVE, XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND, XR_ENVIRONMENT_BLEND_MODE_OPAQUE};
+        const auto selected = SelectEnvironmentBlendMode(supported);
+        Check(selected.has_value() && *selected == XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+              "Selects OPAQUE when it is supported, regardless of enumeration order");
+    }
+
+    void TestSelectEnvironmentBlendModeFallsBackToAlphaBlend()
+    {
+        const std::vector<XrEnvironmentBlendMode> supported{XR_ENVIRONMENT_BLEND_MODE_ADDITIVE, XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND};
+        const auto selected = SelectEnvironmentBlendMode(supported);
+        Check(selected.has_value() && *selected == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND,
+              "Falls back to ALPHA_BLEND when OPAQUE is unsupported");
+    }
+
+    void TestSelectEnvironmentBlendModeFallsBackToAdditive()
+    {
+        const std::vector<XrEnvironmentBlendMode> supported{XR_ENVIRONMENT_BLEND_MODE_ADDITIVE};
+        const auto selected = SelectEnvironmentBlendMode(supported);
+        Check(selected.has_value() && *selected == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE,
+              "Falls back to ADDITIVE when neither OPAQUE nor ALPHA_BLEND is supported");
+    }
+
+    void TestSelectEnvironmentBlendModeReturnsNulloptWhenEmpty()
+    {
+        const auto selected = SelectEnvironmentBlendMode({});
+        Check(!selected.has_value(), "Returns std::nullopt (not a silent fallback) when the runtime reports no supported modes");
+    }
+
+    // --- XrTime conversion (M9E) ---
+
+    void TestXrTimeToSecondsConvertsNanosecondsCorrectly()
+    {
+        Check(XrTimeToSeconds(1'000'000'000) == 1.0, "One billion nanoseconds is exactly one second");
+        Check(XrTimeToSeconds(0) == 0.0, "Zero nanoseconds is zero seconds");
+        Check(XrTimeToSeconds(500'000'000) == 0.5, "Half a billion nanoseconds is half a second");
+    }
 }
 
 int main()
@@ -172,9 +223,16 @@ int main()
     TestSelectReferenceSpacesToCreateWithoutStage();
     TestIdentityPose();
 
+    TestIsEnvironmentBlendModeSupported();
+    TestSelectEnvironmentBlendModePrefersOpaque();
+    TestSelectEnvironmentBlendModeFallsBackToAlphaBlend();
+    TestSelectEnvironmentBlendModeFallsBackToAdditive();
+    TestSelectEnvironmentBlendModeReturnsNulloptWhenEmpty();
+    TestXrTimeToSecondsConvertsNanosecondsCorrectly();
+
     if (g_failureCount == 0)
     {
-        std::printf("All OpenXR session (pure-logic) M9D checks passed\n");
+        std::printf("All OpenXR session (pure-logic) M9D/M9E checks passed\n");
         return 0;
     }
 

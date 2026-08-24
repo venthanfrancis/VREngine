@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -419,13 +419,50 @@ device keeps its unchanged, deliberately minimal feature set. See
 `docs/ARCHITECTURE.md` Section 27, "Vulkan Device Feature Requirement
 Discovered in M9D," for the full investigation.
 
+**M9E gives AREngine its first real OpenXR frame lifecycle**: one
+`XrSwapchain` per view (`OpenXRSwapchain.hpp/.cpp`, Vulkan-gated,
+alongside M9C/M9D's files), sized from M9D's own recommended
+dimensions/sample count, color format selected from what the runtime
+actually reports (`VK_FORMAT_B8G8R8A8_SRGB` preferred, never assumed).
+A real `xrWaitFrame`→`xrBeginFrame`→(acquire/wait/clear/release per
+swapchain when `shouldRender`)→`xrEndFrame` loop runs for 200 frames
+against SteamVR before requesting exit — the per-eye clear
+(`vkCmdClearColorImage` to a distinct color per eye, synchronized with
+a `VkFence` before releasing) proves the OpenXR-owned `VkImage`s are
+genuinely usable, without rendering any real scene content. Zero
+composition layers are submitted (`xrEndFrame`'s `layerCount = 0`) —
+real per-view pose/FOV data via `xrLocateViews` is formally deferred to
+M9F, and M9E deliberately does not fabricate it. Environment blend mode
+is enumerated and selected (`OpenXREnvironmentBlendMode.hpp/.cpp`,
+Vulkan-independent; `OPAQUE` preferred and selected against SteamVR).
+**`SYNCHRONIZED` was reached for the first time in this project's
+history** (`READY -> SYNCHRONIZED -> STOPPING -> EXITING`), confirming
+M9D's own prediction that frame-loop participation is what unlocks it —
+`VISIBLE`/`FOCUSED` were never reached, an honest limitation of
+SteamVR's null/simulated-HMD test environment (no real display, no
+real user-attention signal), not a defect in M9E's own logic. A real
+bug was found and fixed via manual testing: calling `xrWaitFrame` after
+`xrEndSession` had already run (this runtime requires the session to
+be running for `xrWaitFrame`, confirmed empirically) crashed the demo;
+fixed by only calling it while `session.IsRunning()`. Real Vulkan
+validation noise was observed and traced to SteamVR's own internal
+compositor objects (a debug-named `BlankEyeBuffer`, command buffers
+this codebase never allocated) — zero validation errors were traced to
+AREngine's own Vulkan calls. The existing `Frame::FrameDriver`
+interface (`WaitForNextFrame`/`GetViews`/`SubmitFrame`) was evaluated
+against this real lifecycle and found **not** to fit cleanly: no home
+for `shouldRender`, no explicit seam for interleaving per-swapchain
+acquire/render/release with a single `SubmitFrame()` call — reported as
+a finding, not patched over with a premature `XRFrameDriver`. See
+`docs/ARCHITECTURE.md` Section 28 for the full investigation.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, and no XR swapchain/frame loop/`xrLocateViews`/`xrLocateSpace`/
-head tracking/controllers — see Sections 11–15. `Editor` is still an
-M0-style stub with no functionality. Next up is M9E (XR swapchains +
-frame lifecycle) or M8I+ (Scene integration, still pending within M8)
+system, and no `xrLocateViews`/`xrLocateSpace`/head tracking/
+controllers/`XRFrameDriver` — see Sections 11–15. `Editor` is still an
+M0-style stub with no functionality. Next up is M9F (`xrLocateViews` +
+stereo rendering) or M8I+ (Scene integration, still pending within M8)
 — see `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
@@ -441,12 +478,11 @@ frame lifecycle) or M8I+ (Scene integration, still pending within M8)
    no `MeshAsset`/model loading yet — see `docs/ROADMAP.md`'s M8I+ row
    for what's still pending within M8.
 3a. **OpenXR instance/system discovery + Vulkan graphics-binding +
-   XrSession/session-state/reference-space bring-up only so far
-   (M9A–M9D)**: no XR swapchain, no frame loop
-   (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/`xrLocateViews`), no
+   XrSession/session-state/reference-space bring-up + XR swapchains/
+   frame lifecycle only so far (M9A–M9E)**: no `xrLocateViews`, no
    `xrLocateSpace` for tracking, no head/hand/eye tracking, no
-   passthrough, no anchors, no `XRFrameDriver`. See
-   `docs/ROADMAP.md`'s M9E row.
+   passthrough, no anchors, no composition layer submission with real
+   content, no `XRFrameDriver`. See `docs/ROADMAP.md`'s M9F row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

@@ -69,6 +69,13 @@ if(ARENGINE_ENABLE_OPENXR)
             src/openxr/OpenXRViewConfiguration.cpp
             src/openxr/OpenXRReferenceSpace.hpp
             src/openxr/OpenXRReferenceSpace.cpp
+            # M9E: environment blend mode selection and XrTime
+            # conversion are pure OpenXR concepts, no Vulkan dependency
+            # - see docs/ARCHITECTURE.md, "Environment Blend Mode
+            # Selection (M9E)".
+            src/openxr/OpenXREnvironmentBlendMode.hpp
+            src/openxr/OpenXREnvironmentBlendMode.cpp
+            src/openxr/OpenXRFrameTiming.hpp
     )
 
     # Private: OpenXR is an implementation detail of this module's
@@ -102,6 +109,12 @@ if(ARENGINE_ENABLE_OPENXR)
                 # docs/ARCHITECTURE.md, "XrSession Ownership (M9D)".
                 src/openxr/OpenXRSession.hpp
                 src/openxr/OpenXRSession.cpp
+                # M9E: XR swapchains + the VkImages they expose - the
+                # other genuinely Vulkan-coupled piece of the frame
+                # lifecycle. See docs/ARCHITECTURE.md, "XR Swapchain
+                # Topology (M9E)".
+                src/openxr/OpenXRSwapchain.hpp
+                src/openxr/OpenXRSwapchain.cpp
         )
         # Private, same as OpenXR::openxr_loader above - Vulkan is an
         # implementation detail of this one integration boundary, never
