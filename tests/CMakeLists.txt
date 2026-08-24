@@ -162,6 +162,41 @@ if(ARENGINE_ENABLE_OPENXR)
     target_link_libraries(arengine_openxr_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader)
     target_include_directories(arengine_openxr_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
     target_compile_features(arengine_openxr_demo PRIVATE cxx_std_20)
+
+    # --- M9C: OpenXR/Vulkan integration boundary ---
+    #
+    # Only built when BOTH ARENGINE_ENABLE_OPENXR and
+    # ARENGINE_ENABLE_VULKAN are ON - nested inside the OpenXR block
+    # (not the Vulkan block above) so OPENXR=ON/VULKAN=OFF still builds
+    # and tests everything else in this block. See
+    # docs/ARCHITECTURE.md, "Build Options (M9C)".
+    if(ARENGINE_ENABLE_VULKAN)
+        find_package(Vulkan REQUIRED)
+
+        # Pure-logic OpenXR/Vulkan tests: no real OpenXR or Vulkan API
+        # calls, so no loader/runtime/headset/GPU is required at
+        # runtime — see openxr_vulkan_tests.cpp.
+        add_executable(arengine_openxr_vulkan_tests
+            openxr_vulkan_tests.cpp
+        )
+        target_link_libraries(arengine_openxr_vulkan_tests PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
+        target_include_directories(arengine_openxr_vulkan_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+        target_compile_features(arengine_openxr_vulkan_tests PRIVATE cxx_std_20)
+        add_test(NAME OpenXRVulkanTests COMMAND arengine_openxr_vulkan_tests)
+
+        # Manual-only: requires a real OpenXR loader/runtime with
+        # XR_KHR_vulkan_enable2 support (and ideally a real or
+        # simulated HMD) which CI/headless systems lack. Built by CMake
+        # but deliberately NOT registered with add_test. Run it
+        # directly instead. See docs/ARCHITECTURE.md, "M9C
+        # Implementation Notes".
+        add_executable(arengine_openxr_vulkan_demo
+            openxr_vulkan_demo.cpp
+        )
+        target_link_libraries(arengine_openxr_vulkan_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
+        target_include_directories(arengine_openxr_vulkan_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+        target_compile_features(arengine_openxr_vulkan_demo PRIVATE cxx_std_20)
+    endif()
 endif()
 
 # Manual-only: proves M2's Window works end-to-end with real user

@@ -3911,3 +3911,369 @@ yet. `engine/xr`'s M9A-established structure (`OpenXRInstance`,
 
 No architectural issues were discovered — this was a documentation/
 investigation-only milestone with no code surface to introduce them.
+
+## 26. M9C Implementation Notes
+
+M9C integrates OpenXR with Vulkan far enough to construct every Vulkan
+object a future graphics `XrSession` will need — but stops short of
+creating that session. It proves the whole chain: confirm
+`XR_KHR_vulkan_enable2` is supported → enable it on instance creation →
+query Vulkan graphics requirements → create an XR-compatible
+`VkInstance` (through OpenXR, not the ordinary desktop path) → ask
+OpenXR which `VkPhysicalDevice` to use → find a graphics queue family →
+create an XR-compatible `VkDevice` → retrieve the queue → assemble the
+data a future `XrGraphicsBindingVulkan2KHR` needs. No `XrSession`, no
+swapchain, no Windows presentation surface anywhere in this milestone.
+
+### XR-Vulkan Integration Placement (M9C)
+
+```
+OpenXR
+    |  requirements/device selection
+    v
+XR-Vulkan integration   (engine/xr/src/openxr/OpenXRVulkan*.hpp/.cpp)
+    |
+    v
+Vulkan instance/device/queue
+```
+
+This integration code lives in `engine/xr/src/openxr/`, **not**
+`engine/rendering/src/vulkan/`. The deciding factor: every one of
+M9C's calls that actually produces the Vulkan objects
+(`xrCreateVulkanInstanceKHR`, `xrGetVulkanGraphicsDevice2KHR`,
+`xrCreateVulkanDeviceKHR`) is itself an **OpenXR** API call — OpenXR is
+the API surface driving this work, even though Vulkan types come out
+the other end. Placing it in `Rendering` would make Rendering aware of
+OpenXR (the brief's explicit "avoid" case); placing it in `XR` keeps
+that awareness contained to one small, clearly-marked integration
+boundary, private like every other OpenXR implementation file, and
+never exposed through `XR.hpp` or any other public header.
+
+`engine/xr/CMakeLists.txt` only compiles this boundary (`OpenXRVulkanRequirements.*`,
+`OpenXRVulkanGraphicsBinding.*`) and links `Vulkan::Vulkan` **when both**
+`ARENGINE_ENABLE_OPENXR` and `ARENGINE_ENABLE_VULKAN` are `ON` — nested
+inside the existing OpenXR-only block, so `OPENXR=ON`/`VULKAN=OFF`
+still builds `arengine_xr` exactly as M9A left it, just without this
+one file pair. `XR` therefore never depends on the entire `Rendering`
+module to get here — only on the raw Vulkan SDK, the same relationship
+`Rendering` itself already has with Vulkan. `Rendering`'s own
+`CMakeLists.txt` and every desktop Vulkan file are completely
+untouched by M9C.
+
+### XR_KHR_vulkan_enable2 Selection (M9C)
+
+The M9C demo enumerates instance extensions (reusing M9A's
+`EnumerateInstanceExtensions()`) and calls the new
+`IsExtensionSupported(extensions, name)` helper
+(`OpenXRInstance.hpp` — pure logic over already-queried data, directly
+unit-tested) to explicitly verify `XR_KHR_vulkan_enable2` before ever
+requesting it. **If unsupported, the demo logs a clear message and
+stops** — it does not fall back to the older `XR_KHR_vulkan_enable`
+(the non-"2" extension) or invent another path, per the brief. On this
+development machine's runtime (SteamVR/OpenXR 2.16.7),
+`XR_KHR_vulkan_enable2` is supported, so this path was never actually
+exercised — see "Validation Results" below.
+
+`enable2` (not `enable1`) was chosen because it is architecturally
+simpler for exactly the reason this milestone needs: the app builds a
+normal `VkInstanceCreateInfo`/`VkDeviceCreateInfo` itself and hands it
+to OpenXR, which augments it internally with whatever it needs — no
+separate `xrGetVulkanInstanceExtensionsKHR`/`xrGetVulkanDeviceExtensionsKHR`
+query-and-merge dance `enable1` requires. `enable1`'s functions were
+not implemented at all; there was no real need to after `enable2`
+proved supported.
+
+`OpenXRInstance` (M9A's class) was extended, not replaced: its
+constructor now takes an optional `std::span<const char* const>` of
+extension names to enable, defaulting to empty — M9A's own demo still
+default-constructs it unchanged, requesting zero extensions exactly as
+before. The extension-support check stays the *caller's*
+responsibility (the demo, before construction) rather than something
+`OpenXRInstance` silently validates or degrades on its own — matching
+the brief's "report clearly and stop" instruction, which is a decision
+belonging to the caller with context about what "stop" should mean,
+not to a generic instance-creation wrapper.
+
+### Function Pointer Loading (M9C)
+
+`xrCreateVulkanInstanceKHR`, `xrGetVulkanGraphicsRequirements2KHR`,
+`xrGetVulkanGraphicsDevice2KHR`, and `xrCreateVulkanDeviceKHR` are
+extension functions — not part of the loader's static import table —
+so none of them are assumed directly linkable. `LoadOpenXRVulkanFunctions(instance)`
+(`OpenXRVulkanRequirements.hpp/.cpp`) resolves all four via
+`xrGetInstanceProcAddr` and returns `std::nullopt` (not a
+partially-filled struct) if even one fails to load. `OpenXRVulkanGraphicsBinding`'s
+constructor asserts on `std::nullopt` — by the time this class is
+constructed, `XR_KHR_vulkan_enable2` is already confirmed enabled, so
+any function actually failing to load would be a genuine bug/runtime
+inconsistency, not an ordinary outcome.
+
+### Vulkan Graphics Requirements (M9C)
+
+`xrGetVulkanGraphicsRequirements2KHR` reports `minApiVersionSupported`/
+`maxApiVersionSupported` as `XrVersion` values — **not** Vulkan's own
+`VkVersion` encoding, despite representing a Vulkan version. This is a
+genuinely non-obvious gotcha: `XrVersion` packs major/minor/patch as
+16/16/32 bits (`XR_VERSION_MAJOR`/`MINOR`/`PATCH`), while Vulkan's
+`VK_MAKE_API_VERSION` packs them as 7/10/12 bits — the two are **not**
+bit-reinterpretable. `XrVersionToVkApiVersion` (`OpenXRVulkanRequirements.hpp`)
+decodes via the OpenXR macros (correctly recovering the intended
+Vulkan major/minor, since the runtime encoded them with OpenXR's own
+`XR_MAKE_VERSION` in the first place) and re-encodes via
+`VK_MAKE_API_VERSION` — pure bit manipulation, directly unit-tested
+with a synthetic value chosen specifically to fail if the conversion
+were a naive reinterpret instead. Patch is intentionally dropped on
+both ends (every `VK_API_VERSION_1_x` constant already hard-codes
+patch as 0; Vulkan version comparisons are conventionally
+major.minor-only).
+
+**On this development machine (NVIDIA RTX 3060 Laptop, SteamVR/OpenXR
+2.16.7): reported range 1.0.0 – 1.2.0.**
+
+### Vulkan Version Selection (M9C)
+
+`SelectVulkanApiVersion(preferred, range)` (pure logic, unit-tested)
+keeps AREngine's desktop-matching preferred version (Vulkan 1.2 — see
+below for why this is redeclared locally rather than included from
+Rendering) if it falls inside the runtime's reported range, otherwise
+falls back to the runtime's own minimum — never silently requesting a
+version outside what the runtime declared. **1.2 fell inside the
+reported 1.0–1.2 range on this machine, so 1.2 was kept**, per the
+brief's explicit preference. `kPreferredVulkanApiVersion` (`VK_API_VERSION_1_2`)
+is redeclared as a small local constant in `OpenXRVulkanGraphicsBinding.cpp`
+rather than `#include`d from Rendering's private `VulkanVersion.hpp` —
+one duplicated constant is a far smaller cost than a cross-module
+header dependency between `XR` and `Rendering`'s private
+implementation.
+
+### XR-Controlled VkInstance Creation (M9C)
+
+The XR-compatible `VkInstance` is created via `xrCreateVulkanInstanceKHR`
+(`XrVulkanInstanceCreateInfoKHR{ systemId, vkGetInstanceProcAddr, &vulkanCreateInfo,
+vulkanAllocator=nullptr }`) — **not** the ordinary `vkCreateInstance`
+desktop path (`VulkanInstance.cpp`), and returns **both** an `XrResult`
+(did OpenXR itself process the request) and a `VkResult` (did the
+`vkCreateInstance` call OpenXR performed internally succeed) — both are
+checked. `vulkanCreateInfo` is a completely ordinary `VkInstanceCreateInfo`
+AREngine builds itself: an application info block with the selected
+Vulkan API version, and — for `enable2` specifically — no instance
+extensions/layers are *required* by the runtime (unlike `enable1`,
+which needs the app to query and merge the runtime's own required
+extension list first; this is exactly the simplification that made
+`enable2` the right choice here). The only extension/layer AREngine
+adds is `VK_LAYER_KHRONOS_validation` + `VK_EXT_debug_utils`, and only
+when validation is genuinely available.
+
+### Vulkan Validation (M9C)
+
+**Preserved, not lost, when OpenXR participates in instance creation.**
+The same debug-build-only, availability-gated pattern
+`VulkanInstance.cpp` already uses (`vkEnumerateInstanceLayerProperties`
+→ enable `VK_LAYER_KHRONOS_validation` + `VK_EXT_debug_utils` if
+present) is re-implemented (not shared/imported, for the same
+decoupling reasoning as everywhere else in this integration boundary)
+inside `OpenXRVulkanGraphicsBinding`'s constructor, and a debug
+messenger is attached to the resulting `VkInstance` exactly as the
+desktop path attaches one to its own — logging through the same
+`AR_LOG_ERROR`/`WARNING`/`INFO` calls, prefixed `[OpenXR/Vulkan]`
+instead of `[Vulkan]` so the two paths' output stays distinguishable
+in a shared log. **Confirmed working on the manual run**: the log shows
+`VK_LAYER_KHRONOS_validation` genuinely inserted into the XR-created
+instance's layer callstack, with zero validation errors or warnings
+for the entire bring-up.
+
+### XR-Controlled Physical Device Selection (M9C)
+
+The `VkPhysicalDevice` comes from `xrGetVulkanGraphicsDevice2KHR`
+(`XrVulkanGraphicsDeviceGetInfoKHR{ systemId, vulkanInstance }`) — this
+is **authoritative**, not `Rendering::Vulkan`'s own desktop ranking
+algorithm (`SelectPhysicalDevice`/`RankPhysicalDeviceType`), which is
+never called anywhere in this path. On a machine with multiple GPUs,
+only OpenXR knows which one is actually driving the headset's output;
+AREngine's own "prefer discrete over integrated" heuristic has no way
+to know that and must not second-guess it. **On this development
+machine, OpenXR selected the same NVIDIA GeForce RTX 3060 Laptop GPU
+the desktop path already selects** — a useful diagnostic confirmation
+(this machine only has one real GPU, so agreement was expected), but
+the code never requires or checks for this agreement; a machine with a
+dedicated XR-only GPU alongside a desktop GPU would legitimately see
+them differ.
+
+### Queue Family Selection (M9C)
+
+`FindGraphicsQueueFamily` (`OpenXRVulkanGraphicsBinding.hpp/.cpp`) is a
+fresh, self-contained copy of the same ~10 lines `Rendering::Vulkan::FindGraphicsQueueFamily`
+(`VulkanPhysicalDevice.hpp`) already implements — deliberately
+duplicated, not imported, for the same cross-module decoupling
+reasoning as everywhere else in this file. No `VkSurfaceKHR`/
+presentation support is queried at all (unlike the desktop's
+`FindPresentQueueFamily`) — there is no Windows surface anywhere in
+this XR path, only a plain graphics-capable queue family.
+`queueIndex` is always `0` — no concrete reason on this hardware to
+request anything else. **Selected on this machine: queue family index
+0, queue index 0** — confirmed by actually retrieving the `VkQueue`
+handle via `vkGetDeviceQueue` (non-null), not just asserting an index
+looked plausible.
+
+### XR-Controlled VkDevice Creation (M9C)
+
+Created via `xrCreateVulkanDeviceKHR` (`XrVulkanDeviceCreateInfoKHR{
+systemId, vkGetInstanceProcAddr, vulkanPhysicalDevice, &vulkanCreateInfo }`)
+— not `vkCreateDevice`. `vulkanCreateInfo` requests **one queue, one
+family, zero device extensions, and no `pEnabledFeatures`** — in
+particular, deliberately **no `VK_KHR_swapchain`**, even though the
+desktop `VulkanDevice` enables it: OpenXR owns its own swapchains
+starting at M9E, and a Windows presentation swapchain extension has no
+relevance to a device this XR path will never present to a
+`VkSurfaceKHR` with. No optional GPU feature is requested speculatively
+either — nothing in M9C needs one.
+
+### Graphics Binding Data (M9C)
+
+`VulkanGraphicsBindingData` (`OpenXRVulkanGraphicsBinding.hpp`) is a
+plain struct mirroring `XrGraphicsBindingVulkan2KHR`'s real fields
+exactly (`instance`, `physicalDevice`, `device`, `queueFamilyIndex`,
+`queueIndex` — minus `type`/`next`), plus an `IsValid()` predicate
+(non-null instance/physicalDevice/device) that is pure logic and
+directly unit-tested (including with fake-but-non-null handle values,
+proving the check genuinely requires all three, not just one). M9D can
+construct `XrGraphicsBindingVulkan2KHR` directly from this data with no
+translation step. **In simple English**: this struct is the exact
+paperwork OpenXR will ask for when it's finally time to say "render
+into this headset using this Vulkan setup" — M9C proves every field on
+that paperwork is filled in correctly, without actually submitting it
+yet.
+
+### Ownership / Destruction Order (M9C)
+
+- **`XrInstance` / `XrSystemId`**: borrowed, not owned, by
+  `OpenXRVulkanGraphicsBinding`. `XrSystemId` is never destroyed by
+  anyone (it is an opaque identifier, not a resource — unchanged from
+  M9A). The caller (the demo) must keep its `OpenXRInstance` alive for
+  `OpenXRVulkanGraphicsBinding`'s entire lifetime; this is guaranteed
+  by **explicit declaration order**, not left as fragile happenstance:
+  the demo declares `OpenXRInstance instance` before constructing
+  `OpenXRVulkanGraphicsBinding binding`, so C++'s reverse-local-
+  destruction-order rule destroys `binding` first and `instance` last
+  — documented with an inline comment at both the class declaration and
+  the demo's own construction site, not left implicit.
+- **`VkInstance` / `VkDevice` / debug messenger**: owned by
+  `OpenXRVulkanGraphicsBinding`, destroyed in its destructor in the
+  order debug messenger → `VkDevice` → `VkInstance` (a device must
+  never outlive the instance it was created from).
+- **`VkPhysicalDevice`**: never destroyed by an application at all
+  (Vulkan physical devices are driver-owned, enumerated/queried
+  handles) — `OpenXRVulkanGraphicsBinding` never attempts to.
+  **`VkQueue`**: owned implicitly by the `VkDevice` that created it;
+  also never separately destroyed.
+
+### Why the M8 Desktop Vulkan Objects Are Not Reused (M9C)
+
+The M8 desktop `VulkanInstance`/`VulkanDevice` (created via ordinary
+`vkCreateInstance`/`vkCreateDevice`, driving the M8 window/swapchain
+path) are **completely separate** from M9C's XR-compatible objects —
+never handed to OpenXR, never shared. Per the OpenXR spec,
+`XR_KHR_vulkan_enable2` requires the app's Vulkan instance/device to be
+created *through* OpenXR's own functions specifically so the runtime
+can guarantee compatibility with whatever compositor/driver path it
+uses internally — an instance created independently via plain
+`vkCreateInstance` has no such guarantee and is not a valid substitute,
+regardless of which extensions/layers it happens to enable. M9C
+therefore builds a second, independent Vulkan instance/device pair.
+Whether and how much of this eventually gets unified with the desktop
+path is deliberately left undecided — "we can decide how much code to
+unify later after real evidence" (the brief's own words) — one working
+XR path and one working desktop path is not yet evidence for what a
+shared abstraction should look like. The M8 desktop demo
+(`arengine_vulkan_present_demo`) is completely unmodified and continues
+working independently.
+
+### Why the Desktop VkSurfaceKHR/Swapchain Is Absent (M9C)
+
+No `VkSurfaceKHR`, no Win32 Vulkan surface, no `VK_KHR_swapchain`, no
+present queue, anywhere in this integration boundary. Those are
+Windows *desktop presentation* concepts — a `VkSurfaceKHR` represents
+a native window's drawable surface, and `VK_KHR_swapchain` is how an
+app presents rendered images to that surface. **OpenXR presentation
+works completely differently**: the runtime's compositor owns its own
+swapchains (`xrCreateSwapchain`, arriving in M9E) backed by images the
+runtime itself allocates and hands to the app — there is no window,
+and no Windows presentation surface of any kind in the loop. Requesting
+`VK_KHR_swapchain` on this device would be requesting a capability this
+XR path has no use for and no window to ever use it with.
+
+### Build Options (M9C)
+
+M9C's new sources (`OpenXRVulkanRequirements.*`, `OpenXRVulkanGraphicsBinding.*`
+in `engine/xr/`; `openxr_vulkan_tests.cpp`, `openxr_vulkan_demo.cpp` in
+`tests/`) are gated behind **both** `ARENGINE_ENABLE_OPENXR=ON` **and**
+`ARENGINE_ENABLE_VULKAN=ON` — nested `if(ARENGINE_ENABLE_VULKAN)` blocks
+inside the existing `if(ARENGINE_ENABLE_OPENXR)` blocks in both
+`engine/xr/CMakeLists.txt` and `tests/CMakeLists.txt`. All four
+combinations were verified this milestone (see "Validation Results"):
+`OPENXR=ON`/`VULKAN=ON` (13/13 tests, full M9C path), `OPENXR=OFF`/`VULKAN=ON`
+(11/11, unaffected), `OPENXR=ON`/`VULKAN=OFF` (11/11, no Vulkan
+coupling — `arengine_xr` builds without this file pair at all), and
+`OPENXR=OFF`/`VULKAN=OFF` (10/10, unaffected). No link errors in any
+combination.
+
+### Validation Results (M9C)
+
+`ARENGINE_ENABLE_OPENXR=ON`/`ARENGINE_ENABLE_VULKAN=ON`: full `/W4 /WX`
+clean build (including the fetched OpenXR-SDK loader and all M9C
+sources), `ctest` **13/13** (new `OpenXRVulkanTests` — 10 pure-logic
+checks covering `XrVersionToVkApiVersion`'s conversion correctness,
+`FormatVkApiVersion`, `IsVulkanApiVersionSupported`/`SelectVulkanApiVersion`'s
+range logic, `FindGraphicsQueueFamily`, and `VulkanGraphicsBindingData::IsValid()`;
+`OpenXRTests` gained `TestIsExtensionSupported`).
+
+`arengine_openxr_vulkan_demo` run against the live SteamVR/OpenXR 2.16.7
+null-driver runtime (see `docs/ARCHITECTURE.md` Section 25):
+
+```
+XR_KHR_vulkan_enable2: supported, enabled
+Active runtime: SteamVR/OpenXR (version 2.16.7)
+XrSystemId: 1152951414759096766, system name: "SteamVR/OpenXR : null"
+Vulkan API version range supported: 1.0.0 - 1.2.0
+Vulkan API version selected: 1.2.0 (AREngine's desktop preference - in range, so kept)
+Vulkan validation layer: enabled (VK_LAYER_KHRONOS_validation genuinely
+    inserted into the XR-created instance's layer callstack)
+OpenXR-selected GPU: NVIDIA GeForce RTX 3060 Laptop GPU (discrete GPU)
+OpenXR-selected GPU's own Vulkan API version: 1.4.325
+Graphics queue family index: 0, queue index: 0, VkQueue: non-null
+Graphics-binding data valid: true
+```
+
+**Zero Vulkan validation errors or warnings** — confirmed both visually
+(the log contains only `[OpenXR/Vulkan]`-prefixed `INFO`-level layer
+setup messages) and programmatically (grepped for
+warn/error/fail — no matches). Exit code 0 on every run. No `XrSession`
+was created (confirmed by code inspection — `xrCreateSession` does not
+appear anywhere in this milestone's source) and no `VkSurfaceKHR`/
+desktop swapchain exists anywhere in the XR path (confirmed the same
+way).
+
+- Files changed: see the file list in the final chat report (kept out
+  of this document to avoid duplicating a list that changes with every
+  commit).
+
+### What's Deferred to M9D+
+
+No `XrSession`, no `xrCreateSession`, no session-state handling, no
+reference spaces, no XR swapchains, no `xrEnumerateSwapchainFormats`,
+no `xrCreateSwapchain`, no frame lifecycle
+(`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`), no `xrLocateViews`, no
+stereo rendering, no `XRFrameDriver`, no controllers/actions, no hand/
+eye tracking, no passthrough, no spatial anchors, no Scene rendering,
+no headset frame submission. `OpenXRVulkanGraphicsBinding`'s
+`VulkanGraphicsBindingData` is genuinely ready to be handed directly
+into an `XrGraphicsBindingVulkan2KHR` the moment M9D needs one — that
+translation is the only thing M9D adds on the graphics-binding side;
+everything else about M9D (session creation itself, state-change
+handling via `xrPollEvent`, reference spaces) is new work.
+
+No architectural issues were discovered — the extension-support check,
+function-pointer loading, requirements query, XR-controlled instance/
+device creation, physical-device/queue selection, and validation-layer
+preservation all worked correctly on the first real-runtime run, with
+zero validation warnings to investigate.

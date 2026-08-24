@@ -69,6 +69,33 @@ if(ARENGINE_ENABLE_OPENXR)
     # src/openxr/ (never named in XR.hpp or any other public XR
     # header), same discipline Rendering already applies to Vulkan.
     target_link_libraries(arengine_xr PRIVATE OpenXR::openxr_loader)
+
+    # --- M9C: OpenXR/Vulkan integration boundary ---
+    #
+    # Only compiled when BOTH capabilities are enabled - this is the
+    # one place in the XR module that needs Vulkan at all, and only for
+    # this specific, narrow purpose (constructing the Vulkan objects a
+    # future graphics XrSession's binding will need, via OpenXR's own
+    # XR_KHR_vulkan_enable2 creation functions - see
+    # docs/ARCHITECTURE.md, "XR-Vulkan Integration Placement (M9C)").
+    # Guarded independently of the OpenXR-only sources above so
+    # ARENGINE_ENABLE_OPENXR=ON with ARENGINE_ENABLE_VULKAN=OFF still
+    # builds arengine_xr - just without this file.
+    if(ARENGINE_ENABLE_VULKAN)
+        find_package(Vulkan REQUIRED)
+
+        target_sources(arengine_xr
+            PRIVATE
+                src/openxr/OpenXRVulkanRequirements.hpp
+                src/openxr/OpenXRVulkanRequirements.cpp
+                src/openxr/OpenXRVulkanGraphicsBinding.hpp
+                src/openxr/OpenXRVulkanGraphicsBinding.cpp
+        )
+        # Private, same as OpenXR::openxr_loader above - Vulkan is an
+        # implementation detail of this one integration boundary, never
+        # named in any public XR header.
+        target_link_libraries(arengine_xr PRIVATE Vulkan::Vulkan)
+    endif()
 endif()
 
 target_include_directories(arengine_xr

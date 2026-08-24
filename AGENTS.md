@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -321,15 +321,55 @@ was ruled out (platform retired on this Windows build). See
 reasoning. Installation awaits explicit approval — nothing was
 installed this milestone.
 
+**M9C integrates OpenXR with Vulkan** far enough to construct every
+Vulkan object a future graphics `XrSession` will need, but stops short
+of creating that session. `XR_KHR_vulkan_enable2` support is explicitly
+verified (`OpenXRInstance::IsExtensionSupported`, new this milestone)
+before being enabled on instance creation — if unsupported, the demo
+reports that clearly and stops rather than falling back to the older
+`XR_KHR_vulkan_enable`. A new private integration boundary,
+`engine/xr/src/openxr/OpenXRVulkanRequirements.*`/`OpenXRVulkanGraphicsBinding.*`,
+resolves the four required `XR_KHR_vulkan_enable2` functions via
+`xrGetInstanceProcAddr` (never assumed linkable), queries the runtime's
+Vulkan API version range and converts it correctly from `XrVersion`'s
+16/16/32-bit packing to Vulkan's own 7/10/12-bit `VkVersion` encoding
+(the two are not bit-reinterpretable — a real gotcha this milestone
+documents carefully), creates an XR-compatible `VkInstance`/`VkDevice`
+pair through OpenXR's own creation functions (`xrCreateVulkanInstanceKHR`/
+`xrCreateVulkanDeviceKHR` — **not** the ordinary desktop
+`vkCreateInstance`/`vkCreateDevice` path), asks OpenXR which
+`VkPhysicalDevice` to use (authoritative, not `Rendering`'s own desktop
+ranking algorithm), finds a graphics queue family (no `VkSurfaceKHR`/
+presentation involved — there is no Windows surface anywhere in this
+XR path), and assembles a `VulkanGraphicsBindingData` struct ready to
+become a real `XrGraphicsBindingVulkan2KHR` in M9D. Vulkan validation
+is preserved through the XR-created instance (confirmed on the real
+run: `VK_LAYER_KHRONOS_validation` genuinely inserted, zero validation
+errors/warnings). This integration code lives in `engine/xr`, not
+`engine/rendering` — every call driving it is itself an OpenXR call,
+and this keeps `Rendering` completely unaware OpenXR exists; `arengine_xr`
+only links Vulkan when **both** `ARENGINE_ENABLE_OPENXR` and
+`ARENGINE_ENABLE_VULKAN` are `ON`, verified not to create link errors
+in any of the four build-option combinations. The M8 desktop Vulkan
+objects are never reused or handed to OpenXR — a second, independent
+Vulkan instance/device pair is created, since the spec requires
+XR-bound Vulkan objects to be created *through* OpenXR's own functions
+for compositor compatibility. Run against the live SteamVR/OpenXR
+2.16.7 null-driver runtime (see Section 25): reported Vulkan range
+1.0.0–1.2.0, selected 1.2.0 (AREngine's desktop preference, in range),
+OpenXR-selected GPU matched the desktop's own (NVIDIA RTX 3060 Laptop),
+zero validation errors, clean shutdown, no `XrSession` created. See
+`docs/ARCHITECTURE.md` Section 26 for full details.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, and no `XrSession`/graphics binding/Vulkan-OpenXR bridge/
-frame loop/head tracking/controllers — see Sections 11–15. `Editor` is
-still an M0-style stub with no functionality. Next up is M9C (Vulkan/
-OpenXR graphics requirements and graphics binding) or M8I+ (Scene
-integration, still pending within M8) — see `docs/ROADMAP.md` for the
-full plan.
+system, and no `XrSession`/session-state handling/reference spaces/XR
+swapchain/frame loop/head tracking/controllers — see Sections 11–15.
+`Editor` is still an M0-style stub with no functionality. Next up is
+M9D (`XrSession` + session-state handling + reference spaces) or M8I+
+(Scene integration, still pending within M8) — see `docs/ROADMAP.md`
+for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -343,16 +383,13 @@ full plan.
    loading, no uniform buffers, no `SceneRenderer`/Scene integration,
    no `MeshAsset`/model loading yet — see `docs/ROADMAP.md`'s M8I+ row
    for what's still pending within M8.
-3a. **OpenXR instance/system discovery only so far (M9A–M9B)**: no
-   `XrSession`, no graphics binding, no Vulkan/OpenXR bridge, no XR
-   swapchain, no frame loop (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/
-   `xrLocateViews`), no reference spaces, no head/hand/eye tracking, no
-   passthrough, no anchors, no `XRFrameDriver`. **`XrSession` must not
-   be implemented before M9C's Vulkan/OpenXR graphics binding exists** —
-   see `docs/ROADMAP.md`'s M9C row and `docs/ARCHITECTURE.md` Section
-   25 for why. No OpenXR runtime/simulator has been installed on the
-   development machine yet either — see Section 25's recommendation,
-   pending separate approval to install.
+3a. **OpenXR instance/system discovery + Vulkan graphics-binding
+   bring-up only so far (M9A–M9C)**: no `XrSession`, no session-state
+   handling, no reference spaces, no XR swapchain, no frame loop
+   (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/`xrLocateViews`), no
+   head/hand/eye tracking, no passthrough, no anchors, no
+   `XRFrameDriver`. `XrSession` may now be implemented (M9C's graphics
+   binding exists) — see `docs/ROADMAP.md`'s M9D row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

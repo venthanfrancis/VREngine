@@ -12,6 +12,7 @@
 // arengine_openxr_demo — not part of this suite, since CTest must not
 // depend on an XR runtime or headset being present.
 
+#include "openxr/OpenXRInstance.hpp"
 #include "openxr/OpenXRResult.hpp"
 #include "openxr/OpenXRSystem.hpp"
 #include "openxr/OpenXRVersion.hpp"
@@ -84,6 +85,28 @@ namespace
         Check(!IsFormFactorUnavailable(XR_SUCCESS),
               "XR_SUCCESS is not reported as a form-factor-unavailable failure");
     }
+
+    XrExtensionProperties MakeExtension(const char* name)
+    {
+        XrExtensionProperties extension{XR_TYPE_EXTENSION_PROPERTIES};
+        std::snprintf(extension.extensionName, sizeof(extension.extensionName), "%s", name);
+        return extension;
+    }
+
+    void TestIsExtensionSupported()
+    {
+        const std::vector<XrExtensionProperties> extensions{
+            MakeExtension("XR_KHR_composition_layer_depth"),
+            MakeExtension("XR_KHR_vulkan_enable2"),
+            MakeExtension("XR_EXT_hand_tracking"),
+        };
+        Check(IsExtensionSupported(extensions, "XR_KHR_vulkan_enable2"),
+              "IsExtensionSupported finds an extension present in the list");
+        Check(!IsExtensionSupported(extensions, "XR_KHR_vulkan_enable"),
+              "IsExtensionSupported does not match a similarly-named but different extension (no substring match)");
+        Check(!IsExtensionSupported({}, "XR_KHR_vulkan_enable2"),
+              "IsExtensionSupported on an empty list returns false, not a crash");
+    }
 }
 
 int main()
@@ -93,6 +116,7 @@ int main()
     TestXrResultToReadableStringNumericFallback();
     TestXrResultToReadableStringSuccessFallback();
     TestIsFormFactorUnavailable();
+    TestIsExtensionSupported();
 
     if (g_failureCount == 0)
     {

@@ -6,6 +6,7 @@
 #include "AREngine/Core/Log.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace AREngine::XR::OpenXR
 {
@@ -63,6 +64,18 @@ namespace AREngine::XR::OpenXR
         return extensions;
     }
 
+    bool IsExtensionSupported(const std::vector<XrExtensionProperties>& extensions, const char* name)
+    {
+        for (const XrExtensionProperties& extension : extensions)
+        {
+            if (std::strcmp(extension.extensionName, name) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     namespace
     {
         // applicationVersion/engineVersion (below) are plain,
@@ -75,7 +88,7 @@ namespace AREngine::XR::OpenXR
         constexpr std::uint32_t kAppEngineVersion = 0 * 10000 + 1 * 100 + 0; // 0.1.0
     }
 
-    OpenXRInstance::OpenXRInstance()
+    OpenXRInstance::OpenXRInstance(std::span<const char* const> requestedExtensions)
     {
         XrApplicationInfo appInfo{};
         std::snprintf(appInfo.applicationName, sizeof(appInfo.applicationName), "AREngine OpenXR Demo");
@@ -87,8 +100,11 @@ namespace AREngine::XR::OpenXR
         XrInstanceCreateInfo createInfo{};
         createInfo.type = XR_TYPE_INSTANCE_CREATE_INFO;
         createInfo.applicationInfo = appInfo;
-        // enabledApiLayerCount/enabledExtensionCount left at zero - see
-        // the class comment in OpenXRInstance.hpp.
+        // enabledApiLayerCount left at zero - see the class comment in
+        // OpenXRInstance.hpp. enabledExtensionNames/Count come directly
+        // from the caller's already-verified list (M9A's default: none).
+        createInfo.enabledExtensionCount = static_cast<std::uint32_t>(requestedExtensions.size());
+        createInfo.enabledExtensionNames = requestedExtensions.data();
 
         m_creationResult = xrCreateInstance(&createInfo, &m_instance);
         if (XR_FAILED(m_creationResult))
