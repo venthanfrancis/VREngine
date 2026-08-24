@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -356,20 +356,77 @@ Vulkan instance/device pair is created, since the spec requires
 XR-bound Vulkan objects to be created *through* OpenXR's own functions
 for compositor compatibility. Run against the live SteamVR/OpenXR
 2.16.7 null-driver runtime (see Section 25): reported Vulkan range
-1.0.0–1.2.0, selected 1.2.0 (AREngine's desktop preference, in range),
-OpenXR-selected GPU matched the desktop's own (NVIDIA RTX 3060 Laptop),
-zero validation errors, clean shutdown, no `XrSession` created. See
-`docs/ARCHITECTURE.md` Section 26 for full details.
+1.0.0–1.2.0, OpenXR-selected GPU matched the desktop's own (NVIDIA RTX
+3060 Laptop), zero validation errors, clean shutdown, no `XrSession`
+created. See `docs/ARCHITECTURE.md` Section 26 for full details. (M9D's
+real session creation briefly revealed an incompatibility at 1.2 that
+mere instance/device creation couldn't have caught, and briefly capped
+this device's selected version to 1.1 as a fix — a follow-up
+compatibility review found the cap unnecessary once the underlying
+fix was corrected; this device genuinely selects **1.2** today, same
+as the desktop renderer. See below.)
+
+**M9D creates AREngine's first real `XrSession`**, reusing the M9C
+Vulkan graphics binding unchanged (no second Vulkan device):
+`XrGraphicsBindingVulkan2KHR` built from `VulkanGraphicsBindingData`
+and chained through `XrSessionCreateInfo::next` via the new
+`OpenXRSession` class (`engine/xr/src/openxr/OpenXRSession.hpp/.cpp`,
+Vulkan-gated, alongside M9C's files). `XrSessionState` is tracked
+through a real `xrPollEvent` loop (`PollSessionEvents`, draining every
+pending event each cycle) and three small `constexpr` decision
+functions (`OpenXRSessionState.hpp` — Vulkan-independent, like
+`OpenXRViewConfiguration.hpp`/`OpenXRReferenceSpace.hpp`, since session
+state/view configuration/reference spaces are pure OpenXR concepts):
+`ShouldBeginSession` (fires only on `READY`), `ShouldEndSession` (fires
+only on `STOPPING` while already running — `sessionRunning` tracked
+separately from `XrSessionState`, never inferred from it), and
+`ShouldStopMainLoop` (`EXITING`/`LOSS_PENDING`). View configurations
+were enumerated (`PRIMARY_STEREO` was the only, and thus selected,
+type; 2 views, each 1852x2056 recommended/8192x8192 max), and all three
+reference space types the runtime supports (`VIEW`, `LOCAL`, `STAGE`)
+were created via `OpenXRReferenceSpace`. **The observed SteamVR/null
+state sequence was `READY -> STOPPING -> EXITING`** —
+`SYNCHRONIZED`/`VISIBLE`/`FOCUSED` were never reached, confirmed to be
+because those require frame-loop participation (`xrWaitFrame`) that
+M9D explicitly must not call; the demo now requests a clean exit
+immediately once the session starts running rather than waiting for an
+unreachable `FOCUSED`.
+
+Real session creation against SteamVR surfaced a genuine Vulkan
+device-feature requirement M9C's narrower testing (instance/device
+creation only, no session) couldn't have caught: SteamVR's own
+compositor shaders need `shaderOutputViewportIndex`/`shaderOutputLayer`
+and `geometryShader`, and SteamVR's `xrCreateVulkanDeviceKHR`
+unconditionally injects its own `VkPhysicalDeviceTimelineSemaphoreFeatures`
+into the device's `pNext` chain in a way that conflicts with any
+app-provided `VkPhysicalDeviceVulkan12Features`. **M9D's first fix
+capped the XR device's selected Vulkan version to 1.1 whenever 1.2+
+would otherwise be picked — a compatibility review immediately after
+M9D's approval, before M9E began, caught that this cap was broader
+than the evidence justified** (it would have silently downgraded
+every future runtime, not just SteamVR) **and found it was no longer
+even necessary**: the corrected fix satisfies both shader capabilities
+via the plain `VK_EXT_shader_viewport_index_layer` device extension
+(no feature struct to conflict with anything) and `geometryShader` via
+`pEnabledFeatures`, neither of which touches the struct that actually
+conflicted — so **the version cap was removed entirely**, re-tested,
+and confirmed working: the XR device now genuinely selects **1.2**
+(matching the desktop renderer, with zero exception logic anywhere in
+the code) against the same real runtime, still with zero Vulkan
+validation errors. `SelectVulkanApiVersion`'s output is used
+unmodified. Applies only to the XR-compatible device — the M8 desktop
+device keeps its unchanged, deliberately minimal feature set. See
+`docs/ARCHITECTURE.md` Section 27, "Vulkan Device Feature Requirement
+Discovered in M9D," for the full investigation.
 
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, and no `XrSession`/session-state handling/reference spaces/XR
-swapchain/frame loop/head tracking/controllers — see Sections 11–15.
-`Editor` is still an M0-style stub with no functionality. Next up is
-M9D (`XrSession` + session-state handling + reference spaces) or M8I+
-(Scene integration, still pending within M8) — see `docs/ROADMAP.md`
-for the full plan.
+system, and no XR swapchain/frame loop/`xrLocateViews`/`xrLocateSpace`/
+head tracking/controllers — see Sections 11–15. `Editor` is still an
+M0-style stub with no functionality. Next up is M9E (XR swapchains +
+frame lifecycle) or M8I+ (Scene integration, still pending within M8)
+— see `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -383,13 +440,13 @@ for the full plan.
    loading, no uniform buffers, no `SceneRenderer`/Scene integration,
    no `MeshAsset`/model loading yet — see `docs/ROADMAP.md`'s M8I+ row
    for what's still pending within M8.
-3a. **OpenXR instance/system discovery + Vulkan graphics-binding
-   bring-up only so far (M9A–M9C)**: no `XrSession`, no session-state
-   handling, no reference spaces, no XR swapchain, no frame loop
+3a. **OpenXR instance/system discovery + Vulkan graphics-binding +
+   XrSession/session-state/reference-space bring-up only so far
+   (M9A–M9D)**: no XR swapchain, no frame loop
    (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/`xrLocateViews`), no
-   head/hand/eye tracking, no passthrough, no anchors, no
-   `XRFrameDriver`. `XrSession` may now be implemented (M9C's graphics
-   binding exists) — see `docs/ROADMAP.md`'s M9D row.
+   `xrLocateSpace` for tracking, no head/hand/eye tracking, no
+   passthrough, no anchors, no `XRFrameDriver`. See
+   `docs/ROADMAP.md`'s M9E row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

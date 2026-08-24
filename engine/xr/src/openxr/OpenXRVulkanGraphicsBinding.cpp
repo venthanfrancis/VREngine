@@ -122,6 +122,17 @@ namespace AREngine::XR::OpenXR
             "xrGetVulkanGraphicsRequirements2KHR");
         m_supportedVersionRange = DecodeVulkanVersionRange(requirements.minApiVersionSupported, requirements.maxApiVersionSupported);
         m_selectedVulkanApiVersion = SelectVulkanApiVersion(kPreferredVulkanApiVersion, m_supportedVersionRange);
+        // No static version cap: the confirmed conflict (see the device-
+        // creation block below) was specifically between an
+        // app-provided VkPhysicalDeviceVulkan12Features and a runtime-
+        // injected VkPhysicalDeviceTimelineSemaphoreFeatures. Since
+        // device creation below never chains VkPhysicalDeviceVulkan12Features
+        // (or any Features2 wrapper) at all, that conflict cannot occur
+        // regardless of the selected API version - so the version this
+        // object requests is purely SelectVulkanApiVersion's own
+        // capability-driven decision, unmodified. See
+        // docs/ARCHITECTURE.md, "Vulkan Device Feature Requirement
+        // Discovered in M9D".
 
         // --- XR-compatible VkInstance (see docs/ARCHITECTURE.md,
         // "XR-Controlled VkInstance Creation (M9C)") ---
@@ -251,14 +262,64 @@ namespace AREngine::XR::OpenXR
         queueCreateInfo.queueCount = 1;
         queueCreateInfo.pQueuePriorities = &kQueuePriority;
 
+        // This XR-compatible device is used internally by the OpenXR
+        // runtime's own compositor (its shaders are compiled against
+        // THIS VkDevice the moment xrCreateSession runs - M9D's own
+        // manual validation hit this directly: SteamVR's compositor
+        // failed vkCreateShaderModule for a missing geometryShader
+        // capability, and separately for a missing
+        // shaderOutputViewportIndex/shaderOutputLayer capability).
+        // AREngine cannot inspect or control what a third-party
+        // compositor's shaders actually need, so - for THIS device
+        // only, never the M8 desktop device, which keeps its
+        // deliberately minimal M8A-established feature set - every
+        // core 1.0 feature the physical device genuinely reports
+        // supporting (queried via vkGetPhysicalDeviceFeatures, never
+        // assumed) is enabled. Not speculative: nothing is requested
+        // beyond what the hardware/driver already advertises. See
+        // docs/ARCHITECTURE.md, "Vulkan Device Feature Requirement
+        // Discovered in M9D".
+        VkPhysicalDeviceFeatures enabledFeatures{};
+        vkGetPhysicalDeviceFeatures(m_bindingData.physicalDevice, &enabledFeatures);
+
+        // shaderOutputViewportIndex/shaderOutputLayer are satisfied via
+        // the plain VK_EXT_shader_viewport_index_layer device extension
+        // - deliberately NOT the Vulkan-1.2-core VkPhysicalDeviceVulkan12Features
+        // feature bits, which is what actually caused the confirmed
+        // conflict with this runtime's own feature-struct injection
+        // (see the comment on `m_selectedVulkanApiVersion`'s computation
+        // above). The extension has no feature struct of its own, so it
+        // has nothing to conflict with, at any Vulkan version this
+        // object might select. Availability is checked, never assumed;
+        // on a device that doesn't support it, this proceeds without
+        // it - a compositor shader that genuinely needs the capability
+        // would then fail on its own terms, which is a property of that
+        // compositor/device pairing, not something this narrow fix
+        // needs to solve more generally.
+        std::uint32_t deviceExtensionCount = 0;
+        vkEnumerateDeviceExtensionProperties(m_bindingData.physicalDevice, nullptr, &deviceExtensionCount, nullptr);
+        std::vector<VkExtensionProperties> availableDeviceExtensions(deviceExtensionCount);
+        vkEnumerateDeviceExtensionProperties(m_bindingData.physicalDevice, nullptr, &deviceExtensionCount, availableDeviceExtensions.data());
+
+        std::vector<const char*> enabledDeviceExtensions;
+        for (const VkExtensionProperties& extension : availableDeviceExtensions)
+        {
+            if (std::strcmp(extension.extensionName, "VK_EXT_shader_viewport_index_layer") == 0)
+            {
+                enabledDeviceExtensions.push_back("VK_EXT_shader_viewport_index_layer");
+                break;
+            }
+        }
+
         VkDeviceCreateInfo vulkanDeviceCreateInfo{};
         vulkanDeviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        vulkanDeviceCreateInfo.pEnabledFeatures = &enabledFeatures;
         vulkanDeviceCreateInfo.queueCreateInfoCount = 1;
         vulkanDeviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
-        // No device extensions (deliberately no VK_KHR_swapchain - see
-        // docs/ARCHITECTURE.md, "Why the Desktop VkSurfaceKHR/Swapchain
-        // Is Absent (M9C)") and no pEnabledFeatures (no optional GPU
-        // feature is needed yet - nothing speculative).
+        vulkanDeviceCreateInfo.enabledExtensionCount = static_cast<std::uint32_t>(enabledDeviceExtensions.size());
+        vulkanDeviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.data();
+        // No VK_KHR_swapchain - see docs/ARCHITECTURE.md, "Why the
+        // Desktop VkSurfaceKHR/Swapchain Is Absent (M9C)".
 
         XrVulkanDeviceCreateInfoKHR xrDeviceCreateInfo{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
         xrDeviceCreateInfo.systemId = systemId;

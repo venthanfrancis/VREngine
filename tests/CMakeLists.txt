@@ -163,6 +163,18 @@ if(ARENGINE_ENABLE_OPENXR)
     target_include_directories(arengine_openxr_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
     target_compile_features(arengine_openxr_demo PRIVATE cxx_std_20)
 
+    # Pure-logic OpenXR session-lifecycle tests (M9D): session-state
+    # formatting/decisions, view-configuration selection, reference-
+    # space selection. No real OpenXR calls and no Vulkan dependency -
+    # see openxr_session_tests.cpp.
+    add_executable(arengine_openxr_session_tests
+        openxr_session_tests.cpp
+    )
+    target_link_libraries(arengine_openxr_session_tests PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader)
+    target_include_directories(arengine_openxr_session_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+    target_compile_features(arengine_openxr_session_tests PRIVATE cxx_std_20)
+    add_test(NAME OpenXRSessionTests COMMAND arengine_openxr_session_tests)
+
     # --- M9C: OpenXR/Vulkan integration boundary ---
     #
     # Only built when BOTH ARENGINE_ENABLE_OPENXR and
@@ -196,6 +208,19 @@ if(ARENGINE_ENABLE_OPENXR)
         target_link_libraries(arengine_openxr_vulkan_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_openxr_vulkan_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
         target_compile_features(arengine_openxr_vulkan_demo PRIVATE cxx_std_20)
+
+        # Manual-only, M9D: requires a real OpenXR loader/runtime with
+        # XR_KHR_vulkan_enable2 support (and ideally a real or
+        # simulated HMD) which CI/headless systems lack. Built by CMake
+        # but deliberately NOT registered with add_test. Run it
+        # directly instead. See docs/ARCHITECTURE.md, "M9D
+        # Implementation Notes".
+        add_executable(arengine_openxr_session_demo
+            openxr_session_demo.cpp
+        )
+        target_link_libraries(arengine_openxr_session_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
+        target_include_directories(arengine_openxr_session_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+        target_compile_features(arengine_openxr_session_demo PRIVATE cxx_std_20)
     endif()
 endif()
 

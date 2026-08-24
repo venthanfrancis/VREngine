@@ -63,6 +63,12 @@ if(ARENGINE_ENABLE_OPENXR)
             src/openxr/OpenXRInstance.cpp
             src/openxr/OpenXRSystem.hpp
             src/openxr/OpenXRSystem.cpp
+            src/openxr/OpenXRSessionState.hpp
+            src/openxr/OpenXRSessionState.cpp
+            src/openxr/OpenXRViewConfiguration.hpp
+            src/openxr/OpenXRViewConfiguration.cpp
+            src/openxr/OpenXRReferenceSpace.hpp
+            src/openxr/OpenXRReferenceSpace.cpp
     )
 
     # Private: OpenXR is an implementation detail of this module's
@@ -90,6 +96,12 @@ if(ARENGINE_ENABLE_OPENXR)
                 src/openxr/OpenXRVulkanRequirements.cpp
                 src/openxr/OpenXRVulkanGraphicsBinding.hpp
                 src/openxr/OpenXRVulkanGraphicsBinding.cpp
+                # M9D: XrSession creation itself needs
+                # XrGraphicsBindingVulkan2KHR - the one part of session
+                # lifecycle that is genuinely Vulkan-coupled. See
+                # docs/ARCHITECTURE.md, "XrSession Ownership (M9D)".
+                src/openxr/OpenXRSession.hpp
+                src/openxr/OpenXRSession.cpp
         )
         # Private, same as OpenXR::openxr_loader above - Vulkan is an
         # implementation detail of this one integration boundary, never

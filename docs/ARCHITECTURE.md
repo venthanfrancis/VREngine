@@ -4046,6 +4046,19 @@ one duplicated constant is a far smaller cost than a cross-module
 header dependency between `XR` and `Rendering`'s private
 implementation.
 
+**Investigated further in M9D** — see Section 27, "Vulkan Device
+Feature Requirement Discovered in M9D" and its addendum: M9C never
+created an `XrSession`, so this 1.2 selection was never actually
+exercised against the runtime's own session-creation code path. M9D's
+real session creation initially hit a genuine device-feature conflict
+at 1.2, briefly worked around with a static 1.1 cap — then, on
+review, that cap was found to be unnecessary once the underlying
+feature-enabling approach was corrected (avoiding the specific
+struct that conflicted, rather than avoiding the API version). The
+version actually requested today is still exactly this section's
+`SelectVulkanApiVersion` output, unmodified — **1.2 is genuinely
+selected and works**, with no exception logic anywhere in the code.
+
 ### XR-Controlled VkInstance Creation (M9C)
 
 The XR-compatible `VkInstance` is created via `xrCreateVulkanInstanceKHR`
@@ -4277,3 +4290,438 @@ function-pointer loading, requirements query, XR-controlled instance/
 device creation, physical-device/queue selection, and validation-layer
 preservation all worked correctly on the first real-runtime run, with
 zero validation warnings to investigate.
+
+## 27. M9D Implementation Notes
+
+M9D creates AREngine's first real `XrSession`, using the M9C Vulkan
+graphics binding unchanged (no second Vulkan device), tracks
+`XrSessionState` through a real event-polling loop, calls
+`xrBeginSession`/`xrEndSession` at the correct points, enumerates view
+configurations and reference spaces, and creates the reference spaces
+the runtime supports. No swapchain, no frame loop, no view location —
+those remain M9E/M9F.
+
+### XrSession Ownership (M9D)
+
+`OpenXRSession` (`engine/xr/src/openxr/OpenXRSession.hpp/.cpp`) owns
+one `XrSession`, created via `xrCreateSession` with an
+`XrGraphicsBindingVulkan2KHR` — built directly from the M9C
+`VulkanGraphicsBindingData` — chained through
+`XrSessionCreateInfo::next`. `createFlags` stays zero. Destructor calls
+`xrDestroySession`. Not copyable or movable, same discipline as every
+other owned OpenXR/Vulkan handle in this engine. This is the **one**
+piece of M9D's session lifecycle that is Vulkan-coupled — everything
+else (`OpenXRSessionState.hpp`, `OpenXRViewConfiguration.hpp`,
+`OpenXRReferenceSpace.hpp`) has zero Vulkan dependency, since session
+*state*, view configuration, and reference spaces are pure OpenXR
+concepts independent of which graphics API backs the session.
+`engine/xr/CMakeLists.txt` reflects this exactly: `OpenXRSession.*` is
+nested inside the same `if(ARENGINE_ENABLE_VULKAN)` block as M9C's
+files; the other three are in the unconditional OpenXR-only block.
+
+### Graphics-Binding Relationship (M9D)
+
+`XrGraphicsBindingVulkan2KHR`'s five fields (`instance`,
+`physicalDevice`, `device`, `queueFamilyIndex`, `queueIndex`) are
+copied directly from `OpenXRVulkanGraphicsBinding::GetBindingData()` —
+the exact same struct M9C validated. **No second Vulkan instance/
+device is created for M9D.** In simple English: the graphics binding is
+the paperwork OpenXR needs before it will let an app open a real
+session — "here is the Vulkan instance, the GPU, the logical device,
+and which queue to use." M9C proved every field on that paperwork was
+valid; M9D is the first milestone that actually submits it.
+
+### Session-State Lifecycle (M9D)
+
+`XrSessionState` is never treated as a boolean anywhere in this
+engine. `FormatSessionState` (`OpenXRSessionState.hpp/.cpp`) gives
+every state a readable name for logging (with a numeric fallback for
+anything unrecognized, mirroring `XrResultToReadableString`'s own
+discipline). Three small `constexpr` predicates, all pure logic and
+unit-tested:
+
+- `ShouldBeginSession(state)` — true only for `READY`.
+- `ShouldEndSession(state, sessionRunning)` — true only for `STOPPING`
+  **and** an already-running session; `sessionRunning` is a separate
+  parameter, not inferred from `state` (see "Session Running Flag"
+  below).
+- `ShouldStopMainLoop(state)` — true for `EXITING` or `LOSS_PENDING`.
+
+**In simple English, session states answer "what stage of the
+session's life am I in right now, and what am I allowed to do about
+it?"** `IDLE` is "created, not yet ready." `READY` is "the runtime says
+go ahead and begin." `SYNCHRONIZED`/`VISIBLE`/`FOCUSED` describe how
+much the running session is actually being displayed/interacted with
+(least to most). `STOPPING` is "wind down now." `EXITING` is "done,
+leave cleanly." `LOSS_PENDING` is "the whole runtime/system is about to
+disappear out from under you."
+
+### Event Polling (M9D)
+
+`PollSessionEvents(instance)` (`OpenXRSession.hpp/.cpp`) drains every
+pending event in one call: `xrPollEvent` in a loop, each iteration
+using a freshly zero-initialized `XrEventDataBuffer` (as OpenXR
+requires), until `XR_EVENT_UNAVAILABLE`. Only two event types are
+actually handled — `XrEventDataSessionStateChanged` (read via the
+standard OpenXR polymorphic-event `reinterpret_cast`, matching every
+Khronos sample) and `XrEventDataInstanceLossPending` (logged, treated
+as a stop signal); `XrEventDataEventsLost` is logged as a warning
+(queue overflow, not fatal); everything else is silently ignored — a
+deliberately small, non-generic event-dispatch surface, per the brief.
+If multiple session-state-changed events arrive in one poll cycle, only
+the last one's state is kept — it is the current, authoritative one.
+
+### Observed SteamVR/Null State Sequence (M9D)
+
+**Exactly**: `IDLE` is skipped in the demo's own printed sequence
+(only *changes* are logged, and the very first observed change already
+carries the runtime past creation) —
+
+```
+XR_SESSION_STATE_READY -> XR_SESSION_STATE_STOPPING -> XR_SESSION_STATE_EXITING
+```
+
+**Critically, `SYNCHRONIZED`/`VISIBLE`/`FOCUSED` were never reached.**
+This was investigated, not assumed away: per the OpenXR spec,
+`SYNCHRONIZED` is reached once the application participates in the
+frame loop (`xrWaitFrame`) — which M9D explicitly must not call. With
+no frame loop at all, a real, spec-conformant runtime has no reason to
+ever advance past `READY`/running; SteamVR's null driver behaves
+exactly this way in practice, confirmed by direct observation (the
+demo's first implementation waited for `FOCUSED` before requesting
+exit and simply hung until a 30-second safety timeout, every time).
+The demo now requests exit immediately once the session starts
+running, which correctly matches what M9D can actually reach on its
+own. **M9E's frame loop is expected to be the reason `SYNCHRONIZED`+
+become observable at all** — worth confirming directly once that
+milestone exists, not assumed here.
+
+### READY → xrBeginSession Behavior (M9D)
+
+`ShouldBeginSession(state)` fires exactly once, from inside the
+event-poll loop, immediately after a `READY` transition is observed.
+`OpenXRSession::BeginSession(primaryViewConfigurationType)` calls
+`xrBeginSession` and sets its internal running flag. Confirmed via the
+manual run: this happened exactly once, in direct response to the
+single `READY` event SteamVR's null driver sent.
+
+### STOPPING → xrEndSession Behavior (M9D)
+
+`ShouldEndSession(state, sessionRunning)` fires only when the tracked
+state is `STOPPING` **and** the session is still marked running —
+calling `xrEndSession` from any other state is invalid per spec and
+returns `XR_ERROR_SESSION_NOT_RUNNING`. **This was found the hard way**:
+an early version of this demo's post-loop fallback path called
+`EndSession()` unconditionally whenever `IsRunning()` was true,
+regardless of the actual tracked state — this crashed
+(`AR_ASSERT_MSG` fired) the first time the safety timeout fired before
+`STOPPING` had ever arrived. Fixed by gating that fallback on
+`ShouldEndSession` too, exactly like the main loop's own handling; if a
+session is still running but genuinely never reached `STOPPING`, the
+correct action is to destroy it directly (spec-legal — the runtime
+must clean up a still-running session on `xrDestroySession`), not to
+force an invalid `xrEndSession` call.
+
+### EXITING Behavior (M9D)
+
+`ShouldStopMainLoop` returns true, the demo logs a plain informational
+message ("not an error") and breaks its loop. No crash, no special
+handling beyond that — confirmed on the manual run: `EXITING` arrived
+immediately after `xrEndSession` succeeded, and the demo exited cleanly
+with code 0.
+
+### LOSS_PENDING Behavior (M9D)
+
+Also handled by `ShouldStopMainLoop` (session-state `LOSS_PENDING`) —
+the demo stops using the session and exits, with no recreation
+attempted, per the brief. Separately, `XrEventDataInstanceLossPending`
+(a distinct, rarer event about the whole *instance* becoming invalid,
+not just the session) is checked explicitly in the poll loop and also
+treated as a clean-stop signal. Neither was actually observed against
+SteamVR's null driver this session — both are implemented and covered
+by the loop's structure, but this specific path remains unexercised
+against a real runtime; a genuine, honestly-reported gap, consistent
+with this project's practice of not claiming untested paths as
+verified.
+
+### Selected Primary View Configuration (M9D)
+
+`EnumerateViewConfigurationTypes` reported exactly one supported type
+on this runtime/system: `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`.
+`SelectPrimaryViewConfigurationType` (pure logic, unit-tested)
+deliberately returns `std::nullopt` — not a silent fallback to
+`PRIMARY_MONO` or anything else — when stereo isn't present, mirroring
+M9C's own "report clearly and stop, don't invent a fallback" handling
+of `XR_KHR_vulkan_enable2`. Not exercised on this runtime, since stereo
+was supported.
+
+### View Configuration Properties (M9D)
+
+`xrGetViewConfigurationProperties(PRIMARY_STEREO)` reported
+`fovMutable = true` on this runtime — logged, not acted on (nothing in
+M9D adjusts FOV).
+
+### Recommended Per-View Dimensions/Sample Counts (M9D)
+
+`xrEnumerateViewConfigurationViews(PRIMARY_STEREO)` reported **2
+views** (one per eye), each: recommended **1852x2056**, max
+**8192x8192**, recommended sample count **1**, max sample count **1**.
+Purely diagnostic in M9D — no swapchain or Vulkan image is allocated
+from this data; M9E will be the first milestone to actually use these
+numbers.
+
+### Supported Reference-Space Types (M9D)
+
+`xrEnumerateReferenceSpaces` reported all three core types on this
+runtime: `VIEW`, `LOCAL`, `STAGE` (SteamVR's null driver, unlike some
+minimal runtimes, does support `STAGE`). `SelectReferenceSpacesToCreate`
+(pure logic, unit-tested with both an all-present and a
+STAGE-absent synthetic input, since the brief explicitly warns "do not
+assume STAGE exists") always includes `VIEW`/`LOCAL` when supported and
+includes `STAGE` too, for diagnostics only — AREngine does not require
+it.
+
+### Which Reference Spaces Are Created (M9D)
+
+All three: `OpenXRReferenceSpace` instances for `VIEW`, `LOCAL`, and
+`STAGE`, each with `poseInReferenceSpace = IdentityPose()` (no rotation,
+no offset — no reason yet to use anything else). Held in a
+`std::vector<std::unique_ptr<OpenXRReferenceSpace>>`, declared after
+`session` in the demo so they are destroyed before it automatically
+(see "Destruction Order" below).
+
+### Space Semantics (M9D)
+
+In simple English:
+
+- **VIEW** moves with the user's head/viewer — its origin *is*
+  wherever the viewer currently is and however they're currently
+  facing. Useful for things that should always be positioned relative
+  to the eyes (e.g. a HUD).
+- **LOCAL** is a stable local tracking origin appropriate for seated/
+  standing local experiences — it does not move once established, even
+  as the user moves around; think "the point in space where tracking
+  started."
+- **STAGE** is a room-scale/play-area-style reference frame when the
+  runtime supports it — typically the floor-level center of a
+  calibrated play area. AREngine does not require it to exist; it is
+  created here only when the runtime reports supporting it, for
+  diagnostics.
+
+AREngine does not yet build any final world-origin policy on top of
+these — M9D only proves the spaces themselves can be created and
+destroyed correctly. Deciding which of these (if any) becomes the
+engine's actual default rendering origin needs real pose/location
+evidence (`xrLocateSpace`), which M9D explicitly does not call.
+
+### Destruction Order (M9D)
+
+M9D's demo declares, in this exact order: `instance` → `binding`
+(M9C's `OpenXRVulkanGraphicsBinding`) → `session` (`OpenXRSession`) →
+`referenceSpaces` (a vector of `OpenXRReferenceSpace`). C++'s
+reverse-local-destruction-order rule therefore destroys everything in
+exactly the opposite order automatically: reference spaces first (each
+`xrDestroySpace`), then the session (`xrDestroySession`), then the
+Vulkan graphics binding (its `VkDevice`, then `VkInstance`), then the
+OpenXR instance (`xrDestroyInstance`) last — satisfying every ordering
+requirement the brief lists (spaces before session; Vulkan device/
+instance not destroyed while the session still references them;
+instance outliving everything that depends on it). This is documented
+explicitly with a comment at the declaration site, not left as an
+implicit consequence of declaration order a future reader would have
+to rediscover.
+
+### Vulkan Device Feature Requirement Discovered in M9D
+
+**The most significant real finding this milestone produced.** M9C's
+Vulkan device was created and validated, but never actually used to
+back a real session — `xrCreateSession` is where a runtime's own
+compositor first does real work against the app's device. The very
+first real session-creation attempt against SteamVR produced multiple
+rounds of genuine Vulkan validation errors, each investigated and
+resolved with real evidence, not guessed at:
+
+1. **`vkCreateShaderModule` failed**: SteamVR's compositor shaders use
+   the SPIR-V `ShaderViewportIndexLayer` capability, requiring Vulkan
+   1.2's `shaderOutputViewportIndex`/`shaderOutputLayer` device
+   features (or the pre-1.2 `VK_EXT_shader_viewport_index_layer`
+   extension) — M9C's device enabled neither (deliberately minimal, no
+   speculative features).
+2. Enabling those two features via a `VkPhysicalDeviceVulkan12Features`
+   struct fixed that error, but revealed a **second**: `vkCreateDevice`
+   failed because SteamVR's own `xrCreateVulkanDeviceKHR`
+   implementation unconditionally appends its own
+   `VkPhysicalDeviceFeatures2`-wrapped `VkPhysicalDeviceTimelineSemaphoreFeatures`
+   onto whatever `pNext` chain the app supplies — which Vulkan
+   validation correctly rejects the moment the app's own chain *also*
+   contains a `VkPhysicalDeviceVulkan12Features` (both describe
+   `timelineSemaphore`; the spec forbids the ambiguity of two structs
+   potentially disagreeing).
+3. Several chain-structuring variations were tried directly against
+   the real runtime (a bare `VkPhysicalDeviceVulkan12Features`; the
+   same struct pre-populated with every supported 1.2 feature,
+   including `timelineSemaphore`; wrapping it in an app-provided
+   `VkPhysicalDeviceFeatures2` instead of attaching it directly) — **all
+   still conflicted**, since SteamVR's runtime appends its own
+   `VkPhysicalDeviceFeatures2`/`VkPhysicalDeviceTimelineSemaphoreFeatures`
+   pair unconditionally, regardless of what the app's chain already
+   contains.
+4. **Resolution**: `shaderOutputViewportIndex`/`shaderOutputLayer` are
+   satisfied via the plain `VK_EXT_shader_viewport_index_layer`
+   **device extension string** (checked for availability first, never
+   assumed) instead of the `VkPhysicalDeviceVulkan12Features` feature
+   bits — this extension has no feature struct of its own, so it has
+   nothing for the runtime's own injected structs to conflict with, at
+   any Vulkan version. A separate, confirmed real requirement —
+   `VkPhysicalDeviceFeatures::geometryShader`, used by a different
+   SteamVR compositor shader variant — is satisfied by querying
+   `vkGetPhysicalDeviceFeatures` and passing the full supported set via
+   `pEnabledFeatures` (a plain core-1.0 struct, never in conflict with
+   anything the runtime injects).
+5. This device-feature/extension logic applies **only** to the
+   XR-compatible device (`OpenXRVulkanGraphicsBinding`) — the M8
+   desktop device (`Rendering::Vulkan::VulkanDevice`) is completely
+   untouched and keeps its deliberately minimal, zero-optional-feature
+   M8A-established policy. The reasoning for enabling "everything the
+   physical device reports supporting" on the XR device specifically
+   (rather than a hand-picked minimal set) is that a third-party
+   runtime's compositor uses this device for shaders AREngine has no
+   visibility into or control over; nothing is enabled that the
+   hardware doesn't already genuinely support, so this remains
+   evidence-based rather than speculative.
+
+Confirmed fixed end to end: the final manual run produced **zero**
+Vulkan validation errors or warnings, with the Vulkan API version
+logged as **`1.2.0`** — AREngine's genuine, unmodified desktop-matching
+preference, working against SteamVR without any exception. See the
+addendum immediately below for how an initial, broader fix (a static
+1.1 version cap) was caught and replaced with this narrower one before
+M9E began.
+
+### M9D Addendum: Vulkan Version Compatibility Review
+
+**Requested and performed immediately after M9D's own approval, before
+M9E began**, specifically to check that the fix above hadn't
+overreached. The concern: M9D's first working fix capped
+`OpenXRVulkanGraphicsBinding`'s selected Vulkan API version to 1.1
+*unconditionally* whenever `SelectVulkanApiVersion` would otherwise
+have picked 1.2+ — regardless of which OpenXR runtime was actually
+active. That is a broader change than the evidence justified: it would
+have silently downgraded every future runtime to 1.1, including fully
+conformant ones with no trace of SteamVR's specific chain-conflict
+behavior, for a problem that was never actually inherent to Vulkan 1.2
+itself.
+
+Re-examining the fix's own final shape (item 4 above) showed the cap
+was no longer even doing any real work: the actual device-creation code
+never chains `VkPhysicalDeviceVulkan12Features` (or any
+`VkPhysicalDeviceFeatures2` wrapper) at all — `shaderOutputViewportIndex`/
+`shaderOutputLayer` are satisfied through the plain extension string
+instead. Since the confirmed conflict was specifically "app-provided
+`VkPhysicalDeviceVulkan12Features` vs. runtime-injected
+`VkPhysicalDeviceTimelineSemaphoreFeatures`," and the app's chain no
+longer contains the former under *any* circumstance, **the version cap
+had nothing left to protect against.** It was removed, and 1.2 was
+re-tested directly against SteamVR: zero validation errors, full
+session lifecycle correct, exactly as before — confirming the cap was
+never actually load-bearing once the extension-string approach existed.
+
+Checked directly against each concern raised:
+
+1. **Desktop Vulkan renderer remains 1.2** — unchanged; `Rendering::Vulkan`'s
+   `VulkanVersion.hpp`/`VulkanInstance`/`VulkanDevice` were never
+   touched by any part of this fix.
+2. **Runtime's reported min/max range is still queried** — unchanged;
+   `xrGetVulkanGraphicsRequirements2KHR` and `DecodeVulkanVersionRange`
+   are exactly as M9C left them.
+3. **XR Vulkan API version is selected through capability/runtime
+   logic** — yes, and more purely than before: `m_selectedVulkanApiVersion`
+   is now *exactly* `SelectVulkanApiVersion(kPreferredVulkanApiVersion,
+   m_supportedVersionRange)`'s own output, with no post-hoc
+   modification of any kind.
+4. **The SteamVR-specific cap is isolated as narrowly as practical** —
+   more than that: it no longer exists. There was nothing narrower to
+   isolate it to once it was confirmed unnecessary.
+5. **No SteamVR path, driver name, or Valve-specific code leaks into
+   generic AREngine APIs** — confirmed by inspection: `OpenXRVulkanGraphicsBinding.cpp`
+   contains no string comparison against a runtime/driver name and no
+   branch conditioned on which runtime is active. "SteamVR" appears
+   only in comments/documentation describing what was *observed* during
+   manual validation, never in a runtime code path.
+6. **A future runtime can use Vulkan 1.2 or another supported version
+   without redesigning the XR module** — yes: version selection is
+   `SelectVulkanApiVersion`'s pure preference-vs-range logic, unmodified
+   since M9C, with zero runtime-specific exceptions anywhere in the
+   codebase today.
+7. **Compatibility reason documented clearly** — this addendum, plus
+   the corrected "Vulkan Device Feature Requirement Discovered in M9D"
+   section above.
+
+**Result: this is not merely a narrower fix than the one M9D shipped
+with — it is a strictly better one.** The XR path now requests the
+exact same Vulkan version the desktop renderer does, against the one
+real runtime available for testing, with no exception logic left in
+the codebase at all. `docs/ARCHITECTURE.md` Section 26 ("Vulkan Version
+Selection (M9C)") was updated to point here rather than to a stale
+description of the 1.1 cap.
+
+### Validation Results (M9D)
+
+`ARENGINE_ENABLE_OPENXR=ON`/`ARENGINE_ENABLE_VULKAN=ON`: full `/W4 /WX`
+clean build, `ctest` **14/14** (new `OpenXRSessionTests` — 12
+pure-logic checks covering `FormatSessionState`'s known values and
+numeric fallback, `ShouldBeginSession`/`ShouldEndSession`/
+`ShouldStopMainLoop`'s decision logic, view-configuration support/
+selection logic, reference-space support/selection logic including the
+explicit "STAGE absent" case, and `IdentityPose`).
+
+`arengine_openxr_session_demo` run against the live SteamVR/OpenXR
+2.16.7 null-driver runtime:
+
+```
+XrSession created successfully
+Supported view configurations: 1 (PRIMARY_STEREO) - selected
+View count: 2, each 1852x2056 recommended (8192x8192 max), sample count 1
+Supported reference spaces: VIEW, LOCAL, STAGE (all created)
+Observed state sequence: READY -> STOPPING -> EXITING
+xrBeginSession: called once, exactly on READY
+xrEndSession: called once, exactly on STOPPING
+Vulkan API version selected: 1.2.0 (see the M9D Addendum above - re-verified after removing an initial, overly-broad 1.1 cap)
+```
+
+**Zero Vulkan validation errors or warnings** on the final run
+(confirmed both by reading the full log and by grepping for warn/error/
+fail — no matches) — a real improvement over the multiple genuine
+errors hit and fixed during this milestone's own development, not a
+claim that was true from the first attempt. Exit code 0. Re-verified
+against a freshly rebuilt `arengine_openxr_vulkan_demo` (M9C's demo)
+too, confirming the shared `OpenXRVulkanGraphicsBinding` fix didn't
+regress M9C's own scenario. All four build-option combinations
+(`OPENXR`×`VULKAN`, all four `ON`/`OFF` pairs) build and pass their
+respective test suites with no link errors.
+
+- Files changed: see the file list in the final chat report (kept out
+  of this document to avoid duplicating a list that changes with every
+  commit).
+
+### What's Deferred to M9E+
+
+No XR swapchains, no `xrCreateSwapchain`, no `xrEnumerateSwapchainFormats`,
+no frame lifecycle (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`), no
+`xrLocateViews`, no `xrLocateSpace` for tracking, no stereo rendering,
+no `XRFrameDriver`, no controllers/actions, no hand/eye tracking, no
+passthrough, no spatial anchors, no Scene integration, no headset image
+submission. `OpenXRSession`, `OpenXRReferenceSpace`, and the view-
+configuration data M9D already gathered (view count, recommended/max
+dimensions, sample counts) are all genuinely ready for M9E to consume
+directly — that translation is expected to be the bulk of what M9E
+adds on top, alongside the frame loop itself.
+
+No architectural issues were discovered in the session-lifecycle logic
+itself (state tracking, event polling, reference-space creation, and
+destruction ordering all worked correctly on the first attempt once
+constructed). The one genuine issue found and fixed was the Vulkan
+device feature/extension requirement above — a real, evidence-based
+discovery this milestone's own real-runtime testing was specifically
+designed to surface, not a design flaw in M9D's own session-lifecycle
+code.
