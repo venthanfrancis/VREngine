@@ -3356,3 +3356,365 @@ culling all matched their derivations exactly, with zero validation
 warnings on the log-confirmed hardware run. The one open item is the
 visual-confirmation gap noted above, which is an environmental
 limitation of this session, not a defect found in the code.
+
+## 24. M9A Implementation Notes
+
+M9A introduces OpenXR into AREngine for the first time — bring-up only:
+discover the loader, create an `XrInstance`, enumerate API layers and
+instance extensions, request a head-mounted-display-class `XrSystemId`,
+inspect its properties, and shut down cleanly. No `XrSession`, no
+graphics binding, no swapchain, no frame loop, no Vulkan/OpenXR
+connection — all deferred to later M9 sub-milestones.
+
+### OpenXR Build Option (M9A)
+
+`ARENGINE_ENABLE_OPENXR` (top-level CMake option, **default OFF**) gates
+all of OpenXR, mirroring `ARENGINE_ENABLE_VULKAN`'s existing pattern
+exactly: when OFF, no OpenXR headers/loader are required anywhere, and
+`engine/xr` is just the M0-era placeholder it always was (`XR.cpp`'s
+`ModuleName()`). Default OFF (unlike Vulkan's default ON) because,
+unlike Vulkan, there is no OpenXR SDK pre-installed on this development
+machine, and turning OpenXR on requires network access on first
+configure (see below) — a non-XR contributor should never be forced
+into that by default. See "Validation Results" below for confirmation
+that `ARENGINE_ENABLE_OPENXR=OFF` configures/builds/tests exactly as
+before this milestone.
+
+### OpenXR Loader / SDK Acquisition (M9A)
+
+Unlike Vulkan, there is no widely standardized system-wide "OpenXR
+SDK" installer on Windows (no `VULKAN_SDK`-style environment variable
+convention to rely on) — confirmed by checking this development
+machine, which has the Vulkan SDK installed but no OpenXR SDK, no
+vcpkg, and nothing under a conventional install path. Given that, and
+the brief's explicit instructions to prefer CMake package discovery
+and never hard-code a machine-specific path or hand-vendor headers,
+`engine/xr/CMakeLists.txt` does:
+
+1. `find_package(OpenXR CONFIG QUIET)` first — if a system or package-
+   manager-provided OpenXR SDK is available (e.g. via vcpkg, which
+   defines an `OpenXR::openxr_loader` CMake target), it's used as-is.
+2. If `OpenXR::openxr_loader` still isn't a target, CMake `FetchContent`
+   pulls the official Khronos `OpenXR-SDK` repository (not
+   `OpenXR-SDK-Source` — the release repo ships pre-generated headers
+   and loader source, confirmed by inspecting it directly, so no Python
+   code-generation step is needed), pinned to the exact tagged release
+   `release-1.1.62` for reproducibility. `BUILD_API_LAYERS`,
+   `BUILD_TESTS`, and `BUILD_CONFORMANCE_TESTS` are all forced OFF
+   before fetching — only `BUILD_LOADER` (ON) is needed, so this never
+   pulls in Catch2 or the conformance test suite.
+
+Nothing is vendored into this repository — CMake downloads and builds
+the loader the same way it would build any other subdirectory, and
+nothing under `_deps/` is checked into git. This does mean the first
+`ARENGINE_ENABLE_OPENXR=ON` configure requires network access (a `git
+clone` of the OpenXR-SDK repository); documented here as the one
+Windows-specific toolchain limitation the brief asked to call out if
+unavoidable — there was no clean way around it without either vendoring
+headers (explicitly disallowed) or requiring a pre-installed SDK this
+machine doesn't have.
+
+One incidental toolchain note: the fetched OpenXR-SDK's own CMake
+optionally detects this machine's installed Vulkan SDK
+(`if(Vulkan_FOUND)`) and includes Vulkan's headers privately inside its
+own loader build, for its own internal interop declarations — this is
+the *loader's* business, not AREngine's, and was confirmed not to
+create any actual coupling: `ARENGINE_ENABLE_OPENXR=ON` with
+`ARENGINE_ENABLE_VULKAN=OFF` still configures, builds, and passes every
+non-Vulkan test cleanly (see "Validation Results" below) — AREngine's
+own `Rendering` module builds zero Vulkan code in that configuration,
+and AREngine's `XR` module never references Vulkan at all.
+
+### Requested API Version (M9A)
+
+`AREngine::XR::OpenXR::kTargetApiVersion` (`OpenXRVersion.hpp`) targets
+**OpenXR 1.0 core** (`XR_API_VERSION_1_0`), not whatever the newest
+fetched header happens to define (1.1.x) — the same "broad compatibility
+over the newest available" reasoning M8A already applied when choosing
+Vulkan 1.2 over a newer target. Essentially every OpenXR runtime
+supports at least 1.0 core; requesting 1.1 blindly would risk failing
+instance creation on any runtime that doesn't yet implement it. One
+surprising detail worth documenting: `XR_API_VERSION_1_0`'s *patch*
+component (as `openxr.h` defines it) tracks whichever header patch
+version the code was built against, rather than being pinned to 0 - so
+`FormatXrVersion(kTargetApiVersion)` prints `"1.0.62"` (matching the
+fetched 1.1.62 header's own patch number), not `"1.0.0"`. Only
+major/minor are meaningful; `DecodeXrVersion`/`FormatXrVersion`
+(`OpenXRVersion.hpp/.cpp`) mirror `VulkanVersionParts`/
+`DecodeVulkanVersion`/`FormatVulkanVersion` exactly, and are pure bit
+manipulation over the `XR_VERSION_*` macros — directly unit-tested
+without a loader, runtime, or headset.
+
+### API Layer Enumeration (M9A)
+
+`EnumerateApiLayers()` (`OpenXRInstance.hpp/.cpp`) calls
+`xrEnumerateApiLayerProperties` — a loader-level query, no `XrInstance`
+required — and returns every layer found, for the demo to log. **No
+layer is ever enabled**, matching the brief's explicit "do not enable
+arbitrary API layers." The standard OpenXR core validation layer
+(`XR_APILAYER_LUNARG_core_validation`) is specifically checked for and
+reported if present, but still never enabled this milestone: M9A
+creates no session, swapchain, or frame loop, so there is very little
+for a validation layer to usefully catch yet, and normal execution
+never requires it to be installed. On this development machine, zero
+layers were found (confirmed by the manual run — see "Validation
+Results"), which the demo reports plainly rather than treating as an
+error.
+
+### Instance Extension Enumeration (M9A)
+
+`EnumerateInstanceExtensions()` similarly calls
+`xrEnumerateInstanceExtensionProperties(nullptr, ...)` (also no
+instance required) and logs whatever the active runtime supports. M9A
+enables zero extensions — no graphics-binding extension (deferred to
+M9C, which will need `xrGetVulkanGraphicsRequirementsKHR` and friends),
+no hand tracking, no eye tracking, no passthrough, no spatial anchors.
+Unlike the API-layer query, this call genuinely does need a runtime to
+answer — on this development machine (no runtime installed), it fails
+with `XR_ERROR_RUNTIME_UNAVAILABLE`, confirmed directly by the manual
+run's log. Both enumeration functions handle their own failure
+gracefully (`AR_LOG_WARNING` + return an empty vector), not an assert —
+enumeration failing before an instance even exists is exactly the kind
+of "no runtime" scenario this milestone must not crash on.
+
+### Instance Ownership (M9A)
+
+`OpenXRInstance` (`OpenXRInstance.hpp/.cpp`) owns one `XrInstance`,
+requesting zero API layers and zero extensions, with an
+`XrApplicationInfo` carrying AREngine's name/version (`"AREngine OpenXR
+Demo"` / `"AREngine"`, both packed as `major*10000 + minor*100 + patch`
+= `100` for 0.1.0 — plain `uint32_t` fields OpenXR does not interpret,
+unlike `apiVersion`, which is the real `XrVersion`-typed
+`kTargetApiVersion`). Not copyable or movable, destroyed via
+`xrDestroyInstance` exactly once, by this object alone — the same
+discipline every other owned bring-up handle in this engine follows
+(`VulkanInstance`, `VulkanDevice`, etc.).
+
+### Instance Creation Failure Handling (M9A)
+
+**This is the one deliberate departure from every prior bring-up
+wrapper's policy.** `VulkanInstance`/`VulkanDevice`/etc. all assert
+(via `CheckVkResult`) on any creation failure, because M8A treated "no
+Vulkan-capable GPU" as an environment the engine doesn't need to run
+in gracefully. OpenXR is different: **"no OpenXR runtime
+installed/active" is the *normal* state of most desktop dev machines**
+(confirmed directly — this development machine has none), not a
+programmer error. `OpenXRInstance`'s constructor therefore does not
+assert on `xrCreateInstance` failure at all — it records the raw
+`XrResult` (`CreationResult()`) and leaves `IsValid()` false, and it is
+entirely up to the caller (the bring-up demo) to decide what that
+means and how to report it. `CheckXrResult`
+(`OpenXRResult.hpp/.cpp`, mirroring `CheckVkResult`) remains available
+and *is* still used for calls made **after** a valid instance/system
+already exists, where failure would be genuinely unexpected
+(`xrGetInstanceProperties`, `xrGetSystemProperties`) — the fatal-on-
+bring-up-failure policy isn't abandoned, just scoped to where it
+actually applies.
+
+### System Selection (M9A)
+
+`TryGetHmdSystem(XrInstance)` (`OpenXRSystem.hpp/.cpp`) calls
+`xrGetSystem` with `XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY` and, like
+`OpenXRInstance`, **does not assert on failure** — unlike Vulkan's
+`SelectPhysicalDevice` (M8A), "no HMD connected" is an entirely normal
+outcome even when a runtime is active and healthy. It returns a
+`SystemRequestResult{found, systemId, rawResult}` so the caller can
+inspect exactly why `found` is false.
+`IsFormFactorUnavailable(XrResult)` is a small, `constexpr`, directly
+unit-tested pure-logic helper that recognizes the two result codes
+specifically meaning "this form factor genuinely isn't available right
+now" (`XR_ERROR_FORM_FACTOR_UNAVAILABLE`/`_UNSUPPORTED`) as distinct
+from any other, more surprising `xrGetSystem` failure.
+
+### System Properties (M9A)
+
+Once `TryGetHmdSystem` succeeds, `xrGetSystemProperties` is called
+directly from the demo (no wrapper class needed — `XrSystemId` is not a
+resource OpenXR owns, so there's nothing to give RAII to; see "RAII /
+Destruction" below) and logs exactly what M9A's brief asked for from
+core `XrSystemProperties`, with no extension-specific property chains:
+system name, vendor ID, max swapchain image width/height, max
+composition layer count, and the two core tracking-capability flags
+(`orientationTracking`/`positionTracking`).
+
+### Error Handling (M9A)
+
+`XrResultToReadableString(XrInstance, XrResult)` (`OpenXRResult.hpp/.cpp`,
+mirroring `VkResultToString`) is best-effort: if a valid `XrInstance`
+is available, it defers to the real `xrResultToString` (which covers
+every `XrResult`, including vendor/extension-defined ones, far more
+completely than a hand-written switch could); if not (most notably,
+when `xrCreateInstance` itself is the failing call, so no instance
+exists to ask), it falls back to a numeric `"XrResult(-51)"`-style
+representation — directly unit-tested for exactly that no-instance
+case. `CheckXrResult` builds on this the same way `CheckVkResult` does,
+for the calls where asserting is still correct (see "Instance Creation
+Failure Handling" above for the calls where it deliberately is not
+used).
+
+### RAII / Destruction (M9A)
+
+M9A owns exactly one real resource: the `XrInstance`, via
+`OpenXRInstance`. `XrSystemId` is never separately destroyed — per the
+OpenXR spec, it is an opaque identifier valid for the instance's
+lifetime, not a resource with its own creation/destruction calls, so
+`OpenXRSystem.hpp` deliberately has no `~OpenXRSystem`/RAII class at
+all, just a small result struct and a free function. No global XR
+singleton and no global mutable `XrInstance` were introduced -
+`OpenXRInstance` lives on the demo's stack, exactly like `VulkanInstance`
+in `vulkan_demo.cpp`.
+
+### Dependency Trim (M9A)
+
+`engine/xr`'s public link libraries were trimmed from `{Core, Platform,
+Frame}` down to **`{Core}`** only. `Platform` and `Frame` were both
+linked since the M0 stub, in anticipation of needs that hadn't arrived
+yet; M9A is the first real evidence of what XR actually needs, and it
+is neither of those — no window/native-handle access (`Platform`) and
+no `FrameDriver` implementation yet (`Frame` — `XRFrameDriver` is
+explicitly deferred, see "What's Deferred to M9B+" below). This matches
+the brief's explicit expected dependency direction (`XR -> Core`, `XR
+-> Frame` only "if genuinely required later") and the project's
+established evidence-over-speculation pattern (the same reasoning
+M8D/M8E/M8H's `RenderDevice` reviews already applied). `runtime/CMakeLists.txt`
+still links `AREngine::Platform`/`AREngine::Frame` directly itself
+(unrelated to XR's own link graph), so nothing downstream broke — see
+"Validation Results" below. `XR` still does not depend on `Scene`,
+`Rendering`, `Runtime`, `Assets`, `Input`, or `Editor`, and `Core`
+remains entirely unaware that OpenXR exists — no OpenXR type appears
+anywhere under `engine/core`.
+
+### No OpenXR Types in Public Engine APIs (M9A)
+
+`AREngine/XR/XR.hpp` (the module's only public header) is completely
+unchanged by M9A — it still only declares the M0-era placeholder
+`ModuleName()`. Every OpenXR type (`XrInstance`, `XrSystemId`,
+`XrResult`, `XrSystemProperties`, etc.) is confined to
+`engine/xr/src/openxr/*.hpp`, private implementation headers in
+exactly the same sense `engine/rendering/src/vulkan/*.hpp` already are
+for Vulkan — reached only by this module's own `.cpp` files and by the
+manual bring-up demo/tests, which `#include` them directly by relative
+path (`"openxr/OpenXRInstance.hpp"`), never through any public
+`AREngine::XR` header.
+
+### Headset Absent Case (M9A)
+
+The manual demo (`tests/openxr_demo.cpp`) explicitly distinguishes
+three outcomes, per the brief, rather than treating every failure
+identically:
+
+- **A. No OpenXR runtime available** — `OpenXRInstance::IsValid()` is
+  false and `CreationResult() == XR_ERROR_RUNTIME_UNAVAILABLE`.
+- **B. Runtime exists, no HMD system** — instance creation succeeds,
+  but `TryGetHmdSystem`'s result has `found == false` and
+  `IsFormFactorUnavailable(rawResult)` is true.
+- **C. Runtime + HMD system available** — both succeed; system
+  properties are logged.
+
+Each produces a distinct, understandable log message (see
+`openxr_demo.cpp`), and in every case the demo returns `0` — no crash,
+no assert, no non-zero exit code for what are, on most machines,
+completely ordinary states. Case A was directly confirmed on this
+development machine, three separate times (default OpenXR-enabled
+build, the `/W4 /WX` build, and the OpenXR-ON/Vulkan-OFF build) — see
+"Validation Results". Cases B and C could not be exercised on this
+machine (no OpenXR runtime is installed to even reach case B, let alone
+a real headset for case C) — their code paths were verified by careful
+inspection against the exact `XrResult` values the OpenXR 1.1.62
+specification defines, not against real hardware. This is a known,
+honestly-reported gap, the same kind M8H's session already flagged for
+its own visual-verification limitation.
+
+### Automated Tests (M9A)
+
+`tests/openxr_tests.cpp` (`OpenXRTests`, gated behind
+`ARENGINE_ENABLE_OPENXR` exactly like `VulkanTests` is gated behind
+`ARENGINE_ENABLE_VULKAN`) makes **zero real OpenXR API calls** — only
+`DecodeXrVersion`/`FormatXrVersion`, `XrResultToReadableString`'s
+no-instance numeric fallback, and `IsFormFactorUnavailable`, all pure
+logic over OpenXR's plain C structs/enums as synthetic data. Runs on
+any machine with the OpenXR headers available at compile time, without
+needing a real loader, runtime, or headset — the same guarantee
+`VulkanTests` already makes for Vulkan. Real bring-up (instance/system
+creation against a real loader/runtime) is exercised only by the
+separate, manual `arengine_openxr_demo`.
+
+### Validation Results (M9A)
+
+`ARENGINE_ENABLE_OPENXR=OFF` (default): unchanged from before this
+milestone — full build, `ctest` **11/11**, no OpenXR headers/libs
+required anywhere (confirmed: `engine/xr` builds only `XR.cpp`, nothing
+under `src/openxr/` is even added to the target).
+
+`ARENGINE_ENABLE_OPENXR=ON` (default `ARENGINE_ENABLE_VULKAN=ON`): the
+OpenXR-SDK loader fetches and configures cleanly (pre-generated files
+used, no Python required), full `/W4 /WX` clean build (one real issue
+found and fixed during development: `XrApplicationInfo::applicationVersion`/
+`engineVersion` are plain `uint32_t` fields, not `XrVersion` — using
+`XR_MAKE_VERSION` for them, as an initial draft mistakenly did,
+silently truncates a 64-bit value into a 32-bit field, caught by `/W4`
+as `C4305`/`C4309` and fixed by packing a plain `uint32_t` instead),
+`ctest` **12/12** (new `OpenXRTests`, all others unchanged).
+
+`ARENGINE_ENABLE_OPENXR=ON` + `ARENGINE_ENABLE_VULKAN=OFF`: configures,
+builds (zero Vulkan targets present, confirming AREngine's own
+`Rendering` module built no Vulkan code), and passes all **11**
+non-Vulkan tests (`OpenXRTests` included) — directly confirming M9A is
+not coupled to Vulkan, per the brief's explicit requirement.
+
+`arengine_openxr_demo` run on this development machine (which has no
+OpenXR runtime installed) three times, once per configuration above:
+identical, correct Case A behavior every time — API layers enumerate
+successfully (0 found, loader-level query, no runtime needed);
+instance extension enumeration fails with `XR_ERROR_RUNTIME_UNAVAILABLE`
+(logged as a warning, not a crash); instance creation fails with the
+same `XR_ERROR_RUNTIME_UNAVAILABLE`, correctly recognized and reported
+as "no runtime installed - a normal, expected outcome," not a generic
+error; the demo exits with code `0`. The OpenXR loader's own internal
+diagnostic logging (printed directly to stderr by the loader itself,
+not by AREngine) is visible alongside AREngine's own log lines and is
+expected, normal loader behavior when no runtime is registered.
+
+- Active OpenXR runtime: **none installed on this development
+  machine** (Case A) — not reportable this session; see "Headset
+  Absent Case" above.
+- Requested OpenXR API version: **1.0** (`XR_API_VERSION_1_0`, formats
+  as `"1.0.62"` — see "Requested API Version" for why the patch
+  component isn't 0)
+- Header version at build time: **1.1.62** (`XR_CURRENT_API_VERSION`,
+  from the fetched `release-1.1.62` OpenXR-SDK)
+- Available API layers on this machine: **0**
+- Available instance extensions on this machine: **not queryable** (no
+  runtime - `XR_ERROR_RUNTIME_UNAVAILABLE`)
+- HMD `XrSystemId` / system name / max swapchain dimensions / max
+  layer count: **not obtainable this session** (bring-up never reaches
+  instance/system creation without a runtime) - the code paths that
+  would report these are implemented and unit-tested where separable,
+  but not exercised against real hardware; see "Headset Absent Case"
+
+### What's Deferred to M9B+
+
+No `XrSession`, no graphics binding, no Vulkan/OpenXR bridge
+(`xrGetVulkanGraphicsRequirementsKHR`/`xrCreateVulkanInstanceKHR`/
+`xrCreateVulkanDeviceKHR` and friends - all M9C), no XR swapchain, no
+`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/`xrLocateViews`, no reference
+spaces, no head tracking, no controllers, no hand/eye tracking, no
+passthrough, no anchors, no XR actions, no `XRFrameDriver`, no Scene
+rendering, no stereo rendering, no headset presentation. The existing
+`FrameDriver` abstraction (`Frame` module) is completely untouched by
+this milestone, and `engine/xr` does not link `Frame` at all right now
+(see "Dependency Trim" above) - it will come back once
+`XRFrameDriver` is real enough to need it. M8's Vulkan desktop path is
+completely unchanged - `tests/vulkan_present_demo.cpp` and everything
+under `engine/rendering` were not touched by this milestone.
+
+No architectural issues were discovered — the loader acquisition
+strategy, instance/system bring-up sequence, and graceful-failure
+handling all worked exactly as designed against the one real machine
+state available to test (no runtime installed), with the only real
+bug caught being the `applicationVersion`/`engineVersion` type
+mismatch, caught immediately by `/W4 /WX` before it could reach
+production. The one open item, consistent with M8H's own honestly-
+reported gap, is that Cases B and C of the headset-absent handling are
+verified by specification-level code review rather than real hardware,
+since no OpenXR runtime or headset was available this session.

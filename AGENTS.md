@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -247,12 +247,56 @@ on the development machine throughout), so the CPU/GPU counts and
 zero-validation-error result are log-confirmed, but a visual pass is
 still recommended before treating M8H as fully closed out.
 
+**M9A introduces OpenXR bring-up** — the `XR` module's first real
+content, gated behind a new top-level CMake option,
+`ARENGINE_ENABLE_OPENXR` (default **OFF**, mirroring
+`ARENGINE_ENABLE_VULKAN`'s pattern). When ON, `engine/xr/CMakeLists.txt`
+first tries `find_package(OpenXR CONFIG QUIET)`, then falls back to
+`FetchContent`-fetching the official Khronos `OpenXR-SDK` repository
+(pinned to `release-1.1.62`, pre-generated headers/loader — no Python
+needed, nothing vendored into this repo) if no system package is
+found — there is no Vulkan-SDK-style pre-installed system package for
+OpenXR on Windows. `engine/xr/src/openxr/` (private, never exposed
+through `AREngine/XR/XR.hpp`) gained `OpenXRVersion` (targets OpenXR
+1.0 core, the same "broad compatibility over the newest header"
+reasoning M8A used for Vulkan 1.2), `OpenXRResult` (`CheckXrResult`/
+`XrResultToReadableString`, mirroring `CheckVkResult`/`VkResultToString`),
+`OpenXRInstance` (owns one `XrInstance`, zero layers/extensions
+requested — but deliberately does **not** assert on
+`xrCreateInstance` failure, unlike every prior bring-up wrapper: "no
+OpenXR runtime installed" is a normal desktop-machine state, not a
+bug), and `OpenXRSystem` (`TryGetHmdSystem` requests an
+`XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY` system, also without asserting on
+failure — "no HMD connected" is likewise normal). `engine/xr`'s public
+link libraries were trimmed from `{Core, Platform, Frame}` down to
+`{Core}` only — neither Platform nor Frame is genuinely needed yet
+(no window, no `XRFrameDriver`), matching M9A's explicit minimal-
+dependency requirement; both can return once a later milestone gives a
+real reason. `tests/openxr_demo.cpp` (manual, gated behind
+`ARENGINE_ENABLE_OPENXR`, not part of `ctest`) proves the whole
+sequence end to end and explicitly distinguishes three outcomes rather
+than one generic failure: no runtime installed, runtime-but-no-HMD, and
+runtime-plus-HMD. On this development machine (no OpenXR runtime
+installed), the first case was confirmed three times — default OpenXR
+build, `/W4 /WX` build, and an `ARENGINE_ENABLE_OPENXR=ON` +
+`ARENGINE_ENABLE_VULKAN=OFF` build (proving M9A is not coupled to
+Vulkan) — all exiting cleanly with code 0, zero crashes. The other two
+cases could not be exercised on this machine and were verified by
+specification-level code review instead — an honestly-reported gap,
+same as M8H's own visual-verification gap. See `docs/ARCHITECTURE.md`
+Section 24 for full details, including the one real `/W4`-caught bug
+(`XrApplicationInfo::applicationVersion`/`engineVersion` are plain
+`uint32_t`, not `XrVersion` — an initial draft's use of
+`XR_MAKE_VERSION` for them silently truncated a 64-bit value, fixed
+before this milestone shipped).
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, and no analog/XR/controller input — see Sections 11–15.
-Everything else (`XR`, `Editor`) is still an M0-style stub with no
-functionality. Next up is M8I+ (Scene integration). See
+system, and no `XrSession`/graphics binding/Vulkan-OpenXR bridge/
+frame loop/head tracking/controllers — see Sections 11–15. `Editor` is
+still an M0-style stub with no functionality. Next up is M9B+ (not yet
+planned) or M8I+ (Scene integration, still pending within M8) — see
 `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
@@ -266,8 +310,12 @@ functionality. Next up is M8I+ (Scene integration). See
    reusable mesh representation only (M8A–M8H)**: no real image
    loading, no uniform buffers, no `SceneRenderer`/Scene integration,
    no `MeshAsset`/model loading yet — see `docs/ROADMAP.md`'s M8I+ row
-   for what's still pending within M8. **No OpenXR code** before
-   milestone M9.
+   for what's still pending within M8.
+3a. **OpenXR bring-up only (M9A)**: no `XrSession`, no graphics
+   binding, no Vulkan/OpenXR bridge, no XR swapchain, no frame loop
+   (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/`xrLocateViews`), no
+   reference spaces, no head/hand/eye tracking, no passthrough, no
+   anchors, no `XRFrameDriver` — see `docs/ROADMAP.md`'s M9B+ row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

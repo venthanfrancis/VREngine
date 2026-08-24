@@ -134,6 +134,36 @@ if(ARENGINE_ENABLE_VULKAN)
     target_compile_features(arengine_vulkan_present_demo PRIVATE cxx_std_20)
 endif()
 
+# Everything OpenXR-specific is gated on ARENGINE_ENABLE_OPENXR (top-
+# level option, default OFF) — when OFF, none of this is added: no
+# OpenXR headers/loader required at all. Deliberately independent of
+# ARENGINE_ENABLE_VULKAN in both directions (its own if-block, not
+# nested inside the Vulkan one) — M9A must build and test whether or
+# not Vulkan is enabled. See docs/ARCHITECTURE.md, "OpenXR Build Option
+# (M9A)".
+if(ARENGINE_ENABLE_OPENXR)
+    # Pure-logic OpenXR tests: no real OpenXR API calls, so no loader/
+    # runtime/headset is required at runtime — see openxr_tests.cpp.
+    add_executable(arengine_openxr_tests
+        openxr_tests.cpp
+    )
+    target_link_libraries(arengine_openxr_tests PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader)
+    target_include_directories(arengine_openxr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+    target_compile_features(arengine_openxr_tests PRIVATE cxx_std_20)
+    add_test(NAME OpenXRTests COMMAND arengine_openxr_tests)
+
+    # Manual-only: requires a real OpenXR loader/runtime (and ideally a
+    # real headset) which CI/headless systems lack. Built by CMake but
+    # deliberately NOT registered with add_test. Run it directly
+    # instead. See docs/ARCHITECTURE.md, "M9A Implementation Notes".
+    add_executable(arengine_openxr_demo
+        openxr_demo.cpp
+    )
+    target_link_libraries(arengine_openxr_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader)
+    target_include_directories(arengine_openxr_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+    target_compile_features(arengine_openxr_demo PRIVATE cxx_std_20)
+endif()
+
 # Manual-only: proves M2's Window works end-to-end with real user
 # interaction (opening a window, closing it via the close button). Built
 # by CMake but deliberately NOT registered with add_test — CTest must

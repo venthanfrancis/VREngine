@@ -33,7 +33,9 @@ all come after that chain is proven.
 | — M8G | Backend-independent `Scene::Camera` abstraction, driven by a demo-private controller using `Input`: WASD move, click-drag mouse look, delta-time-based movement over a small hard-coded scene. | **Complete** | See `docs/ARCHITECTURE.md` Section 22 |
 | — M8H | Reusable mesh representation: backend-independent `Rendering::MeshData`, Vulkan-private `VulkanMesh`, one cube mesh uploaded once and drawn as multiple instances via different Model transforms. Back-face culling enabled. | **Complete** | See `docs/ARCHITECTURE.md` Section 23 |
 | — M8I+ | Scene integration | Not started | |
-| M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | Not started | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps |
+| M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | In progress | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps. Split into sub-milestones — see below |
+| — M9A | OpenXR bring-up: loader discovery (fetched via CMake), `XrInstance`, API layer/instance extension enumeration, HMD-class `XrSystemId` request + system properties, graceful no-runtime/no-headset handling. No session, no swapchain, no Vulkan/OpenXR bridge. | **Complete** | See `docs/ARCHITECTURE.md` Section 24 |
+| — M9B+ | (not yet planned) | Not started | |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |
 | M12 | `Audio`: minimal implementation | Deprioritized | Starts only after M10 |
