@@ -34,8 +34,13 @@ all come after that chain is proven.
 | — M8H | Reusable mesh representation: backend-independent `Rendering::MeshData`, Vulkan-private `VulkanMesh`, one cube mesh uploaded once and drawn as multiple instances via different Model transforms. Back-face culling enabled. | **Complete** | See `docs/ARCHITECTURE.md` Section 23 |
 | — M8I+ | Scene integration | Not started | |
 | M9 | `XR` module: OpenXR integration, `XRFrameDriver` implementing wait/predict/submit | In progress | `Runtime`'s main loop requires no changes — only the `FrameDriver` swaps. Split into sub-milestones — see below |
-| — M9A | OpenXR bring-up: loader discovery (fetched via CMake), `XrInstance`, API layer/instance extension enumeration, HMD-class `XrSystemId` request + system properties, graceful no-runtime/no-headset handling. No session, no swapchain, no Vulkan/OpenXR bridge. | **Complete** | See `docs/ARCHITECTURE.md` Section 24 |
-| — M9B+ | (not yet planned) | Not started | |
+| — M9A | OpenXR instance/system discovery: loader discovery (fetched via CMake), `XrInstance`, API layer/instance extension enumeration, HMD-class `XrSystemId` request + system properties, graceful no-runtime/no-headset handling. No session, no swapchain, no Vulkan/OpenXR bridge. | **Complete** | See `docs/ARCHITECTURE.md` Section 24 |
+| — M9B | Runtime/simulator development environment: planning/review only — inspect this machine's OpenXR runtime registration, confirm how the loader discovers runtimes, recommend a conformant, vendor-neutral-to-AREngine runtime/simulator for headset-free development. No engine code changes; no installation performed yet. | **Complete** | See `docs/ARCHITECTURE.md` Section 25 |
+| — M9C | Vulkan/OpenXR graphics requirements and graphics binding: `xrGetVulkanGraphicsRequirementsKHR` and the Vulkan instance/device/queue negotiation a graphics `XrSession` requires. Still no session. | Not started | Must precede M9D — see `docs/ARCHITECTURE.md` Section 25, "Why Graphics Binding Must Precede a Graphics XrSession" |
+| — M9D | `XrSession` + session-state handling (`xrPollEvent`/`XrEventDataSessionStateChanged`) + reference spaces. | Not started | |
+| — M9E | XR swapchains + frame lifecycle (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`). | Not started | |
+| — M9F | `xrLocateViews` + stereo rendering. | Not started | |
+| — M9G | Head-tracked AREngine demo. | Not started | Fulfills M9's own goal, ahead of M10's full AR/XR demo |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |
 | M12 | `Audio`: minimal implementation | Deprioritized | Starts only after M10 |

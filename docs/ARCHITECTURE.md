@@ -3718,3 +3718,196 @@ production. The one open item, consistent with M8H's own honestly-
 reported gap, is that Cases B and C of the headset-absent handling are
 verified by specification-level code review rather than real hardware,
 since no OpenXR runtime or headset was available this session.
+
+## 25. M9B: Runtime/Simulator Development Environment (Planning Only)
+
+M9B is a **planning/review milestone with zero engine code changes** —
+it exists because of a roadmap correction discovered right after M9A:
+a normal (non-headless) OpenXR session requires a graphics binding at
+creation time, so `XrSession` cannot be implemented before Vulkan/
+OpenXR graphics integration exists (see "Why Graphics Binding Must
+Precede a Graphics XrSession" below). M9B's job is narrower than that:
+confirm this development machine's current OpenXR runtime state, and
+recommend (not install) a suitable runtime/simulator so M9C+ can
+eventually be validated against something real. No files under
+`engine/` changed in this milestone.
+
+### Revised M9 Sub-Milestone Order
+
+M9A's original roadmap entry ("OpenXR integration") is now split more
+finely, in this conceptual order:
+
+- **M9A** — OpenXR instance/system discovery (complete).
+- **M9B** — runtime/simulator development environment (this section).
+- **M9C** — Vulkan/OpenXR graphics requirements and graphics binding.
+- **M9D** — `XrSession` + session-state handling + reference spaces.
+- **M9E** — XR swapchains + frame lifecycle.
+- **M9F** — `xrLocateViews` + stereo rendering.
+- **M9G** — head-tracked AREngine demo.
+
+See `docs/ROADMAP.md` for the corresponding table rows.
+
+### Why Graphics Binding Must Precede a Graphics XrSession
+
+`xrCreateSession`'s `XrSessionCreateInfo` has a `next` chain, and for
+any *normal* (non-headless) session, that chain **must** contain a
+graphics-API-specific binding struct — for Vulkan, `XrGraphicsBindingVulkanKHR`,
+carrying an already-created `VkInstance`, `VkPhysicalDevice`,
+`VkDevice`, and the queue family/index AREngine intends to render
+with. Without it, there is no valid `XrSessionCreateInfo` to
+construct at all for a graphics session — this isn't a missing
+optional feature, it's a required input the struct has no sensible
+default for. (A session-less/graphics-less mode does exist in OpenXR —
+the `XR_MND_headless` extension — but that is an optional,
+vendor-adjacent extension for non-rendering use cases, not the
+"normal" graphics session this roadmap's M9D is aiming for.)
+
+Beyond just *having* Vulkan objects, the OpenXR spec requires the app
+to *negotiate* them with the runtime first, specifically so the
+runtime's compositor and the app agree on exactly which physical GPU
+and Vulkan API version are in play (a machine can have multiple GPUs;
+the runtime needs the app rendering on the same one driving the
+headset's output):
+
+1. `xrGetVulkanGraphicsRequirementsKHR` — asks the runtime what
+   Vulkan API version range it supports, *before* creating a
+   `VkInstance`.
+2. `xrGetVulkanGraphicsDeviceKHR` (or the runtime-driven
+   `xrCreateVulkanInstanceKHR`/`xrCreateVulkanDeviceKHR` path) — asks
+   the runtime which physical device to use, rather than AREngine's
+   own `SelectPhysicalDeviceForPresentation` (M8B) picking one
+   independently, which could disagree with the headset's actual
+   output device.
+
+Only once this negotiation produces a `VkInstance`/`VkPhysicalDevice`/
+`VkDevice`/queue tuple the runtime has agreed to is there anything
+valid to place in `XrGraphicsBindingVulkanKHR` and hand to
+`xrCreateSession`. This is exactly why M9C (graphics requirements +
+graphics binding) is sequenced immediately before M9D (`XrSession`) and
+never the other way around — attempting `XrSession` first, as M9A's
+original unsplit roadmap entry implicitly suggested, would have hit
+this requirement with nothing to satisfy it.
+
+### Environment Inspection (M9B)
+
+Checked directly on this development machine (Windows 11, build
+26200):
+
+- **`XR_RUNTIME_JSON` environment variable** (the loader's absolute
+  override, checked first before any registry lookup): **not set**, at
+  process, user, or machine scope.
+- **`HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\OpenXR\1\ActiveRuntime`**
+  (the standard Windows runtime-registration key the loader falls back
+  to): **the key does not exist at all** — not merely empty. Confirmed
+  by direct registry inspection; only `HKLM\SOFTWARE\Khronos\Vulkan`
+  exists under `Khronos` (created by the Vulkan SDK installer), with
+  no sibling `OpenXR` key.
+- **Known OpenXR runtime software** (SteamVR, Meta/Oculus, Varjo Base,
+  Windows Mixed Reality, ALVR, Monado): checked via installed-program
+  registry entries and known install paths — **none found**.
+- **Windows Mixed Reality specifically**: not installed, and not
+  expected to be viable even if reinstalled — Microsoft retired the
+  WMR platform (including its OpenXR runtime) starting with Windows 11
+  24H2; this machine's build (26200) postdates that removal.
+
+This precisely explains M9A's own observed behavior: `xrCreateInstance`
+failing with `XR_ERROR_RUNTIME_UNAVAILABLE`, and the OpenXR loader's
+own diagnostic log ("`RuntimeManifestFile::FindManifestFiles - failed
+to find active runtime file in registry`") — the loader's Windows
+runtime lookup found nothing because there is, genuinely, nothing
+registered.
+
+### How the OpenXR Loader Discovers Runtimes (M9B)
+
+Confirmed by direct inspection of the fetched OpenXR-SDK loader's own
+source (`src/loader/manifest_file.cpp`,
+`RuntimeManifestFile::FindManifestFiles`), not just general knowledge —
+the exact order is:
+
+1. **`XR_RUNTIME_JSON` environment variable** — if set (and points at
+   a real, readable file), it is used unconditionally, bypassing the
+   registry entirely. This is the standard way to force a specific
+   runtime for local testing without touching the registry.
+2. **Windows registry**, `HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\OpenXR\<major-version>\ActiveRuntime`
+   (a `REG_SZ` value naming an absolute path to a runtime manifest
+   JSON file) — `HKEY_LOCAL_MACHINE` only; unlike API-layer discovery
+   (which also checks `HKEY_CURRENT_USER`), the *active runtime* key is
+   HKLM-only in this loader version. Setting it requires installing (or
+   manually registering) a runtime with administrator privileges - a
+   per-user override is not part of the standard runtime lookup.
+3. If neither yields a valid manifest, `xrCreateInstance` (and any
+   loader-level call that needs to talk to a runtime, such as
+   `xrEnumerateInstanceExtensionProperties`) fails with
+   `XR_ERROR_RUNTIME_UNAVAILABLE` — exactly the case M9A's demo
+   exercised and this section's environment inspection explains.
+
+Note this is entirely separate from **API layer** discovery (also
+registry-based, under a sibling `ApiLayers\Implicit`/`ApiLayers\Explicit`
+key structure, and does check `HKEY_CURRENT_USER` as a fallback) — M9A
+already confirmed 0 layers present on this machine, consistent with no
+runtime (many API layers ship alongside a runtime installation) having
+ever been installed here either.
+
+### Recommended Runtime/Simulator (M9B)
+
+**Recommendation: SteamVR's OpenXR runtime, run with a null/simulated
+HMD driver (no physical headset required).** Reasoning against the
+brief's own criteria:
+
+- **Conformant**: SteamVR's OpenXR runtime is on Khronos's official
+  Adopters/Conformant Products list — satisfies "prefer a conformant
+  OpenXR runtime" directly, rather than an experimental or
+  partially-compliant implementation.
+- **No custom AR glasses required**: SteamVR supports running without
+  a real headset via its built-in null/simulated HMD driver
+  (`driver_null`) — well-documented, widely used by the OpenXR/OpenVR
+  developer community specifically for headless CI and no-hardware
+  development. This would let AREngine's future M9D+ session/swapchain/
+  frame-loop code be exercised against a real, conformant runtime's
+  actual state machine (session states, frame timing) without needing
+  physical AR/VR hardware.
+- **Free and easy to install**: distributed via Steam (itself free),
+  no purchase required to install and register the runtime.
+- **No AREngine coupling**: AREngine's own code has zero
+  runtime-specific logic today — no vendor extensions requested, no
+  SteamVR-specific assumptions anywhere in `engine/xr`. Whichever
+  runtime is "active" is an OS/environment-level choice (the registry
+  key above), completely outside AREngine's code. Recommending SteamVR
+  for *this developer's local testing* does not create any code-level
+  dependency on Valve — a different developer, or a future CI machine,
+  could just as validly point `XR_RUNTIME_JSON` at a different
+  conformant runtime with zero AREngine changes.
+
+**Alternative considered**: **Meta XR Simulator** (Meta's own
+standalone, headset-free OpenXR runtime/simulator, free to download,
+does not require owning a Quest) is a legitimate secondary option,
+particularly if future milestones want to exercise Meta-specific
+extensions (hand tracking, passthrough) — but it is more feature-heavy
+and Quest-content-oriented than M9C–M9E's actual near-term needs
+(graphics binding, session states, basic stereo rendering), so SteamVR
+remains the primary recommendation for now.
+
+**Ruled out**: Windows Mixed Reality (platform retired on this
+Windows build, confirmed above); Meta/Oculus native runtime and Varjo
+Base (both require owning the actual respective hardware, contradicting
+"without requiring custom AR glasses"); Monado (Windows support is
+limited/experimental compared to its Linux-first target, a weaker fit
+for a smooth Windows dev loop than SteamVR).
+
+**Nothing has been installed.** Per the brief, this is a
+recommendation only, reported before any installation, awaiting
+explicit approval to proceed.
+
+### What's Deferred to M9C+
+
+No Vulkan/OpenXR graphics requirements query, no graphics binding, no
+`XrSession`, no session-state handling, no reference spaces, no XR
+swapchains, no frame lifecycle (`xrWaitFrame`/`xrBeginFrame`/
+`xrEndFrame`), no `xrLocateViews`, no stereo rendering, no head-tracked
+demo, and (per this milestone) no runtime/simulator actually installed
+yet. `engine/xr`'s M9A-established structure (`OpenXRInstance`,
+`OpenXRSystem`, `OpenXRResult`, `OpenXRVersion`, all private under
+`src/openxr/`) is completely unchanged.
+
+No architectural issues were discovered — this was a documentation/
+investigation-only milestone with no code surface to introduce them.

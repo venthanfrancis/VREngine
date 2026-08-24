@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -290,14 +290,46 @@ Section 24 for full details, including the one real `/W4`-caught bug
 `XR_MAKE_VERSION` for them silently truncated a 64-bit value, fixed
 before this milestone shipped).
 
+**M9B is a planning/review milestone only — zero engine code changed.**
+Triggered by a roadmap correction found right after M9A: a normal
+(non-headless) `XrSession` requires a graphics binding at creation time
+(`XrGraphicsBindingVulkanKHR`'s `VkInstance`/`VkPhysicalDevice`/
+`VkDevice`/queue, negotiated via `xrGetVulkanGraphicsRequirementsKHR`
+first), so `XrSession` cannot come before Vulkan/OpenXR graphics
+integration exists — M9's sub-milestones were re-ordered accordingly
+(M9C graphics binding now precedes M9D `XrSession`; see
+`docs/ROADMAP.md` and `docs/ARCHITECTURE.md` Section 25, "Why Graphics
+Binding Must Precede a Graphics XrSession," for the full reasoning).
+M9B inspected this development machine directly: no `XR_RUNTIME_JSON`
+override, and `HKLM\SOFTWARE\Khronos\OpenXR\1\ActiveRuntime` doesn't
+exist at all (confirmed via the registry, not just inference) — no
+OpenXR runtime has ever been registered here, explaining M9A's observed
+`XR_ERROR_RUNTIME_UNAVAILABLE` precisely. The OpenXR loader's own
+fetched source was inspected to confirm its exact Windows discovery
+order: `XR_RUNTIME_JSON` env var first, then
+`HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\OpenXR\<major>\ActiveRuntime`
+(HKLM only — no `HKEY_CURRENT_USER` fallback for the runtime itself,
+unlike API-layer discovery). **Recommendation (not installed yet)**:
+SteamVR's OpenXR runtime, run with its built-in null/simulated-HMD
+driver — Khronos-conformant, free, requires no physical headset,
+and creates zero code-level coupling (AREngine's `engine/xr` requests
+no vendor extensions and has no runtime-specific logic; whichever
+runtime is "active" is purely an OS/registry-level choice). Meta XR
+Simulator was considered as a secondary option; Windows Mixed Reality
+was ruled out (platform retired on this Windows build). See
+`docs/ARCHITECTURE.md` Section 25 for the full investigation and
+reasoning. Installation awaits explicit approval — nothing was
+installed this milestone.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
 system, and no `XrSession`/graphics binding/Vulkan-OpenXR bridge/
 frame loop/head tracking/controllers — see Sections 11–15. `Editor` is
-still an M0-style stub with no functionality. Next up is M9B+ (not yet
-planned) or M8I+ (Scene integration, still pending within M8) — see
-`docs/ROADMAP.md` for the full plan.
+still an M0-style stub with no functionality. Next up is M9C (Vulkan/
+OpenXR graphics requirements and graphics binding) or M8I+ (Scene
+integration, still pending within M8) — see `docs/ROADMAP.md` for the
+full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -311,11 +343,16 @@ planned) or M8I+ (Scene integration, still pending within M8) — see
    loading, no uniform buffers, no `SceneRenderer`/Scene integration,
    no `MeshAsset`/model loading yet — see `docs/ROADMAP.md`'s M8I+ row
    for what's still pending within M8.
-3a. **OpenXR bring-up only (M9A)**: no `XrSession`, no graphics
-   binding, no Vulkan/OpenXR bridge, no XR swapchain, no frame loop
-   (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/`xrLocateViews`), no
-   reference spaces, no head/hand/eye tracking, no passthrough, no
-   anchors, no `XRFrameDriver` — see `docs/ROADMAP.md`'s M9B+ row.
+3a. **OpenXR instance/system discovery only so far (M9A–M9B)**: no
+   `XrSession`, no graphics binding, no Vulkan/OpenXR bridge, no XR
+   swapchain, no frame loop (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`/
+   `xrLocateViews`), no reference spaces, no head/hand/eye tracking, no
+   passthrough, no anchors, no `XRFrameDriver`. **`XrSession` must not
+   be implemented before M9C's Vulkan/OpenXR graphics binding exists** —
+   see `docs/ROADMAP.md`'s M9C row and `docs/ARCHITECTURE.md` Section
+   25 for why. No OpenXR runtime/simulator has been installed on the
+   development machine yet either — see Section 25's recommendation,
+   pending separate approval to install.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a
