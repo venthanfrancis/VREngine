@@ -1,6 +1,11 @@
 // M1 tests for AREngine::Frame: FrameTiming, ViewInfo, and the
 // FrameDriver interface (exercised via a minimal dummy implementation —
 // not a real desktop or XR driver; those come in later milestones).
+//
+// M9E.5 adds FrameStatus/FrameContext coverage and updates
+// DummyFrameDriver to the redesigned PrepareFrame/BeginFrame/GetViews/
+// EndFrame interface - see docs/ARCHITECTURE.md, "New Lifecycle API
+// (M9E.5)".
 
 #include "AREngine/Frame/Frame.hpp"
 
@@ -22,11 +27,16 @@ namespace
     class DummyFrameDriver : public AREngine::Frame::FrameDriver
     {
     public:
-        AREngine::Frame::FrameTiming WaitForNextFrame() override
+        AREngine::Frame::FrameContext PrepareFrame() override
         {
             AREngine::Frame::FrameTiming timing;
             timing.deltaTimeSeconds = 0.016;
-            return timing;
+            return AREngine::Frame::FrameContext{timing, AREngine::Frame::FrameStatus::Continue};
+        }
+
+        void BeginFrame() override
+        {
+            ++beginCount;
         }
 
         std::vector<AREngine::Frame::ViewInfo> GetViews() override
@@ -34,12 +44,13 @@ namespace
             return { AREngine::Frame::ViewInfo{} };
         }
 
-        void SubmitFrame() override
+        void EndFrame() override
         {
-            ++submitCount;
+            ++endCount;
         }
 
-        int submitCount = 0;
+        int beginCount = 0;
+        int endCount = 0;
     };
 
     void TestFrameTiming()
@@ -48,6 +59,22 @@ namespace
         Check(timing.deltaTimeSeconds == 0.0, "FrameTiming defaults deltaTimeSeconds to 0");
         Check(timing.totalTimeSeconds == 0.0, "FrameTiming defaults totalTimeSeconds to 0");
         Check(timing.predictedDisplayTimeSeconds == 0.0, "FrameTiming defaults predictedDisplayTimeSeconds to 0");
+        Check(timing.shouldRender == true, "FrameTiming defaults shouldRender to true");
+    }
+
+    void TestFrameStatus()
+    {
+        using AREngine::Frame::FrameStatus;
+        Check(FrameStatus::Continue != FrameStatus::Idle, "Continue and Idle are distinct");
+        Check(FrameStatus::Continue != FrameStatus::Stop, "Continue and Stop are distinct");
+        Check(FrameStatus::Idle != FrameStatus::Stop, "Idle and Stop are distinct");
+    }
+
+    void TestFrameContext()
+    {
+        const AREngine::Frame::FrameContext context;
+        Check(context.status == AREngine::Frame::FrameStatus::Continue, "FrameContext defaults status to Continue");
+        Check(context.timing.shouldRender == true, "FrameContext's default timing defaults shouldRender to true");
     }
 
     void TestViewInfo()
@@ -63,20 +90,26 @@ namespace
     {
         DummyFrameDriver driver;
 
-        const auto timing = driver.WaitForNextFrame();
-        Check(timing.deltaTimeSeconds == 0.016, "FrameDriver::WaitForNextFrame returns timing");
+        const auto context = driver.PrepareFrame();
+        Check(context.timing.deltaTimeSeconds == 0.016, "FrameDriver::PrepareFrame returns timing");
+        Check(context.status == AREngine::Frame::FrameStatus::Continue, "FrameDriver::PrepareFrame returns a status");
+
+        driver.BeginFrame();
+        Check(driver.beginCount == 1, "FrameDriver::BeginFrame can be called");
 
         const auto views = driver.GetViews();
         Check(views.size() == 1, "FrameDriver::GetViews can return a view");
 
-        driver.SubmitFrame();
-        Check(driver.submitCount == 1, "FrameDriver::SubmitFrame can be called");
+        driver.EndFrame();
+        Check(driver.endCount == 1, "FrameDriver::EndFrame can be called");
     }
 }
 
 int main()
 {
     TestFrameTiming();
+    TestFrameStatus();
+    TestFrameContext();
     TestViewInfo();
     TestFrameDriver();
 

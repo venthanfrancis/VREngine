@@ -7,7 +7,7 @@ namespace AREngine::Runtime
     {
     }
 
-    Frame::FrameTiming DesktopFrameDriver::WaitForNextFrame()
+    Frame::FrameContext DesktopFrameDriver::PrepareFrame()
     {
         // "Wait" is a no-op on desktop today — there is nothing to
         // synchronize with yet (no vsync/present; see
@@ -20,7 +20,17 @@ namespace AREngine::Runtime
         timing.totalTimeSeconds = m_clock.ElapsedSeconds();
         // predictedDisplayTimeSeconds stays at its default (0) —
         // meaningless on desktop; real values arrive with XRFrameDriver.
-        return timing;
+        // shouldRender stays at its default (true) — desktop has no
+        // reason to ever skip rendering. FrameStatus stays at its
+        // default (Continue) — desktop never returns Idle or Stop; see
+        // docs/ARCHITECTURE.md, "Desktop Mapping (M9E.5)".
+        return Frame::FrameContext{timing, Frame::FrameStatus::Continue};
+    }
+
+    void DesktopFrameDriver::BeginFrame()
+    {
+        // Nothing to do yet — there is no renderer. Once Rendering
+        // exists, this is where per-frame desktop setup would happen.
     }
 
     std::vector<Frame::ViewInfo> DesktopFrameDriver::GetViews()
@@ -32,7 +42,7 @@ namespace AREngine::Runtime
         return { Frame::ViewInfo{} };
     }
 
-    void DesktopFrameDriver::SubmitFrame()
+    void DesktopFrameDriver::EndFrame()
     {
         // Nothing to submit yet — there is no renderer. Once Rendering
         // exists, this is where a desktop present would happen.

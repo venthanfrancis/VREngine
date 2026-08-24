@@ -27,5 +27,19 @@ namespace AREngine::Frame
         // not an OpenXR type — the XR module will translate OpenXR's
         // time representation into this later.
         double predictedDisplayTimeSeconds = 0.0;
+
+        // Whether the frame source wants the caller to actually render
+        // this frame. True by default — desktop (and any driver with no
+        // reason to skip) simply always renders. False only when the
+        // backend has real evidence rendering would be wasted (e.g.
+        // OpenXR's own shouldRender=false while the session is running
+        // but not currently visible/focused). Added in M9E.5 from real
+        // OpenXR evidence — see docs/ARCHITECTURE.md, "shouldRender
+        // Semantics (M9E.5)". Only meaningful when the FrameContext this
+        // timing came from has FrameStatus::Continue — see
+        // FrameStatus.hpp for why "no frame lifecycle at all this tick"
+        // is a separate concept from "a frame is happening, but skip
+        // its content."
+        bool shouldRender = true;
     };
 }

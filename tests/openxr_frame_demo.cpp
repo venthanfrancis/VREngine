@@ -1,18 +1,32 @@
-// Manual M9E validation demo — NOT part of the automated CTest suite,
-// since it requires a real OpenXR loader/runtime with XR_KHR_vulkan_enable2
-// support (and ideally a real or simulated HMD) that CI/headless systems
-// may lack. Built by CMake but deliberately not registered with
-// add_test. Run it manually.
+// Manual M9E/M9E.5 validation demo — NOT part of the automated CTest
+// suite, since it requires a real OpenXR loader/runtime with
+// XR_KHR_vulkan_enable2 support (and ideally a real or simulated HMD)
+// that CI/headless systems may lack. Built by CMake but deliberately
+// not registered with add_test. Run it manually.
 //
 // Proves AREngine's first real OpenXR frame lifecycle end to end: create
 // the M9C Vulkan graphics binding -> create an XrSession (M9D) -> select
 // PRIMARY_STEREO (M9D) -> enumerate + select an environment blend mode
 // -> enumerate + select a swapchain color format -> create one XrSwapchain
 // per view, sized from the runtime's own recommended dimensions/sample
-// count -> run a real xrWaitFrame/xrBeginFrame/(acquire/wait/clear/
-// release)/xrEndFrame loop, submitting ZERO composition layers, until a
-// target frame count is reached -> xrRequestExitSession -> observe the
-// runtime drive STOPPING/EXITING -> clean shutdown.
+// count -> drive a real xrWaitFrame/xrBeginFrame/(acquire/wait/clear/
+// release)/xrEndFrame loop THROUGH XRFrameDriver (M9E.5's generic
+// Frame::FrameDriver implementation for OpenXR - see
+// engine/xr/src/openxr/XRFrameDriver.hpp), submitting ZERO composition
+// layers, until a target frame count is reached -> xrRequestExitSession
+// -> observe the runtime drive STOPPING/EXITING -> clean shutdown.
+//
+// M9E.5 note: the session-state event loop (poll/BeginSession/EndSession/
+// stop-detection) and the raw xrWaitFrame/xrBeginFrame/xrEndFrame calls
+// that M9E drove manually, inline, in this file are now entirely inside
+// XRFrameDriver - this demo only calls PrepareFrame()/BeginFrame()/
+// EndFrame() and reacts to the generic FrameContext/FrameStatus/
+// shouldRender they return. What stays here, unchanged in substance: the
+// swapchain-specific Vulkan work (acquire/wait/clear/release across the
+// two OpenXRSwapchains) - a deliberate ownership decision, not an
+// oversight; see docs/ARCHITECTURE.md, "Render-Target Acquisition
+// Ownership (M9E.5)". This demo plays the "Renderer/XR integration"
+// coordinating role no dedicated module implements yet.
 //
 // Does NOT call xrLocateViews or xrLocateSpace (no real view pose/FOV
 // data exists yet - deferred to M9F), does NOT submit any
@@ -35,18 +49,18 @@
 // all reported clearly and stopped on cleanly, never crashed on.
 
 #include "AREngine/Core/Core.hpp"
+#include "AREngine/Frame/Frame.hpp"
 
 #include "openxr/OpenXREnvironmentBlendMode.hpp"
-#include "openxr/OpenXRFrameTiming.hpp"
 #include "openxr/OpenXRInstance.hpp"
 #include "openxr/OpenXRResult.hpp"
 #include "openxr/OpenXRSession.hpp"
-#include "openxr/OpenXRSessionState.hpp"
 #include "openxr/OpenXRSwapchain.hpp"
 #include "openxr/OpenXRSystem.hpp"
 #include "openxr/OpenXRVersion.hpp"
 #include "openxr/OpenXRViewConfiguration.hpp"
 #include "openxr/OpenXRVulkanGraphicsBinding.hpp"
+#include "openxr/XRFrameDriver.hpp"
 
 #include <array>
 #include <chrono>
@@ -169,6 +183,7 @@ namespace
 int main()
 {
     using namespace AREngine::XR::OpenXR;
+    namespace Frame = AREngine::Frame;
 
     AR_LOG_INFO(std::format("AREngine OpenXR frame demo - header version {}, requesting API version {}",
                              FormatXrVersion(XR_CURRENT_API_VERSION), FormatXrVersion(kTargetApiVersion)));
@@ -340,83 +355,51 @@ int main()
     VkFence renderFence = VK_NULL_HANDLE;
     CheckVkResultHere(vkCreateFence(bindingData.device, &fenceInfo, nullptr, &renderFence), "vkCreateFence");
 
-    // --- Frame loop ---
+    // --- Frame loop, driven through XRFrameDriver (M9E.5) ---
     AR_LOG_INFO(std::format("Beginning OpenXR frame loop - target {} completed frames before requesting exit...", kTargetFrameCount));
 
-    XrSessionState currentState = XR_SESSION_STATE_UNKNOWN;
-    std::vector<XrSessionState> observedStates;
+    XRFrameDriver frameDriver(instance.Get(), session, *primaryViewConfigType, *selectedBlendMode);
+
     std::uint32_t completedFrameCount = 0;
     bool exitRequested = false;
     const auto startTime = std::chrono::steady_clock::now();
 
     while (true)
     {
-        const SessionEventPollResult pollResult = PollSessionEvents(instance.Get());
+        // PrepareFrame() internally polls session-state events (reacting
+        // to every transition observed, in order - not just the last
+        // one) and either calls the real xrWaitFrame (FrameStatus::
+        // Continue) or reports FrameStatus::Idle (session not currently
+        // running - not yet begun, or between STOPPING and EXITING; no
+        // xrWaitFrame call was made) or FrameStatus::Stop (session
+        // reached a terminal state). See XRFrameDriver.cpp.
+        const Frame::FrameContext frameContext = frameDriver.PrepareFrame();
 
-        if (pollResult.instanceLossPending)
+        if (frameContext.status == Frame::FrameStatus::Stop)
         {
-            AR_LOG_WARNING("XrEventDataInstanceLossPending received - stopping cleanly.");
+            AR_LOG_INFO("Frame driver reports FrameStatus::Stop - stopping the main loop cleanly (not an error)");
             break;
         }
 
-        if (pollResult.sessionStateChanged)
+        if (frameContext.status == Frame::FrameStatus::Idle)
         {
-            currentState = pollResult.newSessionState;
-            observedStates.push_back(currentState);
-            AR_LOG_INFO(std::format("Session state changed -> {}", FormatSessionState(currentState)));
-
-            if (ShouldBeginSession(currentState))
-            {
-                session.BeginSession(*primaryViewConfigType);
-                AR_LOG_INFO("xrBeginSession succeeded - session is now running; the frame loop below is what "
-                            "should now drive it toward SYNCHRONIZED/VISIBLE/FOCUSED (unlike M9D, which had no "
-                            "frame loop and could never observe those states)");
-            }
-            else if (ShouldEndSession(currentState, session.IsRunning()))
-            {
-                session.EndSession();
-                AR_LOG_INFO("xrEndSession succeeded - session is no longer running");
-            }
-        }
-
-        if (ShouldStopMainLoop(currentState))
-        {
-            AR_LOG_INFO(std::format("{} - stopping the main loop cleanly (not an error)", FormatSessionState(currentState)));
-            break;
-        }
-
-        // xrWaitFrame is only called while the session is actually
-        // running (between xrBeginSession and xrEndSession) - confirmed
-        // empirically against SteamVR's null driver, NOT assumed: an
-        // earlier version of this loop called xrWaitFrame
-        // unconditionally every iteration (matching general OpenXR
-        // guidance to participate in frame timing as early as possible)
-        // and this runtime accepted that fine right up until STOPPING ->
-        // xrEndSession was called, at which point the very next
-        // xrWaitFrame call failed with XR_ERROR_SESSION_NOT_RUNNING. See
-        // docs/ARCHITECTURE.md, "xrWaitFrame Requires A Running Session
-        // (M9E)" for the full finding. A short sleep avoids busy-
-        // spinning while not running (this branch is not paced by a
-        // blocking OpenXR call, unlike the running case below).
-        if (!session.IsRunning())
-        {
+            // No BeginFrame()/EndFrame() call this tick at all - see
+            // FrameStatus.hpp for why this is a different situation
+            // from shouldRender=false below. XRFrameDriver itself
+            // sleeps briefly in this branch to avoid a CPU hot-spin
+            // (see its own PrepareFrame() comment) - this loop only
+            // needs its own safety-timeout check here.
             if (std::chrono::steady_clock::now() - startTime > kMaxDemoDuration)
             {
-                AR_LOG_WARNING("Safety timeout reached while the session was not running - stopping.");
+                AR_LOG_WARNING("Safety timeout reached while the frame driver was idle - stopping.");
                 break;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
             continue;
         }
 
-        XrFrameState frameState{XR_TYPE_FRAME_STATE};
-        XrFrameWaitInfo frameWaitInfo{XR_TYPE_FRAME_WAIT_INFO};
-        CheckXrResult(instance.Get(), xrWaitFrame(session.Get(), &frameWaitInfo, &frameState), "xrWaitFrame");
+        frameDriver.BeginFrame();
 
-        XrFrameBeginInfo frameBeginInfo{XR_TYPE_FRAME_BEGIN_INFO};
-        CheckXrResult(instance.Get(), xrBeginFrame(session.Get(), &frameBeginInfo), "xrBeginFrame");
-
-        if (frameState.shouldRender)
+        if (frameContext.timing.shouldRender)
         {
             std::vector<std::uint32_t> acquiredIndices(swapchains.size());
             for (std::size_t i = 0; i < swapchains.size(); ++i)
@@ -483,30 +466,25 @@ int main()
 
         // Zero composition layers submitted - see this file's header
         // comment for why (no real xrLocateViews pose/FOV data exists
-        // yet in M9E). xrEndFrame with layerCount=0 is spec-legal and
-        // means "the compositor shows nothing new from this application
-        // this frame" - the frame lifecycle mechanics above (wait/begin/
-        // acquire/wait/clear/release/end) are fully exercised regardless.
-        XrFrameEndInfo frameEndInfo{};
-        frameEndInfo.type = XR_TYPE_FRAME_END_INFO;
-        frameEndInfo.displayTime = frameState.predictedDisplayTime;
-        frameEndInfo.environmentBlendMode = *selectedBlendMode;
-        frameEndInfo.layerCount = 0;
-        frameEndInfo.layers = nullptr;
-        CheckXrResult(instance.Get(), xrEndFrame(session.Get(), &frameEndInfo), "xrEndFrame");
+        // yet). EndFrame() calls xrEndFrame with layerCount=0, which is
+        // spec-legal and means "the compositor shows nothing new from
+        // this application this frame" - the frame lifecycle mechanics
+        // above (wait/begin/acquire/wait/clear/release/end) are fully
+        // exercised regardless.
+        frameDriver.EndFrame();
 
         ++completedFrameCount;
         if (completedFrameCount == 1 || completedFrameCount % 50 == 0)
         {
             AR_LOG_INFO(std::format("Completed frame {} (predictedDisplayTime {:.4f}s, shouldRender={})",
-                                     completedFrameCount, XrTimeToSeconds(frameState.predictedDisplayTime),
-                                     frameState.shouldRender != XR_FALSE));
+                                     completedFrameCount, frameContext.timing.predictedDisplayTimeSeconds,
+                                     frameContext.timing.shouldRender));
         }
 
         if (completedFrameCount >= kTargetFrameCount && !exitRequested)
         {
             AR_LOG_INFO(std::format("Reached target frame count ({}) - requesting a clean session exit...", kTargetFrameCount));
-            session.RequestExit();
+            frameDriver.RequestExit();
             exitRequested = true;
         }
 
@@ -517,28 +495,18 @@ int main()
         }
     }
 
-    std::string observedSequence;
-    for (std::size_t i = 0; i < observedStates.size(); ++i)
-    {
-        if (i != 0)
-        {
-            observedSequence += " -> ";
-        }
-        observedSequence += FormatSessionState(observedStates[i]);
-    }
-    AR_LOG_INFO(std::format("Observed session state sequence: {}", observedSequence));
     AR_LOG_INFO(std::format("Total completed frames: {}", completedFrameCount));
 
-    if (session.IsRunning() && ShouldEndSession(currentState, session.IsRunning()))
-    {
-        AR_LOG_WARNING("Loop exited with the session still marked running and state STOPPING - calling xrEndSession");
-        session.EndSession();
-    }
-    else if (session.IsRunning())
-    {
-        AR_LOG_WARNING("Loop exited with the session still marked running, but STOPPING was never observed - "
-                        "destroying the session directly (xrEndSession is not valid outside STOPPING)");
-    }
+    // No post-loop EndSession fallback needed here (M9E's demo had one) -
+    // XRFrameDriver's PrepareFrame() already reacts to every session-
+    // state transition on every tick it runs, so by the time this loop
+    // exits, BeginSession/EndSession have already been called correctly
+    // wherever the observed states warranted it. The one remaining edge
+    // case - loop exits via the safety timeout while the session is
+    // still marked running, having never reached STOPPING - is handled
+    // identically to before: destroying a still-running session directly
+    // is spec-legal, and OpenXRSession's destructor (below) does exactly
+    // that.
 
     // Explicit cleanup of the raw Vulkan handles this demo created
     // directly (no RAII wrapper for these in a manual demo - see their

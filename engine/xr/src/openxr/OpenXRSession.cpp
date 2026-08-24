@@ -36,6 +36,7 @@ namespace AREngine::XR::OpenXR
                     const auto& stateEvent = reinterpret_cast<const XrEventDataSessionStateChanged&>(event);
                     result.sessionStateChanged = true;
                     result.newSessionState = stateEvent.state;
+                    result.sessionStateSequence.push_back(stateEvent.state);
                     break;
                 }
                 case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:

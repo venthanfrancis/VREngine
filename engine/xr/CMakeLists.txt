@@ -83,6 +83,18 @@ if(ARENGINE_ENABLE_OPENXR)
     # header), same discipline Rendering already applies to Vulkan.
     target_link_libraries(arengine_xr PRIVATE OpenXR::openxr_loader)
 
+    # M9E.5: OpenXRSessionState.cpp's DetermineFrameStatus needs
+    # Frame::FrameStatus - the first time this module has depended on
+    # Frame since M9A deliberately trimmed it ("deferred until a real
+    # XRFrameDriver is built... can come back the moment a later
+    # milestone gives a genuine reason" - see engine/xr/CMakeLists.txt's
+    # own comment below on the Frame/Platform trim). Private and at this
+    # outer level (not nested in the Vulkan block below) because
+    # OpenXRSessionState.hpp is Vulkan-independent and needs this
+    # regardless of ARENGINE_ENABLE_VULKAN. See docs/ARCHITECTURE.md,
+    # "Where DetermineFrameStatus Lives (M9E.5)".
+    target_link_libraries(arengine_xr PRIVATE AREngine::Frame)
+
     # --- M9C: OpenXR/Vulkan integration boundary ---
     #
     # Only compiled when BOTH capabilities are enabled - this is the
@@ -115,6 +127,12 @@ if(ARENGINE_ENABLE_OPENXR)
                 # Topology (M9E)".
                 src/openxr/OpenXRSwapchain.hpp
                 src/openxr/OpenXRSwapchain.cpp
+                # M9E.5: needs OpenXRSession, which is only compiled in
+                # this Vulkan-gated block - see XRFrameDriver.hpp's own
+                # comment for why it lives here despite making no direct
+                # Vulkan API call itself.
+                src/openxr/XRFrameDriver.hpp
+                src/openxr/XRFrameDriver.cpp
         )
         # Private, same as OpenXR::openxr_loader above - Vulkan is an
         # implementation detail of this one integration boundary, never
@@ -128,14 +146,18 @@ target_include_directories(arengine_xr
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# M9A trims this down to Core only. Platform and Frame were both linked
+# M9A trimmed this to Core only. Platform and Frame were both linked
 # here since the M0 stub, in anticipation of needs that hadn't arrived
-# yet; M9A is the first real evidence of what XR actually needs right
-# now, and it is neither of those - no window/native-handle access
-# (Platform) and no FrameDriver implementation yet (Frame, deferred
-# until a real XRFrameDriver is built - see docs/ARCHITECTURE.md,
-# "Dependency Trim (M9A)"). Both can come back the moment a later
-# milestone gives a genuine reason.
+# yet; M9A was the first real evidence of what XR actually needed at
+# the time, and it was neither of those - no window/native-handle
+# access (Platform) and no FrameDriver implementation yet (Frame,
+# deferred until a real XRFrameDriver was built - see
+# docs/ARCHITECTURE.md, "Dependency Trim (M9A)"). M9E.5 is that genuine
+# reason for Frame (see the PRIVATE AREngine::Frame link above, added
+# once XRFrameDriver actually existed) - a real reversal of a
+# deliberate earlier decision, not a silent one; see
+# docs/ARCHITECTURE.md, "Why Frame Came Back (M9E.5)". Platform remains
+# untouched - nothing in XR needs window/native-handle access yet.
 target_link_libraries(arengine_xr
     PUBLIC
         AREngine::Core

@@ -3,6 +3,10 @@
 // a real OS window (same as platform_tests.cpp), since
 // DesktopFrameDriver needs a Platform::Window to construct, but never
 // waits on it to close.
+//
+// M9E.5 updates this to the redesigned PrepareFrame/BeginFrame/
+// GetViews/EndFrame interface and adds FrameStatus/shouldRender
+// coverage - see docs/ARCHITECTURE.md, "Desktop Mapping (M9E.5)".
 
 #include "AREngine/Platform/Platform.hpp"
 #include "AREngine/Runtime/DesktopFrameDriver.hpp"
@@ -36,12 +40,23 @@ namespace
         bool allDeltasNonNegative = true;
         bool totalTimeMonotonic = true;
         bool alwaysOneView = true;
+        bool alwaysContinue = true;
+        bool alwaysShouldRender = true;
 
         constexpr int kFrameCount = 5;
         for (int i = 0; i < kFrameCount; ++i)
         {
-            const AREngine::Frame::FrameTiming timing = frameDriver.WaitForNextFrame();
+            const AREngine::Frame::FrameContext context = frameDriver.PrepareFrame();
+            const AREngine::Frame::FrameTiming& timing = context.timing;
 
+            if (context.status != AREngine::Frame::FrameStatus::Continue)
+            {
+                alwaysContinue = false;
+            }
+            if (!timing.shouldRender)
+            {
+                alwaysShouldRender = false;
+            }
             if (timing.deltaTimeSeconds < 0.0)
             {
                 allDeltasNonNegative = false;
@@ -52,18 +67,22 @@ namespace
             }
             previousTotal = timing.totalTimeSeconds;
 
+            frameDriver.BeginFrame(); // must not crash with nothing to begin
+
             const auto views = frameDriver.GetViews();
             if (views.size() != 1)
             {
                 alwaysOneView = false;
             }
 
-            frameDriver.SubmitFrame(); // must not crash with nothing to submit to
+            frameDriver.EndFrame(); // must not crash with nothing to submit to
         }
 
         Check(allDeltasNonNegative, "DesktopFrameDriver delta time is always non-negative");
         Check(totalTimeMonotonic, "DesktopFrameDriver total time never goes backwards");
         Check(alwaysOneView, "DesktopFrameDriver always produces exactly one desktop view");
+        Check(alwaysContinue, "DesktopFrameDriver's FrameStatus is always Continue - it never returns Idle or Stop");
+        Check(alwaysShouldRender, "DesktopFrameDriver's shouldRender is always true");
         Check(previousTotal >= 0.0, "DesktopFrameDriver ran for the expected number of frames");
     }
 }

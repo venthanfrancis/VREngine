@@ -9,5 +9,7 @@
 // of them. See docs/ARCHITECTURE.md, "The FrameDriver Abstraction".
 
 #include "AREngine/Frame/FrameTiming.hpp"
+#include "AREngine/Frame/FrameStatus.hpp"
+#include "AREngine/Frame/FrameContext.hpp"
 #include "AREngine/Frame/ViewInfo.hpp"
 #include "AREngine/Frame/FrameDriver.hpp"

@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -453,17 +453,51 @@ interface (`WaitForNextFrame`/`GetViews`/`SubmitFrame`) was evaluated
 against this real lifecycle and found **not** to fit cleanly: no home
 for `shouldRender`, no explicit seam for interleaving per-swapchain
 acquire/render/release with a single `SubmitFrame()` call — reported as
-a finding, not patched over with a premature `XRFrameDriver`. See
-`docs/ARCHITECTURE.md` Section 28 for the full investigation.
+a finding, not patched over with a premature `XRFrameDriver` at the
+time. See `docs/ARCHITECTURE.md` Section 28 for the full investigation.
+
+**M9E.5 redesigns `FrameDriver` using that evidence**:
+`PrepareFrame() -> FrameContext` (was `WaitForNextFrame`), a new
+`BeginFrame()`, `GetViews()` (unchanged shape), `EndFrame()` (was
+`SubmitFrame`). `FrameContext` bundles `FrameTiming` (which gained one
+new field, `bool shouldRender`) with a new `FrameStatus` (`Continue`/
+`Idle`/`Stop`) — `Idle` means "no Begin/End call at all this tick"
+(e.g. the XR session isn't currently running), a deliberately different
+axis from `shouldRender=false` ("a Begin/End pair is happening, but
+skip the content"); collapsing the two would have reintroduced the
+`xrWaitFrame`-after-`xrEndSession` crash risk. `DesktopFrameDriver` and
+`Runtime::Run()`'s loop were both refactored onto the new interface
+with no behavior change (`Runtime` preserves the exact M7 event order:
+Input.BeginFrame → Platform messages → Close check → Frame lifecycle →
+Application/update/render → Frame completion). An initial
+`XRFrameDriver` (`engine/xr/src/openxr/XRFrameDriver.hpp/.cpp`,
+Vulkan-gated - needs `OpenXRSession`) now exists, wrapping exactly
+`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` and the session-state event
+loop M9D/M9E already built — it deliberately does **not** own swapchain
+image acquisition (that stays on `OpenXRSwapchain`, coordinated by
+whichever layer actually renders - currently the manual frame demo),
+does not call `xrLocateViews`, and does not render anything.
+`engine/xr` regained a dependency on `AREngine::Frame` as a result - a
+real, documented reversal of M9A's earlier trim, not a silent one. A
+second real bug was caught and fixed during this milestone's own
+design review (before implementation): `SessionEventPollResult`
+previously collapsed multiple session-state transitions observed in one
+poll cycle down to just the last one, which could silently skip a
+required `xrBeginSession`/`xrEndSession` call - fixed by processing
+every transition in order via a new pure, unit-tested
+`DetermineSessionLifecycleActions` function, and confirmed genuinely
+exercised (not just theoretical) against real SteamVR runs. See
+`docs/ARCHITECTURE.md` Section 29 for the full design and validation.
 
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
 system, and no `xrLocateViews`/`xrLocateSpace`/head tracking/
-controllers/`XRFrameDriver` — see Sections 11–15. `Editor` is still an
-M0-style stub with no functionality. Next up is M9F (`xrLocateViews` +
-stereo rendering) or M8I+ (Scene integration, still pending within M8)
-— see `docs/ROADMAP.md` for the full plan.
+controllers/stereo rendering/swapchain-image ownership inside
+`XRFrameDriver` — see Sections 11–15. `Editor` is still an M0-style
+stub with no functionality. Next up is M9F (`xrLocateViews` + stereo
+rendering) or M8I+ (Scene integration, still pending within M8) — see
+`docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -479,10 +513,13 @@ stereo rendering) or M8I+ (Scene integration, still pending within M8)
    for what's still pending within M8.
 3a. **OpenXR instance/system discovery + Vulkan graphics-binding +
    XrSession/session-state/reference-space bring-up + XR swapchains/
-   frame lifecycle only so far (M9A–M9E)**: no `xrLocateViews`, no
-   `xrLocateSpace` for tracking, no head/hand/eye tracking, no
-   passthrough, no anchors, no composition layer submission with real
-   content, no `XRFrameDriver`. See `docs/ROADMAP.md`'s M9F row.
+   frame lifecycle + generic FrameDriver redesign only so far
+   (M9A–M9E.5)**: no `xrLocateViews`, no `xrLocateSpace` for tracking,
+   no head/hand/eye tracking, no passthrough, no anchors, no
+   composition layer submission with real content, no stereo rendering,
+   no swapchain-image acquisition inside `XRFrameDriver` (that stays on
+   `OpenXRSwapchain`, coordinated outside `Frame`/`XRFrameDriver`). See
+   `docs/ROADMAP.md`'s M9F row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

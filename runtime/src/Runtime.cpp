@@ -167,27 +167,58 @@ namespace AREngine::Runtime
                 AR_LOG_INFO("Select action pressed (Space or Left Mouse)");
             }
 
-            const Frame::FrameTiming timing = m_frameDriver->WaitForNextFrame();
-            const std::vector<Frame::ViewInfo> views = m_frameDriver->GetViews();
-            (void)views; // not consumed by rendering yet — no camera/Scene until M5+
+            // Frame lifecycle: PrepareFrame() blocks (if the driver
+            // needs to) until it's time to prepare the next frame, and
+            // reports whether a frame lifecycle should even happen this
+            // tick at all (FrameStatus::Idle — e.g. an XR session that
+            // isn't currently running — skips BeginFrame/GetViews/
+            // EndFrame entirely, not just the render work below) or
+            // whether the frame source can no longer produce frames at
+            // all (FrameStatus::Stop). See docs/ARCHITECTURE.md, "Runtime
+            // Loop Changes (M9E.5)".
+            const Frame::FrameContext frameContext = m_frameDriver->PrepareFrame();
+            if (frameContext.status == Frame::FrameStatus::Stop)
+            {
+                break;
+            }
+            if (frameContext.status == Frame::FrameStatus::Idle)
+            {
+                continue;
+            }
 
-            // "Update runtime/application state" belongs here once
-            // there is any state to update (Scene, M5+).
+            m_frameDriver->BeginFrame();
 
-            // TEMPORARY (M4 validation only): a hard-coded dummy draw
-            // proving the Rendering seam works end to end (CreateBuffer
-            // -> BeginRendering -> SubmitDraw -> EndRendering), with
-            // nothing actually appearing on screen since NullRenderDevice
-            // does no real graphics work. Scene (M5) replaces this with
-            // real geometry submission driven by actual scene content.
-            m_renderDevice->BeginRendering();
-            Rendering::DrawCommand dummyDraw;
-            dummyDraw.vertexBuffer = m_dummyVertexBuffer;
-            dummyDraw.count = 3; // pretend one triangle
-            m_renderDevice->SubmitDraw(dummyDraw);
-            m_renderDevice->EndRendering();
+            // Application/update/render: gated on shouldRender, not on
+            // FrameStatus — a Continue frame can still legitimately ask
+            // to skip rendering its content (OpenXR's own
+            // shouldRender=false while the session is running but not
+            // currently visible/focused), while BeginFrame()/EndFrame()
+            // still bracket it either way.
+            if (frameContext.timing.shouldRender)
+            {
+                const std::vector<Frame::ViewInfo> views = m_frameDriver->GetViews();
+                (void)views; // not consumed by rendering yet — no camera/Scene until M5+
 
-            fpsAccumulatedSeconds += timing.deltaTimeSeconds;
+                // "Update runtime/application state" belongs here once
+                // there is any state to update (Scene, M5+).
+
+                // TEMPORARY (M4 validation only): a hard-coded dummy draw
+                // proving the Rendering seam works end to end (CreateBuffer
+                // -> BeginRendering -> SubmitDraw -> EndRendering), with
+                // nothing actually appearing on screen since NullRenderDevice
+                // does no real graphics work. Scene (M5) replaces this with
+                // real geometry submission driven by actual scene content.
+                m_renderDevice->BeginRendering();
+                Rendering::DrawCommand dummyDraw;
+                dummyDraw.vertexBuffer = m_dummyVertexBuffer;
+                dummyDraw.count = 3; // pretend one triangle
+                m_renderDevice->SubmitDraw(dummyDraw);
+                m_renderDevice->EndRendering();
+            }
+
+            // Timing accounting is unconditional — only the render work
+            // above is gated on shouldRender.
+            fpsAccumulatedSeconds += frameContext.timing.deltaTimeSeconds;
             ++fpsFrameCount;
             if (fpsAccumulatedSeconds >= 1.0)
             {
@@ -198,7 +229,10 @@ namespace AREngine::Runtime
                 fpsFrameCount = 0;
             }
 
-            m_frameDriver->SubmitFrame();
+            // Frame completion: called once per BeginFrame(), regardless
+            // of shouldRender — some backends require a matching Begin/
+            // End pair either way (OpenXR's xrBeginFrame/xrEndFrame).
+            m_frameDriver->EndFrame();
         }
 
         AR_LOG_INFO("Runtime loop stopped");

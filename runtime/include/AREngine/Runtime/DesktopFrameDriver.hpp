@@ -32,9 +32,10 @@ namespace AREngine::Runtime
         DesktopFrameDriver(DesktopFrameDriver&&) = delete;
         DesktopFrameDriver& operator=(DesktopFrameDriver&&) = delete;
 
-        Frame::FrameTiming WaitForNextFrame() override;
+        Frame::FrameContext PrepareFrame() override;
+        void BeginFrame() override;
         std::vector<Frame::ViewInfo> GetViews() override;
-        void SubmitFrame() override;
+        void EndFrame() override;
 
     private:
         // Currently unused beyond being stored — kept because a

@@ -5094,3 +5094,422 @@ passthrough, spatial anchors, physics, PBR shading, Scene integration.
 `OpenXRSwapchain`, the environment-blend-mode selection, and the
 now-working `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` lifecycle are all
 genuinely ready for M9F to build on directly.
+
+## 29. M9E.5 Implementation Notes
+
+M9E.5 is a focused architecture milestone: redesign `Frame::FrameDriver`
+using the real evidence M9E gathered, refactor `DesktopFrameDriver`/
+`Runtime` onto the new interface without regressing desktop behavior,
+and introduce an initial `XRFrameDriver` that wraps only `xrWaitFrame`/
+`xrBeginFrame`/`xrEndFrame` — not swapchain image acquisition, not
+`xrLocateViews`, not rendering. No stereo rendering, no Scene
+integration; those remain M9F+.
+
+### Why The Old FrameDriver Was Insufficient (M9E.5)
+
+The original interface (`WaitForNextFrame() -> FrameTiming`,
+`GetViews() -> vector<ViewInfo>`, `SubmitFrame()`) was designed in M1,
+before any real backend existed. M9E's own "FrameDriver Fit Evaluation"
+(Section 28) found four concrete mismatches once a real OpenXR frame
+lifecycle actually existed to compare against:
+
+1. **No representation of `shouldRender`.** `XrFrameState::shouldRender`
+   is real, load-bearing data (SteamVR's null driver reported it false
+   on the large majority of M9E's 200 frames) with nowhere to go.
+2. **No explicit begin-frame seam.** `WaitForNextFrame()` conflated
+   "block for timing" with everything that follows; OpenXR's real
+   sequence has a distinct `xrBeginFrame` step between waiting and
+   acquiring/rendering.
+3. **`SubmitFrame()` too coarse.** OpenXR's real per-frame body is
+   acquire → wait → [render] → release → end — a single opaque call
+   has no seam for the caller's own render work in the middle.
+4. **A session-running precondition the old interface had no way to
+   express.** M9E discovered, by crashing and fixing it, that
+   `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` all require the session to
+   be running - calling `xrWaitFrame` right after `STOPPING ->
+   xrEndSession` fails with `XR_ERROR_SESSION_NOT_RUNNING`. The old
+   interface had no concept of "no frame lifecycle at all this tick."
+
+### New Lifecycle API (M9E.5)
+
+`FrameDriver` (`engine/frame/include/AREngine/Frame/FrameDriver.hpp`):
+
+```cpp
+class FrameDriver {
+public:
+    virtual ~FrameDriver() = default;
+    virtual FrameContext PrepareFrame() = 0; // was WaitForNextFrame()
+    virtual void BeginFrame() = 0;           // NEW
+    virtual std::vector<ViewInfo> GetViews() = 0; // unchanged shape
+    virtual void EndFrame() = 0;             // was SubmitFrame()
+};
+```
+
+`FrameContext` (new, `FrameContext.hpp`): `{ FrameTiming timing;
+FrameStatus status = FrameStatus::Continue; }` — bundled together
+because they are always produced and consumed together, mirroring how
+`XrFrameState` itself bundles `predictedDisplayTime`/
+`predictedDisplayPeriod`/`shouldRender` into one struct.
+
+`FrameStatus` (new, `FrameStatus.hpp`): `enum class FrameStatus {
+Continue, Idle, Stop };`
+
+- **`Continue`** — a full frame lifecycle should happen this tick:
+  `BeginFrame()`, then (only if `timing.shouldRender`) the caller's own
+  render work, then `EndFrame()` — regardless of `shouldRender`.
+- **`Idle`** — no `BeginFrame()`/`GetViews()`/`EndFrame()` call should
+  happen at all this tick, not even an "empty" one. Desktop never
+  returns this; XR returns it while the session exists but is not
+  currently running (not yet begun, or between `STOPPING` and
+  `EXITING`) — `xrBeginFrame`/`xrEndFrame` are not legal to call in
+  that window at all, not merely "skip the content." (Named `Idle`, not
+  the earlier-drafted `SkipRendering` — renamed specifically to avoid
+  reading as a synonym for `shouldRender=false`, which is a genuinely
+  different situation; see "shouldRender Semantics" below.)
+- **`Stop`** — the frame source can no longer produce frames; the
+  caller should end its own loop. Desktop never returns this; XR
+  returns it once the session reaches `EXITING`/`LOSS_PENDING` (via the
+  already-tested `ShouldStopMainLoop`).
+
+**Contract** (documented on `FrameDriver` itself):
+`BeginFrame()`/`GetViews()`/`EndFrame()` must only be called after
+`PrepareFrame()` returns `FrameStatus::Continue`. `GetViews()` is only
+valid after `BeginFrame()`. `EndFrame()` must be called exactly once
+per `BeginFrame()`, regardless of `shouldRender` — OpenXR requires a
+matching `xrBeginFrame`/`xrEndFrame` pair either way.
+
+### shouldRender Semantics (M9E.5)
+
+`FrameTiming` gained exactly one new field: `bool shouldRender = true`.
+Deliberately a different axis from `FrameStatus::Idle` — the two answer
+different questions:
+
+- `FrameStatus` answers "is a `Begin`/`End` pair even legal to call
+  this tick at all."
+- `FrameTiming::shouldRender` answers "given a legal `Begin`/`End`
+  pair, should its content actually be rendered."
+
+OpenXR's real lifecycle needs both, and they are not interchangeable:
+`xrBeginFrame`/`xrEndFrame` require a running session (a `FrameStatus`
+question — see the crash in Section 28), while a *running* session's
+own `xrWaitFrame` can independently report `shouldRender=false` (a
+`FrameTiming` question — this is what actually happened on the large
+majority of M9E's 200 frames; `xrBeginFrame`/`xrEndFrame` remained
+fully legal and were called every time). Collapsing these into one
+concept would either reintroduce the `xrWaitFrame`-after-`xrEndSession`
+crash risk (by making `Idle` and `shouldRender=false` the same signal)
+or require hiding the running/not-running distinction inside no-op
+`BeginFrame`/`EndFrame` bodies, which would remove the pure-logic
+testability `DetermineFrameStatus` (below) depends on. `shouldRender`
+defaults `true` so any default-constructed `FrameTiming` behaves
+sanely; no `predictedDisplayPeriodSeconds` field was added — nothing
+would consume it yet.
+
+### Frame Timing Semantics (M9E.5)
+
+Unchanged in kind, only in source: `deltaTimeSeconds`/
+`totalTimeSeconds` still come from a monotonic wall clock (Desktop's
+`Platform::SteadyClock`; `XRFrameDriver` owns its own self-contained
+`std::chrono::steady_clock`-based timer rather than depending on
+`Platform` — see "Why `engine/xr` Does Not Depend On `Platform`"
+below). `predictedDisplayTimeSeconds` is real for the first time on the
+XR path: `XrTimeToSeconds` (M9E, `OpenXRFrameTiming.hpp`) converts
+`XrFrameState::predictedDisplayTime` using the OpenXR spec's own fixed
+nanoseconds-per-tick definition.
+
+### Render-Target Acquisition Ownership (M9E.5)
+
+**Deliberately excluded from `FrameDriver`**: GPU render-target
+acquisition (OpenXR's `xrAcquireSwapchainImage`/
+`xrWaitSwapchainImage`/`xrReleaseSwapchainImage`) stays entirely on
+`OpenXRSwapchain` (M9E), coordinated by whichever layer actually owns
+rendering — currently the manual frame demo, since no dedicated
+Renderer/XR-integration module exists yet. Confirmed against the real
+M9E code, not just argued abstractly: in the demo, the acquire/wait/
+Vulkan-clear/release block sits *between* `xrBeginFrame` and
+`xrEndFrame`, gated on `shouldRender` — resource-lifecycle work,
+sharing the same envelope as frame timing but not itself a frame-timing
+concern. Putting it inside `XRFrameDriver` would also contradict the
+"generic Frame module describes WHEN a frame happens, not GPU resource
+ownership" principle this redesign is built on: swapchain images,
+`VkImageView`s, and Vulkan handles must never appear in `Frame`'s
+public API. `XRFrameDriver` wraps exactly `xrWaitFrame`/`xrBeginFrame`/
+`xrEndFrame` and nothing else.
+
+### Desktop Mapping (M9E.5)
+
+`DesktopFrameDriver::PrepareFrame()` ticks `Platform::SteadyClock`
+exactly as before, returns `FrameContext{timing,
+FrameStatus::Continue}` with `timing.shouldRender = true` always.
+`BeginFrame()`/`EndFrame()` are both empty bodies — nothing to do yet,
+same as the old `SubmitFrame()`'s empty body. `GetViews()` is
+unchanged (one placeholder `ViewInfo`). No new complexity was added
+just to make Desktop resemble XR — it never returns `Idle` or `Stop`,
+and its `shouldRender` is never false.
+
+### XR Mapping (M9E.5)
+
+`XRFrameDriver` (new, `engine/xr/src/openxr/XRFrameDriver.hpp/.cpp`,
+namespace `AREngine::XR::OpenXR`) implements `Frame::FrameDriver`.
+Constructor: `XRFrameDriver(XrInstance instance, OpenXRSession&
+session, XrViewConfigurationType primaryViewConfigurationType,
+XrEnvironmentBlendMode environmentBlendMode)` — borrows `instance`/
+`session` (same discipline as every other OpenXR wrapper in this
+codebase); the blend mode is pre-selected by the caller via M9E's
+`OpenXREnvironmentBlendMode.hpp` functions, not enumerated/selected by
+this class itself.
+
+- **`PrepareFrame()`**: polls session-state events (see "Ordered
+  Session-State Processing" below), reacts to every transition
+  observed (in order), then either returns `FrameStatus::Stop`
+  (terminal state reached), `FrameStatus::Idle` (session not currently
+  running — no real `xrWaitFrame` call is made; see "CPU Behavior While
+  Idle" below), or calls the real `xrWaitFrame` and returns
+  `FrameStatus::Continue` with real `deltaTimeSeconds`/
+  `totalTimeSeconds`/`predictedDisplayTimeSeconds`/`shouldRender`.
+- **`BeginFrame()`**: calls `xrBeginFrame`. Only valid after `Continue`
+  (contract, not defensively re-checked — same trust-the-caller
+  discipline the rest of this codebase already applies to internal
+  contracts).
+- **`GetViews()`**: always returns an empty vector. No real view data
+  exists yet — `xrLocateViews` is M9F's job. Empty is spec-legal per
+  `ViewInfo`'s own "a frame may need zero, one, or several of these"
+  documentation.
+- **`EndFrame()`**: calls `xrEndFrame` with zero composition layers —
+  the same decision M9E made (no real per-view pose/FOV data exists yet
+  to build a valid `XrCompositionLayerProjection`, and this class does
+  not fabricate one), using the `displayTime` stashed from
+  `PrepareFrame()`'s `xrWaitFrame` call.
+- **`RequestExit()`**: not part of `FrameDriver` — forwards to
+  `OpenXRSession::RequestExit()`. Requesting a session exit is an
+  application-level decision (e.g. "I've run N diagnostic frames"), not
+  something a generic frame-pacing driver should decide on its own.
+  Only reachable through a concrete `XRFrameDriver` reference, never
+  through a `Frame::FrameDriver*` pointer.
+
+### Ordered Session-State Processing (M9E.5)
+
+**A real correctness fix, caught during design review before any code
+was written, not discovered by accident.** `SessionEventPollResult`
+(M9D, `OpenXRSession.hpp`) originally reported only the *last*
+`XrEventDataSessionStateChanged` observed in one `xrPollEvent` draining
+cycle — acceptable for M9D's own demo (which only logs/reacts to "the
+current state"), but wrong for `XRFrameDriver`: a runtime can
+legitimately deliver more than one session-state-changed event within
+a single cycle (e.g. `READY` immediately followed by `STOPPING`).
+Reacting only to the last one would see `STOPPING` with
+`sessionRunning` still `false` (since `READY`'s `xrBeginSession` call
+was never made), produce no action at all, and leave the session
+permanently stuck — never begun, never ended, with no way to recover.
+
+**Fix** (additive, backward-compatible — M9D's own demo is unaffected):
+`SessionEventPollResult` gained `std::vector<XrSessionState>
+sessionStateSequence`, holding every state-changed event observed that
+cycle, in the exact order `xrPollEvent` returned them
+(`sessionStateSequence.back() == newSessionState` always holds when
+`sessionStateChanged` is true). A new pure function,
+`DetermineSessionLifecycleActions(sequence, initiallyRunning) ->
+vector<SessionLifecycleAction>` (`OpenXRSessionState.hpp`), computes
+the full `Begin`/`End`/`None` action plan for the whole sequence
+up front (tracking the running flag exactly as `OpenXRSession` itself
+would after each real call), and `XRFrameDriver::PrepareFrame()`
+applies it in order, updating `m_currentState` and logging each
+transition alongside each action. Directly unit-tested, including the
+exact READY-then-STOPPING-same-cycle scenario described above
+(`TestDetermineSessionLifecycleActionsReadyThenStoppingSameCycle`,
+`tests/openxr_session_tests.cpp`) — confirms two actions (`Begin`, then
+`End`) are produced, not the one-or-zero a last-state-only approach
+would produce. **Confirmed genuinely exercised, not just theoretically
+possible**: a real manual run against SteamVR (see "Validation Results"
+below) observed an extra `IDLE` transition between `STOPPING` and
+`EXITING` in the same poll cycle that would previously have been
+silently absorbed — now correctly logged and processed as its own
+`None`-action step.
+
+### CPU Behavior While Idle (M9E.5)
+
+**Verified, not assumed.** Because `xrWaitFrame` cannot legally be
+called while the session isn't running, `PrepareFrame()`'s
+`FrameStatus::Idle` branch has no blocking OpenXR call to pace it
+(unlike the `Continue` path, which blocks inside the real
+`xrWaitFrame`). Without a guard, a caller looping on `Idle` while
+waiting for `READY` (or for `EXITING` after `STOPPING`) would busy-spin
+`PollSessionEvents` at full CPU. **Fix, implementation-private to
+`XRFrameDriver`, not part of the generic `Frame` API** (per the brief:
+"do not make timing/sleep policy part of the generic Frame API"): a
+16ms `std::this_thread::sleep_for` inside `PrepareFrame()`'s own `Idle`
+branch, matching the polling cadence already established by M9D's/
+M9E's own demos. `Frame::FrameStatus`/`FrameContext`/`FrameDriver`
+contain no timing/sleep concept whatsoever — Desktop's `PrepareFrame()`
+has nothing analogous, since it never returns `Idle`.
+
+### Why `engine/xr` Does Not Depend On `Platform` (M9E.5)
+
+`XRFrameDriver` needs a monotonic delta/total-time clock, same as
+`Platform::SteadyClock` already provides — but `engine/xr` does not
+gain a new dependency on `engine/platform` just for ~10 lines of
+`std::chrono` wrapping. `XRFrameDriver` owns a private, self-contained
+`std::chrono::steady_clock`-based timer instead, matching the
+"duplicate small self-contained logic rather than add a cross-module
+dependency" precedent already established for
+`FindGraphicsQueueFamily`/`TransitionImageLayout` elsewhere in this
+module.
+
+### Where DetermineFrameStatus Lives (M9E.5)
+
+`DetermineFrameStatus(currentState, sessionRunning) ->
+Frame::FrameStatus` and `DetermineSessionLifecycleActions` both live in
+`OpenXRSessionState.hpp/.cpp` — **not** co-located with `XRFrameDriver`
+— specifically so they (and their tests) stay buildable/testable in
+the *narrowest* config. `OpenXRSessionState.hpp` is Vulkan-independent
+(unconditional `ARENGINE_ENABLE_OPENXR` block); `XRFrameDriver.hpp` is
+not — it has a hard *build* dependency on `OpenXRSession`, which only
+exists when `ARENGINE_ENABLE_VULKAN=ON` (it needs
+`XrGraphicsBindingVulkan2KHR`). So `XRFrameDriver.hpp/.cpp` are nested
+inside `if(ARENGINE_ENABLE_VULKAN)` in `engine/xr/CMakeLists.txt`,
+alongside `OpenXRSession`/`OpenXRSwapchain`, even though `XRFrameDriver`
+itself makes no direct Vulkan API call. `tests/openxr_session_tests.cpp`
+gained the `DetermineFrameStatus`/`DetermineSessionLifecycleActions`
+tests directly (no new test executable) — it already covers this
+file's other pure-logic functions and already builds Vulkan-independent.
+
+### Why Frame Came Back (M9E.5)
+
+`engine/xr/CMakeLists.txt` gains `target_link_libraries(arengine_xr
+PRIVATE AREngine::Frame)` — a real reversal of M9A's deliberate trim
+("Frame ... deferred until a real XRFrameDriver is built... can come
+back the moment a later milestone gives a genuine reason"), documented
+as such at the trim's own comment site, not silently. The link is at
+the *outer* `if(ARENGINE_ENABLE_OPENXR)` level (not nested in the
+Vulkan block) because `OpenXRSessionState.cpp` needs
+`Frame::FrameStatus` regardless of `ARENGINE_ENABLE_VULKAN`. `Platform`
+remains untouched — nothing in `engine/xr` needs window/native-handle
+access yet.
+
+### Runtime Loop Changes (M9E.5)
+
+```cpp
+while (true) {
+    m_inputSystem.BeginFrame();
+    m_window->PollEvents();
+    if (m_window->ShouldClose()) break;           // unchanged
+    // ... existing input-logging block, unchanged ...
+
+    const Frame::FrameContext frameContext = m_frameDriver->PrepareFrame();
+    if (frameContext.status == Frame::FrameStatus::Stop) break;
+    if (frameContext.status == Frame::FrameStatus::Idle) continue;
+
+    m_frameDriver->BeginFrame();
+    if (frameContext.timing.shouldRender) {
+        const std::vector<Frame::ViewInfo> views = m_frameDriver->GetViews();
+        (void)views;
+        m_renderDevice->BeginRendering();
+        /* existing dummy draw, unchanged */
+        m_renderDevice->EndRendering();
+    }
+    // fps accounting - unconditional, only render work is gated
+    m_frameDriver->EndFrame();
+}
+```
+
+Preserves the M7 event order exactly: Input.BeginFrame → Platform
+messages → Close check → **Frame lifecycle** (`PrepareFrame` +
+early-outs + `BeginFrame`) → **Application/update/render** (the
+`shouldRender`-gated block) → **Frame completion** (`EndFrame`). The
+window-close signal stays entirely on `Window::ShouldClose()`, untouched
+— `FrameStatus::Stop` is for driver-level termination (XR), not desktop
+window close; Desktop never returns it. `Runtime` itself gained no new
+XR-specific concept — it only ever sees the generic `FrameContext`/
+`FrameStatus`/`shouldRender`.
+
+### Deferred View/Stereo Design (M9E.5)
+
+`Frame::ViewInfo` was **not** redesigned around OpenXR — M9F will
+provide real evidence via `xrLocateViews`. The only structural change
+this milestone made anywhere near views was moving `GetViews()` after
+`BeginFrame()` in the interface's documented contract (a consequence of
+the `BeginFrame()` seam existing at all, not a `ViewInfo`-specific
+decision). `XRFrameDriver::GetViews()` returns an empty vector, not a
+placeholder XR-shaped view — an honest "no data yet," not a fabricated
+one.
+
+### Test-Coverage Scoping (M9E.5)
+
+"Runtime skips render work when shouldRender=false" and "Runtime can
+stop when frame source indicates termination" are verified at the
+`FrameContext`/`DummyFrameDriver` unit level
+(`tests/frame_tests.cpp`), not by literally driving `Runtime::Run()`
+with a fake driver — `Runtime::m_frameDriver` is constructed internally
+with no dependency-injection seam, and adding one is out of scope for
+this milestone. `tests/runtime_tests.cpp`'s `DesktopFrameDriver` test
+confirms the real desktop driver always reports `Continue`/
+`shouldRender=true` across 5 iterations, exercising `BeginFrame()`/
+`EndFrame()` for the first time. `tests/openxr_session_tests.cpp`
+gained 8 new pure-logic checks (`DetermineFrameStatus`'s 3 outcomes,
+`DetermineSessionLifecycleActions`'s single-action/ordered-multi-
+action/non-actionable/empty cases) — zero real OpenXR calls, no
+SteamVR required.
+
+### Validation Results (M9E.5)
+
+All four `ARENGINE_ENABLE_OPENXR` × `ARENGINE_ENABLE_VULKAN`
+combinations: full build succeeds, `/EHsc /W4 /WX` clean (verified on
+ON/ON), `ctest` green on every combination (ON/ON: 14/14 — includes the
+new `FrameTests`/`RuntimeTests`/`OpenXRSessionTests` checks; ON/OFF:
+12/12; OFF/ON default: 11/11).
+
+`arengine_openxr_frame_demo`, rewired through `XRFrameDriver`, run
+twice against the live SteamVR/OpenXR runtime — both clean (exit code
+0), 200/200 frames completed both times:
+
+```
+Session state changed -> XR_SESSION_STATE_IDLE
+Session state changed -> XR_SESSION_STATE_READY
+xrBeginSession succeeded - session is now running
+Completed frame 1 (shouldRender=true)
+Session state changed -> XR_SESSION_STATE_SYNCHRONIZED
+Completed frame 50/100/150/200 (shouldRender=false)
+Reached target frame count (200) - requesting a clean session exit...
+Session state changed -> XR_SESSION_STATE_STOPPING
+xrEndSession succeeded - session is no longer running
+Session state changed -> XR_SESSION_STATE_IDLE
+Session state changed -> XR_SESSION_STATE_EXITING
+Frame driver reports FrameStatus::Stop - stopping the main loop cleanly (not an error)
+Total completed frames: 200
+```
+
+Note the `IDLE` transition observed between `STOPPING` and `EXITING` in
+both runs — exactly the kind of multi-transition-in-one-cycle detail
+the ordered-processing fix above was designed to surface correctly (as
+a harmless `None` action) rather than silently absorb. Same category of
+SteamVR-internal Vulkan validation noise as M9E (`BlankEyeBuffer`,
+command-buffer handles this codebase never allocated) was observed
+again, unchanged in kind — zero validation errors traced to AREngine's
+own code. `AREngineSandbox` and `arengine_vulkan_present_demo` were
+both launched and confirmed to start and run without crashing (process
+stayed alive under manual inspection; full log capture is limited by
+stdio buffering under a forced kill, not a regression - unrelated to
+this milestone's changes, since neither binary's own code was touched).
+
+- Files changed: `engine/frame/include/AREngine/Frame/{FrameDriver,
+  FrameTiming,Frame}.hpp`, new `FrameStatus.hpp`/`FrameContext.hpp`,
+  `engine/frame/CMakeLists.txt`; `runtime/src/{Runtime,
+  DesktopFrameDriver}.cpp`, `runtime/include/AREngine/Runtime/
+  DesktopFrameDriver.hpp`; new `engine/xr/src/openxr/
+  XRFrameDriver.hpp/.cpp`; `engine/xr/src/openxr/
+  OpenXRSession.hpp/.cpp`, `OpenXRSessionState.hpp`;
+  `engine/xr/CMakeLists.txt`; `tests/openxr_frame_demo.cpp`,
+  `tests/frame_tests.cpp`, `tests/runtime_tests.cpp`,
+  `tests/openxr_session_tests.cpp`, `tests/CMakeLists.txt`.
+
+### Architectural Issues Found (M9E.5)
+
+None beyond what this milestone itself set out to fix. The one design
+question genuinely worth flagging forward: `XRFrameDriver::GetViews()`
+returning an empty vector today means `Runtime`'s existing `(void)
+views;` no-op is trivially satisfied — M9F's real `xrLocateViews`
+integration will be the first actual test of whether `ViewInfo`'s
+current shape (`position`/`orientation`/`projection`) is sufficient, or
+whether *that* milestone surfaces its own concrete mismatch the way
+M9E did for `FrameDriver`. Not fixed here, not assumed away — flagged
+for M9F to discover with its own real evidence.

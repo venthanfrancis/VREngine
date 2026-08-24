@@ -7,6 +7,8 @@ target_sources(arengine_frame
     PRIVATE
         include/AREngine/Frame/Frame.hpp
         include/AREngine/Frame/FrameTiming.hpp
+        include/AREngine/Frame/FrameStatus.hpp
+        include/AREngine/Frame/FrameContext.hpp
         include/AREngine/Frame/ViewInfo.hpp
         include/AREngine/Frame/FrameDriver.hpp
 )

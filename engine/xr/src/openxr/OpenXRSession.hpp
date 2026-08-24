@@ -16,6 +16,7 @@
 #include "OpenXRVulkanGraphicsBinding.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace AREngine::XR::OpenXR
 {
@@ -27,14 +28,25 @@ namespace AREngine::XR::OpenXR
     // through a giant dispatch system. See docs/ARCHITECTURE.md,
     // "Event Polling (M9D)".
     //
-    // If multiple XrEventDataSessionStateChanged events arrive within
-    // one poll cycle, `newSessionState` reflects the LAST one - it is
-    // the current, authoritative state; earlier ones in the same cycle
-    // are already stale by the time polling returns.
+    // `newSessionState` reflects the LAST XrEventDataSessionStateChanged
+    // observed this cycle - a convenience field kept for callers (like
+    // M9D's session demo) that only care about the current, authoritative
+    // state. `sessionStateSequence` holds EVERY XrEventDataSessionStateChanged
+    // observed this cycle, in the exact order xrPollEvent returned them -
+    // added in M9E.5 because a runtime can legitimately deliver more than
+    // one state change within a single draining cycle (e.g. READY
+    // immediately followed by STOPPING), and a caller that must react to
+    // each transition individually (XRFrameDriver: call xrBeginSession on
+    // READY, xrEndSession on STOPPING) would silently skip a required
+    // call if it only looked at the last one. `sessionStateSequence.back()
+    // == newSessionState` always holds when `sessionStateChanged` is true;
+    // `sessionStateSequence` is empty when it is false. See
+    // docs/ARCHITECTURE.md, "Ordered Session-State Processing (M9E.5)".
     struct SessionEventPollResult
     {
         bool sessionStateChanged = false;
         XrSessionState newSessionState = XR_SESSION_STATE_UNKNOWN;
+        std::vector<XrSessionState> sessionStateSequence;
         bool instanceLossPending = false;
         XrTime lossTime = 0;
     };

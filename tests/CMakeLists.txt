@@ -170,7 +170,7 @@ if(ARENGINE_ENABLE_OPENXR)
     add_executable(arengine_openxr_session_tests
         openxr_session_tests.cpp
     )
-    target_link_libraries(arengine_openxr_session_tests PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader)
+    target_link_libraries(arengine_openxr_session_tests PRIVATE AREngine::Core AREngine::XR AREngine::Frame OpenXR::openxr_loader)
     target_include_directories(arengine_openxr_session_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
     target_compile_features(arengine_openxr_session_tests PRIVATE cxx_std_20)
     add_test(NAME OpenXRSessionTests COMMAND arengine_openxr_session_tests)
@@ -218,7 +218,7 @@ if(ARENGINE_ENABLE_OPENXR)
         add_executable(arengine_openxr_session_demo
             openxr_session_demo.cpp
         )
-        target_link_libraries(arengine_openxr_session_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
+        target_link_libraries(arengine_openxr_session_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_openxr_session_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
         target_compile_features(arengine_openxr_session_demo PRIVATE cxx_std_20)
 
@@ -230,7 +230,7 @@ if(ARENGINE_ENABLE_OPENXR)
         add_executable(arengine_openxr_frame_demo
             openxr_frame_demo.cpp
         )
-        target_link_libraries(arengine_openxr_frame_demo PRIVATE AREngine::Core AREngine::XR OpenXR::openxr_loader Vulkan::Vulkan)
+        target_link_libraries(arengine_openxr_frame_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_openxr_frame_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
         target_compile_features(arengine_openxr_frame_demo PRIVATE cxx_std_20)
     endif()

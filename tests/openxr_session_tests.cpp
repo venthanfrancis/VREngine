@@ -10,6 +10,12 @@
 // compile time, without needing a real OpenXR runtime, headset, GPU, or
 // even Vulkan enabled.
 //
+// M9E.5 adds DetermineFrameStatus/DetermineSessionLifecycleActions
+// coverage - still zero real OpenXR/Vulkan calls, but this file (like
+// OpenXRSessionState.hpp/.cpp itself) now depends on AREngine::Frame
+// for Frame::FrameStatus - see docs/ARCHITECTURE.md, "Where
+// DetermineFrameStatus Lives (M9E.5)".
+//
 // Real OpenXR session bring-up (session/space creation and event
 // polling against a real loader/runtime) is exercised only by the
 // separate, manual arengine_openxr_session_demo — not part of this
@@ -21,6 +27,8 @@
 #include "openxr/OpenXRReferenceSpace.hpp"
 #include "openxr/OpenXRSessionState.hpp"
 #include "openxr/OpenXRViewConfiguration.hpp"
+
+#include "AREngine/Frame/FrameStatus.hpp"
 
 #include <cstdio>
 
@@ -84,6 +92,89 @@ namespace
         Check(ShouldStopMainLoop(XR_SESSION_STATE_LOSS_PENDING), "LOSS_PENDING should stop the main loop");
         Check(!ShouldStopMainLoop(XR_SESSION_STATE_FOCUSED), "FOCUSED should not stop the main loop");
         Check(!ShouldStopMainLoop(XR_SESSION_STATE_STOPPING), "STOPPING alone (before EXITING) should not yet stop the main loop");
+    }
+
+    // --- DetermineFrameStatus (M9E.5) ---
+
+    void TestDetermineFrameStatusStop()
+    {
+        Check(DetermineFrameStatus(XR_SESSION_STATE_EXITING, /*sessionRunning=*/false) == AREngine::Frame::FrameStatus::Stop,
+              "EXITING maps to FrameStatus::Stop regardless of sessionRunning");
+        Check(DetermineFrameStatus(XR_SESSION_STATE_LOSS_PENDING, /*sessionRunning=*/true) == AREngine::Frame::FrameStatus::Stop,
+              "LOSS_PENDING maps to FrameStatus::Stop regardless of sessionRunning");
+    }
+
+    void TestDetermineFrameStatusIdle()
+    {
+        Check(DetermineFrameStatus(XR_SESSION_STATE_READY, /*sessionRunning=*/false) == AREngine::Frame::FrameStatus::Idle,
+              "A non-terminal state with sessionRunning=false maps to FrameStatus::Idle (e.g. not yet begun)");
+        Check(DetermineFrameStatus(XR_SESSION_STATE_STOPPING, /*sessionRunning=*/false) == AREngine::Frame::FrameStatus::Idle,
+              "STOPPING with sessionRunning=false (already ended) maps to FrameStatus::Idle, not Stop - "
+              "EXITING has not arrived yet");
+    }
+
+    void TestDetermineFrameStatusContinue()
+    {
+        Check(DetermineFrameStatus(XR_SESSION_STATE_SYNCHRONIZED, /*sessionRunning=*/true) == AREngine::Frame::FrameStatus::Continue,
+              "A non-terminal state with sessionRunning=true maps to FrameStatus::Continue");
+        Check(DetermineFrameStatus(XR_SESSION_STATE_FOCUSED, /*sessionRunning=*/true) == AREngine::Frame::FrameStatus::Continue,
+              "FOCUSED with sessionRunning=true maps to FrameStatus::Continue");
+    }
+
+    // --- DetermineSessionLifecycleActions (M9E.5) ---
+    //
+    // Directly tests the ordered-processing fix: a runtime can legitimately
+    // deliver more than one XrEventDataSessionStateChanged within a single
+    // poll cycle, and reacting only to the last one would silently skip a
+    // required xrBeginSession/xrEndSession call.
+
+    void TestDetermineSessionLifecycleActionsSingleReady()
+    {
+        const std::vector<XrSessionState> sequence{XR_SESSION_STATE_READY};
+        const auto actions = DetermineSessionLifecycleActions(sequence, /*initiallyRunning=*/false);
+        Check(actions.size() == 1 && actions[0] == SessionLifecycleAction::Begin,
+              "A single READY (not running) produces exactly one Begin action");
+    }
+
+    void TestDetermineSessionLifecycleActionsSingleStopping()
+    {
+        const std::vector<XrSessionState> sequence{XR_SESSION_STATE_STOPPING};
+        const auto actions = DetermineSessionLifecycleActions(sequence, /*initiallyRunning=*/true);
+        Check(actions.size() == 1 && actions[0] == SessionLifecycleAction::End,
+              "A single STOPPING (running) produces exactly one End action");
+    }
+
+    void TestDetermineSessionLifecycleActionsReadyThenStoppingSameCycle()
+    {
+        // The exact scenario this function exists to fix: READY and
+        // STOPPING both arrive within one poll cycle, before the
+        // session was ever running. Collapsing to "only the last state"
+        // would see only STOPPING (with sessionRunning still false) and
+        // produce no action at all - the session would never begin,
+        // never end, and the demo would be stuck. Processing in order
+        // must produce Begin, then End.
+        const std::vector<XrSessionState> sequence{XR_SESSION_STATE_READY, XR_SESSION_STATE_STOPPING};
+        const auto actions = DetermineSessionLifecycleActions(sequence, /*initiallyRunning=*/false);
+        Check(actions.size() == 2, "Two observed transitions produce two actions, not one");
+        Check(actions.size() == 2 && actions[0] == SessionLifecycleAction::Begin,
+              "READY (first) produces Begin");
+        Check(actions.size() == 2 && actions[1] == SessionLifecycleAction::End,
+              "STOPPING (second, after Begin already ran) produces End - only possible because the running "
+              "flag updated in between, not by looking at the original initiallyRunning=false alone");
+    }
+
+    void TestDetermineSessionLifecycleActionsNonActionableStates()
+    {
+        const std::vector<XrSessionState> sequence{XR_SESSION_STATE_IDLE, XR_SESSION_STATE_SYNCHRONIZED};
+        const auto actions = DetermineSessionLifecycleActions(sequence, /*initiallyRunning=*/true);
+        Check(actions.size() == 2 && actions[0] == SessionLifecycleAction::None && actions[1] == SessionLifecycleAction::None,
+              "States that are neither READY nor a running-session's STOPPING produce None actions");
+    }
+
+    void TestDetermineSessionLifecycleActionsEmpty()
+    {
+        const auto actions = DetermineSessionLifecycleActions({}, /*initiallyRunning=*/false);
+        Check(actions.empty(), "No observed transitions produces no actions");
     }
 
     // --- View configuration ---
@@ -214,6 +305,16 @@ int main()
     TestShouldEndSession();
     TestShouldStopMainLoop();
 
+    TestDetermineFrameStatusStop();
+    TestDetermineFrameStatusIdle();
+    TestDetermineFrameStatusContinue();
+
+    TestDetermineSessionLifecycleActionsSingleReady();
+    TestDetermineSessionLifecycleActionsSingleStopping();
+    TestDetermineSessionLifecycleActionsReadyThenStoppingSameCycle();
+    TestDetermineSessionLifecycleActionsNonActionableStates();
+    TestDetermineSessionLifecycleActionsEmpty();
+
     TestIsViewConfigurationTypeSupported();
     TestSelectPrimaryViewConfigurationTypePrefersStereo();
     TestSelectPrimaryViewConfigurationTypeReturnsNulloptWithoutStereo();
@@ -232,7 +333,7 @@ int main()
 
     if (g_failureCount == 0)
     {
-        std::printf("All OpenXR session (pure-logic) M9D/M9E checks passed\n");
+        std::printf("All OpenXR session (pure-logic) M9D/M9E/M9E.5 checks passed\n");
         return 0;
     }
 
