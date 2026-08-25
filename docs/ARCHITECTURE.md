@@ -5513,3 +5513,500 @@ current shape (`position`/`orientation`/`projection`) is sufficient, or
 whether *that* milestone surfaces its own concrete mismatch the way
 M9E did for `FrameDriver`. Not fixed here, not assumed away — flagged
 for M9F to discover with its own real evidence.
+
+## 30. M9F Implementation Notes
+
+M9F integrates real OpenXR view location: `xrLocateViews` is called at
+the current frame's predicted display time, the runtime's real per-view
+pose and asymmetric FOV are converted into generic `Frame::ViewInfo`,
+and a genuine `XrCompositionLayerProjection` — built from that real
+data — is submitted to the compositor. No scene geometry is rendered;
+the swapchain images still just receive M9E's solid-color clear. The
+goal is proving real view data flows correctly end to end and is
+accepted by the compositor, not drawing anything.
+
+A design-review pass (before implementation) independently re-derived
+the asymmetric-projection matrix math from first principles and
+confirmed it correct with no sign errors. A second, later review pass
+(also before implementation) caught that the original draft let
+`XRFrameDriver` grow to own swapchain topology and composition-layer
+metadata directly — reworked into a smaller, separate
+`OpenXRProjectionLayer` helper instead; see "Why OpenXRProjectionLayer
+Is Separate From XRFrameDriver" below.
+
+### ViewInfo Architecture Decision (M9F)
+
+**Old shape** (unchanged since M1):
+```cpp
+struct ViewInfo {
+    Core::Math::Vec3 position;
+    Core::Math::Quaternion orientation = Core::Math::Quaternion::Identity();
+    Core::Math::Mat4 projection = Core::Math::Mat4::Identity();
+};
+```
+
+**Evaluated against real `xrLocateViews` evidence and found already
+sufficient — zero field changes.** `position`/`orientation` already
+represent exactly what `xrLocateViews` provides: the view's pose in the
+reference space used to locate it (see "View-Pose Semantics" below) —
+not a view matrix, and `projection` was already a plain `Mat4`, capable
+of holding a real asymmetric projection without any structural change
+once a function to build one existed (`PerspectiveOffCenterRH_ZO`,
+below).
+
+One field was seriously considered and explicitly **rejected**: a
+precomputed `viewMatrix` (the milestone's own brief offered this as "a
+possible direction"). Rejected because nothing in M9F renders anything
+— no code anywhere in this engine yet consumes a view matrix — and
+`Scene::Camera` already establishes the relevant precedent:
+`Camera::GetViewMatrix(transform)` computes `viewFromWorld` from a
+separately-stored pose on demand, rather than storing both the pose and
+its derived matrix redundantly ("Camera does NOT own or duplicate
+position/rotation... the same way every other piece of AREngine avoids
+storing the same data twice" — `Camera.hpp`'s own doc comment).
+Deriving `viewFromWorld` from `ViewInfo`'s pose the same way is a real
+design decision, correctly deferred to M9G, when a real renderer first
+needs one and can supply genuine evidence for its exact shape — not
+invented speculatively here. Only `ViewInfo.hpp`'s doc comment changed,
+clarifying this reasoning and that `projection` still carries no Vulkan
+Y-flip (same policy as `Camera`).
+
+### xrLocateViews Lifecycle Position (M9F)
+
+Called from `XRFrameDriver::GetViews()`, which is only ever called by a
+caller (the demo) after `BeginFrame()` has succeeded — consistent with
+`FrameDriver`'s own documented contract since M9E.5. Only called when
+`shouldRender` is true: `xrLocateViews` is real runtime work with no
+benefit when nothing will be drawn this frame, and the milestone brief
+explicitly asks not to call it unnecessarily. Uses the standard
+two-call idiom (`xrLocateViews` with `viewCapacityInput=0` to query the
+count, then again with a sized buffer) — the same idiom every other
+`xrEnumerate*`-shaped call in this codebase already uses.
+
+### Predicted Display Time Usage (M9F)
+
+`XrViewLocateInfo::displayTime` is set to
+`m_lastPredictedDisplayTime` — the exact value `PrepareFrame()`'s own
+`xrWaitFrame` call stashed for *this* frame, the same value `EndFrame()`
+uses for `XrFrameEndInfo::displayTime`. Never CPU wall-clock time, never
+a previous frame's time — the located views correspond exactly to the
+frame actually being rendered/submitted, per the milestone's explicit
+requirement. No new state was needed for this: `m_lastPredictedDisplayTime`
+already existed (M9E.5), used for `xrEndFrame`'s `displayTime`; M9F
+simply reads the same field.
+
+### LOCAL Reference-Space Use (M9F)
+
+Used as both `xrLocateViews`'s `space` parameter and
+`XrCompositionLayerProjection::space`. M9D's `OpenXRReferenceSpace`
+class (unused since M9E.5, when zero composition layers meant nothing
+needed an `XrSpace`) is brought back — the demo creates one `LOCAL`
+space, declared after `session` (destroyed before it, per M9D's
+established ordering rule), and passes it by reference into
+`XRFrameDriver`'s constructor. Deliberately **not** AREngine's final AR
+world-origin policy: `STAGE` and future spatial anchors remain separate
+concerns, entirely unaddressed by this milestone.
+
+### OpenXR/AREngine Coordinate Compatibility (M9F)
+
+**Verified before writing any conversion code, not assumed.** Per the
+OpenXR specification's own coordinate-system definition, OpenXR
+reference spaces are right-handed, +Y up, -Z forward, in meters —
+identical, field for field, to AREngine's own world convention
+(`docs/WORLD_CONVENTIONS.md`: 1 unit = 1 meter, right-handed, +X right,
++Y up, -Z forward). **No axis flip is introduced anywhere in this
+milestone's conversion code** — `ConvertXrPosition` is a direct,
+unmodified field copy (`OpenXRViewConversion.hpp`). This is
+deliberately documented as a verified fact, not a silent assumption —
+see that file's own comment and `TestConvertXrPositionTranslated`
+(`tests/openxr_view_tests.cpp`), which checks a position with a
+distinct, non-zero value on every axis specifically so a sign error on
+any one of them would be caught.
+
+### Quaternion Conversion (M9F)
+
+**Confirmed against both types' actual definitions before writing the
+conversion, not assumed.** `XrQuaternionf` stores `{x, y, z, w}`.
+`AREngine::Core::Math::Quaternion` is Hamilton `{w, x, y, z}` storage,
+with constructor `Quaternion(float w, float x, float y, float z)`. The
+conversion (`ConvertXrOrientation`, `OpenXRViewConversion.hpp`) is
+therefore `Quaternion(xr.w, xr.x, xr.y, xr.z)` — a component
+**reorder**, not a coordinate-system conversion (no axis flip is
+involved, per the previous section). Tested with a deliberately
+per-component-asymmetric quaternion (`{x=0.1, y=0.2, z=0.3, w=0.9}`),
+not just identity — an identity-only test could pass even with the
+fields swapped into the wrong slots; this one actually catches a
+reorder bug (`TestConvertXrOrientationFieldReorder`).
+
+### View-Pose Semantics (M9F)
+
+Documented precisely, per the milestone's own explicit warning:
+`ViewInfo::position`/`orientation` is the view's pose **in the
+reference space it was located against** (LOCAL, for M9F) —
+conceptually "worldFromView": where the view is and how it's facing,
+expressed in that space. It is **not** a view matrix, and **not**
+`viewFromWorld` (its inverse) either. A renderer that needs a
+conventional view matrix computes `viewFromWorld` from this pose on
+demand — see "ViewInfo Architecture Decision" above for why that
+computation doesn't exist yet.
+
+### Asymmetric FOV / New Core Helper (M9F)
+
+OpenXR's `XrFovf` provides four **independent** angles
+(`angleLeft`/`angleRight`/`angleUp`/`angleDown`) — a stereo headset's
+per-eye frustum is not generally symmetric around the view's forward
+axis, and the existing `PerspectiveRH_ZO` (one symmetric `fovY` +
+`aspect`) cannot represent that. New `Core::Math::PerspectiveOffCenterRH_ZO`
+(`ViewProjection.hpp`) is the general off-center case
+`PerspectiveRH_ZO`'s formula is a special case of:
+
+```cpp
+Mat4 PerspectiveOffCenterRH_ZO(
+    float angleLeftRadians, float angleRightRadians,
+    float angleUpRadians, float angleDownRadians,
+    float nearZ, float farZ)
+{
+    const float tanLeft = std::tan(angleLeftRadians);
+    const float tanRight = std::tan(angleRightRadians);
+    const float tanUp = std::tan(angleUpRadians);
+    const float tanDown = std::tan(angleDownRadians);
+    Mat4 result;
+    result.Set(0, 0, 2.0f / (tanRight - tanLeft));
+    result.Set(0, 2, (tanRight + tanLeft) / (tanRight - tanLeft));
+    result.Set(1, 1, 2.0f / (tanUp - tanDown));
+    result.Set(1, 2, (tanUp + tanDown) / (tanUp - tanDown));
+    result.Set(2, 2, farZ / (nearZ - farZ));
+    result.Set(2, 3, (farZ * nearZ) / (nearZ - farZ));
+    result.Set(3, 2, -1.0f);
+    return result;
+}
+```
+
+**Derivation**: at the near plane (view-space `z = -nearZ`), the
+visible x-range is `[nearZ·tanLeft, nearZ·tanRight]` and must map to
+NDC `x ∈ [-1, +1]`; solving that linear system for the two boundary
+conditions gives `m00`/`m02` (same derivation, transposed, for
+`m11`/`m12` with up/down). The depth terms (`m22`/`m23`/`m32`) are
+exactly `PerspectiveRH_ZO`'s own — off-center shear affects only X/Y,
+never Z/W. **Independently re-derived by a design-review pass** before
+any code was written (concrete numeric case: `angleLeft=-30°,
+angleRight=+60°` → `m00=0.86603, m02=0.5`, verified against both
+frustum edges by hand) — confirmed correct, no sign error.
+**Symmetric-case reduction verified both algebraically and by test**
+(`TestPerspectiveOffCenterRH_ZOSymmetricCaseMatchesPerspectiveRH_ZO`,
+`tests/core_tests.cpp`): substituting `angleLeft=-angleRight`,
+`angleDown=-angleUp` collapses `m02`/`m12` to exactly 0 and
+`m00`/`m11` to exactly `PerspectiveRH_ZO`'s own `focalLength/aspect`
+and `focalLength`. Asymmetric-boundary tests
+(`TestPerspectiveOffCenterRH_ZOAsymmetricFrustumBoundaries`) transform
+each of the four frustum-edge points through the matrix and confirm
+each lands exactly on its corresponding NDC boundary — the "a point on
+the left frustum boundary should map to the left clip boundary" check
+the milestone brief explicitly asked for, for all four sides.
+
+Same policy as `PerspectiveRH_ZO`/`Camera`: **no Vulkan Y-flip baked
+in**. That correction stays a downstream, Vulkan-renderer-layer
+concern (`Rendering::Vulkan::ApplyVulkanYFlip`, M8F) — `engine/xr` does
+not include Rendering's private headers (same established boundary as
+M9C's `FindGraphicsQueueFamily` duplication), and more fundamentally,
+nothing renders yet in M9F for the flip to matter to. When a real
+XR-Vulkan renderer exists (M9G+), the flip is a Vulkan-API-level NDC
+convention correction — not swapchain-topology-specific — so
+`ApplyVulkanYFlip` (or an equivalent) applies to XR render targets
+exactly as it already does to desktop ones; this was reasoned through
+explicitly, not assumed, but implementing it is out of scope until a
+real XR renderer exists to apply it.
+
+### Near/Far Policy (M9F)
+
+OpenXR's `XrFovf` provides angular FOV only — never near/far clip
+distances. `nearZ`/`farZ` are therefore explicit
+`XRFrameDriver` constructor parameters (defaults `0.05f`/`100.0f`),
+not hard-coded inside any conversion function — application/engine
+policy, kept easy to change, clearly separated from the
+runtime-provided FOV data flowing through `ConvertXrViewToViewInfo`.
+
+### View Validity Handling (M9F)
+
+`XrViewState::viewStateFlags` is inspected via
+`IsViewStateValid(flags)` (`OpenXRViewConversion.hpp`): requires
+**both** `XR_VIEW_STATE_ORIENTATION_VALID_BIT` and
+`XR_VIEW_STATE_POSITION_VALID_BIT` — per the OpenXR spec, pose data
+must not be used at all when either is unset. The `*_TRACKED_BIT`
+flags are deliberately **not** required: the spec permits a runtime to
+report valid-but-untracked (a "last known good" pose during a brief
+tracking interruption), which remains legitimate, usable data, not a
+hard failure. When invalid, `GetViews()` returns an empty vector — **no
+identity head pose is ever fabricated to hide the condition** — and
+`EndFrame()` correctly submits zero composition layers as a
+consequence (see "Composition-Layer Seam" below). Logging is
+transition-only (`m_lastViewStateValid` tracks the last-observed
+validity; a log line fires only when it flips), avoiding per-frame
+spam while still surfacing the condition clearly when it actually
+changes. Not exercised against SteamVR's null driver this session —
+pose data was valid on every observed frame; a genuine, honestly-
+reported gap, consistent with this project's established practice.
+
+### Why OpenXRProjectionLayer Is Separate From XRFrameDriver (M9F)
+
+**Caught and corrected during design review, before implementation.**
+The first draft added swapchain sub-image metadata directly to
+`XRFrameDriver`'s constructor. Reworked: M9E.5 established
+`XRFrameDriver` as a frame-*lifecycle* object (session events,
+`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`, and now `xrLocateViews` →
+generic `ViewInfo` conversion) — it does not own swapchain topology or
+permanent render-target metadata, which is a genuinely separate
+resource-lifecycle concern (same reasoning M9E.5 already applied to
+swapchain image acquisition staying on `OpenXRSwapchain`, not
+`XRFrameDriver`). `OpenXRProjectionLayer` (new,
+`engine/xr/src/openxr/OpenXRProjectionLayer.hpp/.cpp`) is the smallest
+dedicated place for that: it owns per-view `XrSwapchainSubImage`
+metadata (fixed for the session's lifetime) and, each frame, rebuilds
+an `XrCompositionLayerProjectionView` array + `XrCompositionLayerProjection`
+from that metadata plus the frame's real located `XrView` data.
+Vulkan-independent (its own types —
+`XrSwapchainSubImage`/`XrCompositionLayerProjection*` — are all core
+`openxr.h` types, not `openxr_platform.h` Vulkan-flavored ones), so it
+lives in the unconditional OpenXR CMake block, same tier as
+`OpenXRSessionState.hpp`, and its `Prepare()` logic (count-mismatch
+handling, view-array construction) is directly pure-logic-testable
+with synthetic data — no Vulkan or real OpenXR call needed
+(`tests/openxr_view_tests.cpp`).
+
+**Borrowed-lifetime discipline, documented explicitly**: the
+`XrSwapchainSubImage`s `OpenXRProjectionLayer` holds contain raw
+`XrSwapchain` handles it does not own — `XrSwapchain` is an opaque
+OpenXR handle, not a C++ object with its own lifetime tracking; the
+actual owning C++ object is `OpenXRSwapchain` (M9E), and it is
+`OpenXRSwapchain`'s destructor (`xrDestroySwapchain`) that these
+borrowed handles must not outlive. The demo declares `swapchains`
+before `projectionLayer`, guaranteeing correct destruction order.
+
+### No XrView/ViewInfo Round-Trip (M9F)
+
+`Frame::ViewInfo`'s generic shape does not, and should not, carry
+every OpenXR-specific field `XrCompositionLayerProjectionView` needs
+(raw `XrPosef`/`XrFovf`, not AREngine math types). Round-tripping
+`XrView → ViewInfo → reconstructed XrView` would be both lossy
+(`ViewInfo` doesn't need to preserve OpenXR's exact struct layout) and
+pointless extra work. Instead, `XRFrameDriver` retains the current
+frame's raw `XrView` data privately (`m_lastLocatedViews`, populated
+inside `GetViews()`'s own `xrLocateViews` call) and exposes it via a
+narrow, XR-only accessor — `GetLastLocatedXrViews() const -> const
+std::vector<XrView>&` — not part of the generic `FrameDriver`
+interface, consumed directly by `OpenXRProjectionLayer::Prepare()`.
+
+### Composition-Layer Seam (M9F)
+
+**`Frame::FrameDriver::EndFrame()` gained zero new parameters and
+stays a completely generic, OpenXR-free override.** The minimal
+XR-private seam: `XRFrameDriver::SetPendingProjectionLayer(const
+XrCompositionLayerProjection* layer)` — not part of `FrameDriver`,
+called by the demo (after `OpenXRProjectionLayer::Prepare()` succeeds)
+right before `EndFrame()`. `EndFrame()` builds `XrFrameEndInfo::layers`
+from whatever was pending (zero or one layer), submits it, then
+**resets the pending pointer to `nullptr`** regardless of whether it
+was used — the actual fix for a real bug caught during an earlier
+review pass of this same design (an earlier draft required a separate,
+easy-to-forget clear call elsewhere; the "always reset after
+consuming" rule means a tick that never calls
+`SetPendingProjectionLayer()` at all — `shouldRender` was false, or no
+valid views were located — safely defaults to zero layers with no
+other bookkeeping required).
+
+### Swapchain/View-Count Validation (M9F)
+
+**A genuine runtime check, not a debug-only assertion** — per the
+milestone's explicit requirement that a Release build compiling out an
+`AR_ASSERT_MSG` must not silently remove the check entirely.
+`OpenXRProjectionLayer::Prepare(views)` compares `views.size()`
+(this frame's real `xrLocateViews` result) against `m_subImages.size()`
+(fixed at construction, one per swapchain): on a mismatch, logs a
+clear `AR_LOG_ERROR` and returns `false` (submitting zero layers this
+frame) rather than indexing either array out of bounds. `views.empty()`
+(shouldRender was false, or view state was invalid) is handled
+identically but is not itself an error — no log, just "no layer this
+frame." Both paths tested directly with synthetic data
+(`TestOpenXRProjectionLayerCountMismatchProducesNoLayer`,
+`TestOpenXRProjectionLayerEmptyViewsProducesNoLayer`).
+
+### Composition Submission (M9F)
+
+When a valid layer was prepared: one `XrCompositionLayerProjection`
+(`space = LOCAL`, `layerFlags = 0`) containing one
+`XrCompositionLayerProjectionView` per located view (`pose`/`fov`
+straight from the real `XrView`, `subImage` from the pre-built,
+real-swapchain-derived metadata), submitted via the standard
+`const XrCompositionLayerBaseHeader* const*` pointer-array +
+`reinterpret_cast` idiom `XrFrameEndInfo::layers` requires. Confirmed
+accepted by the compositor on the one frame it was attempted (frame 1,
+the only frame `shouldRender` was true on this run — see below): no
+`CheckXrResult` failure, no crash, exit code 0.
+
+### Static/Moving Pose Findings (M9F)
+
+Observed against SteamVR's null driver, twice, both runs identical:
+```
+View 0: pos=(0.0315, 0.0000, 0.0000) orient=(w=0.0000, x=0.0000, y=0.0000, z=-1.0000) fov(L/R/U/D deg)=(-45.00, 45.00, 45.00, -45.00)
+View 1: pos=(-0.0315, 0.0000, 0.0000) orient=(w=0.0000, x=0.0000, y=0.0000, z=-1.0000) fov(L/R/U/D deg)=(-45.00, 45.00, 45.00, -45.00)
+```
+**FOV wording, precise**: these ±45° values are symmetric
+(`angleLeft = -angleRight`, `angleDown = -angleUp`) on both eyes, every
+observed run. AREngine's support for genuinely asymmetric FOV is
+real and proven — by the pure mathematical/conversion tests
+(`PerspectiveOffCenterRH_ZO`'s frustum-boundary tests,
+`tests/core_tests.cpp`; `ConvertXrViewToViewInfo`'s tests,
+`tests/openxr_view_tests.cpp`), not by this live run. SteamVR's null
+driver simply happened to report a symmetric FOV every time it was
+observed; this is a fact about the runtime, not a limitation of
+AREngine's conversion pipeline (which carries through whatever FOV
+values it is given, symmetric or not, without collapsing anything -
+see the tests above). Do not read "asymmetric FOV preserved end to
+end" claims elsewhere in this document as claiming the *live* runtime
+demonstrated asymmetry - only the tests do; see "M9F Diagnostic Review
+Addendum" below for the review that caught and corrected this exact
+wording ambiguity.
+
+The ±0.0315 m X-separation between the two views is a plausible,
+realistic human IPD (≈63 mm total) — evidence the position conversion
+is genuinely correct, not coincidentally-plausible garbage. The
+orientation `(w=0, x=0, y=0, z=-1)` is a valid unit quaternion (not a
+bug) representing a 180° rotation about Z — not the identity a
+"forward-facing, upright" default might be expected to be; this
+appears to be the null driver's own fixed default, not a bug in
+AREngine's conversion pipeline (independently re-verified twice: the
+position conversion's IPD sanity, and the field-reorder logic's own
+unit test). **Whether poses change over time could not be observed in
+this run**: `shouldRender` was `true` only on frame 1 (the same
+SteamVR/null-driver behavior already documented in M9E — see Section
+28, "`xrWaitFrame` Timing / `predictedDisplayTime` / `shouldRender`
+(M9E)"), and `GetViews()` is deliberately only called when
+`shouldRender` is true (per this milestone's own "don't call
+`xrLocateViews` unnecessarily" requirement) — so only one real sample
+was gathered per run. Reported honestly as a real limitation of this
+test environment, not papered over; a runtime/simulator that reports
+`shouldRender=true` more often, or genuine head-tracking hardware,
+would be needed to observe pose changes across frames. No SteamVR-
+specific null-driver pose-injection mechanism was investigated — out
+of scope, and the brief explicitly warns against adding vendor-specific
+AREngine code for it regardless.
+
+### Validation Results (M9F)
+
+All four `ARENGINE_ENABLE_OPENXR` × `ARENGINE_ENABLE_VULKAN`
+combinations: full build succeeds, `/EHsc /W4 /WX` clean (verified on
+ON/ON), `ctest` green on every combination (ON/ON: 15/15 — includes
+the new `OpenXRViewTests`, 15 pure-logic checks; ON/OFF: 13/13;
+OFF/ON default: 11/11).
+
+`arengine_openxr_frame_demo` run twice against the live SteamVR/OpenXR
+runtime — both clean (exit code 0), 200/200 frames completed both
+times, identical view/pose data both runs (see above). Session-state
+sequence: `IDLE → READY → SYNCHRONIZED → STOPPING → IDLE → EXITING`.
+Same category of SteamVR-internal Vulkan validation noise as M9E/
+M9E.5 (`BlankEyeBuffer`, command-buffer handles this codebase never
+allocated) — zero validation errors traced to AREngine's own code.
+Sandbox and the desktop Vulkan present demo both launched and ran
+without crashing (neither `engine/rendering/` nor `runtime/` code was
+touched by this milestone).
+
+- Files changed: `engine/core/include/AREngine/Core/Math/ViewProjection.hpp`;
+  `engine/frame/include/AREngine/Frame/ViewInfo.hpp` (docs only); new
+  `engine/xr/src/openxr/OpenXRViewConversion.hpp`,
+  `OpenXRProjectionLayer.hpp/.cpp`; `engine/xr/src/openxr/
+  XRFrameDriver.hpp/.cpp`; `engine/xr/CMakeLists.txt`;
+  `tests/openxr_frame_demo.cpp`, new `tests/openxr_view_tests.cpp`,
+  `tests/core_tests.cpp`, `tests/CMakeLists.txt`.
+
+### Architectural Issues Found (M9F)
+
+None beyond what design review already caught and corrected before
+implementation (the swapchain-metadata-ownership question, resolved by
+introducing `OpenXRProjectionLayer`). The one item flagged forward for
+M9G: `ViewInfo`'s pose-only shape (no view matrix) has now gone two
+milestones without a real consumer exercising it for rendering — M9G
+(head-tracked AREngine demo) will be the first genuine test of whether
+that remains the right shape, or whether a `viewFromWorld`-producing
+helper (on `ViewInfo` itself, or elsewhere) is the smallest correct
+addition once a real renderer exists to need one.
+
+### M9F Diagnostic Review Addendum
+
+Requested and performed immediately after M9F's own architectural
+approval, before any commit, in response to two specific concerns
+raised about the delivered report.
+
+**Issue 1 — PRIMARY_STEREO view order / eye positions.** The original
+report showed `View 0 = (+0.0315, 0, 0)`, `View 1 = (-0.0315, 0, 0)`,
+which looks reversed against the usual index-0-is-left,
++X-is-right expectation. Investigated directly rather than "fixed" by
+swapping or negating anything (which the review explicitly, and
+correctly, warned against — that would have hidden real runtime
+behavior behind a guess). The demo's diagnostic logging was extended to
+print the **raw** `xrLocateViews` output (`XrView[i].pose.position`,
+straight from the runtime, before any AREngine code touches it)
+alongside the **converted** `Frame::ViewInfo[i].position`, for the same
+index `i`, side by side — then rerun twice against live SteamVR:
+
+```
+View 0: RAW xrLocateViews pos=(0.0315, 0.0000, 0.0000)
+View 0: CONVERTED ViewInfo pos=(0.0315, 0.0000, 0.0000) ...
+View 1: RAW xrLocateViews pos=(-0.0315, 0.0000, 0.0000)
+View 1: CONVERTED ViewInfo pos=(-0.0315, 0.0000, 0.0000) ...
+```
+
+Raw and converted are identical for both indices, both runs — proving
+`ConvertXrPosition` genuinely performs only a direct field copy (no
+reversal, no sign flip) and that no reordering happens anywhere between
+`xrLocateViews`'s output and `ViewInfo`'s consumer-facing values. Every
+other requested check was confirmed by direct code inspection, not
+merely asserted:
+- `GetViews()` builds its result vector with a single `for (const
+  XrView& view : views) result.push_back(...)` loop, in order — no
+  reversal, and `m_lastLocatedViews = views` is a straight copy of the
+  same array, same order.
+- The demo's logging loop uses the same index `i` for `views[i]`
+  (converted) and `rawViews[i]` (raw) - no mislabeling.
+- `swapchains[i]` is built from `viewConfigViews[i]` (M9D's own
+  index-preserving `EnumerateViewConfigurationViews`), and
+  `projectionSubImages[i]` is built by iterating `swapchains` in the
+  same order - confirmed both by code inspection and by new explicit
+  log output (`projectionSubImages[0] <- swapchains[0] (1852x2056)`,
+  `projectionSubImages[1] <- swapchains[1] (1852x2056)`) added during
+  this review. `xrEnumerateViewConfigurationViews` and `xrLocateViews`
+  are both indexed consistently by the runtime for a given
+  `XrViewConfigurationType`, per spec - there is no seam anywhere in
+  this pipeline where index `i` could silently become index `j`.
+
+**Conclusion: the raw `xrLocateViews` output itself, before any
+AREngine code runs, already reports index 0 at +X and index 1 at -X.**
+This is SteamVR null-driver runtime behavior, observed directly, not an
+AREngine bug - reported as exactly that, per the review's own
+instruction, with **no runtime-specific workaround introduced**.
+AREngine's view ordering and axis convention are preserved exactly as
+the runtime reports them; swapping or negating anything here would have
+been AREngine silently disagreeing with its own graphics runtime about
+whose eye is whose, which is a strictly worse outcome than surfacing
+the raw fact. **No code change was required to fix a bug**, because
+there was no bug to fix - the two logging additions above (raw-vs-
+converted position, sub-image index correspondence) exist purely to
+make this conclusion independently verifiable from the log output
+itself, not just from this document's own claims.
+
+**Issue 2 — FOV wording precision.** Corrected in this document (see
+"Static/Moving Pose Findings (M9F)" above) and in `AGENTS.md`: AREngine
+supports and preserves genuinely asymmetric OpenXR FOV, proven by pure
+mathematical/conversion tests, not by the live runtime, which reported
+a symmetric ±45° FOV in every observed run. Prior wording in
+`AGENTS.md` that listed "asymmetric FOV preserved end to end" as
+something "verified... against live SteamVR" conflated the two and has
+been corrected.
+
+**Regression validation after this review**: `/EHsc /W4 /WX` clean,
+`ctest` 15/15 (ON/ON - the only combination affected, since the change
+is confined to `tests/openxr_frame_demo.cpp`'s logging inside the
+already-Vulkan-gated code path; no header, library, or test-suite
+source changed). `arengine_openxr_frame_demo` rerun twice against live
+SteamVR: raw/converted positions identical and stable across both runs
+(see above), composition layer still accepted (no `CheckXrResult`
+failure, no crash), 200/200 frames both runs, exit code 0 both times.

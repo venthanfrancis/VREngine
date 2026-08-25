@@ -175,6 +175,19 @@ if(ARENGINE_ENABLE_OPENXR)
     target_compile_features(arengine_openxr_session_tests PRIVATE cxx_std_20)
     add_test(NAME OpenXRSessionTests COMMAND arengine_openxr_session_tests)
 
+    # Pure-logic OpenXR view-location tests (M9F): XrPosef/XrFovf ->
+    # Frame::ViewInfo conversion, XrViewState validity, and
+    # OpenXRProjectionLayer's composition-layer preparation (including
+    # its view/sub-image count mismatch handling). No real OpenXR calls
+    # and no Vulkan dependency - see openxr_view_tests.cpp.
+    add_executable(arengine_openxr_view_tests
+        openxr_view_tests.cpp
+    )
+    target_link_libraries(arengine_openxr_view_tests PRIVATE AREngine::Core AREngine::XR AREngine::Frame OpenXR::openxr_loader)
+    target_include_directories(arengine_openxr_view_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+    target_compile_features(arengine_openxr_view_tests PRIVATE cxx_std_20)
+    add_test(NAME OpenXRViewTests COMMAND arengine_openxr_view_tests)
+
     # --- M9C: OpenXR/Vulkan integration boundary ---
     #
     # Only built when BOTH ARENGINE_ENABLE_OPENXR and

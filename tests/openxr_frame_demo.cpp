@@ -1,58 +1,68 @@
-// Manual M9E/M9E.5 validation demo — NOT part of the automated CTest
-// suite, since it requires a real OpenXR loader/runtime with
+// Manual M9E/M9E.5/M9F validation demo — NOT part of the automated
+// CTest suite, since it requires a real OpenXR loader/runtime with
 // XR_KHR_vulkan_enable2 support (and ideally a real or simulated HMD)
 // that CI/headless systems may lack. Built by CMake but deliberately
 // not registered with add_test. Run it manually.
 //
-// Proves AREngine's first real OpenXR frame lifecycle end to end: create
-// the M9C Vulkan graphics binding -> create an XrSession (M9D) -> select
-// PRIMARY_STEREO (M9D) -> enumerate + select an environment blend mode
-// -> enumerate + select a swapchain color format -> create one XrSwapchain
-// per view, sized from the runtime's own recommended dimensions/sample
-// count -> drive a real xrWaitFrame/xrBeginFrame/(acquire/wait/clear/
-// release)/xrEndFrame loop THROUGH XRFrameDriver (M9E.5's generic
-// Frame::FrameDriver implementation for OpenXR - see
-// engine/xr/src/openxr/XRFrameDriver.hpp), submitting ZERO composition
-// layers, until a target frame count is reached -> xrRequestExitSession
+// Proves AREngine's first real OpenXR frame lifecycle, view location,
+// and composition submission end to end: create the M9C Vulkan graphics
+// binding -> create an XrSession (M9D) -> select PRIMARY_STEREO (M9D)
+// -> enumerate + select an environment blend mode -> enumerate + select
+// a swapchain color format -> create a LOCAL reference space (M9D) ->
+// create one XrSwapchain per view, sized from the runtime's own
+// recommended dimensions/sample count -> drive a real xrWaitFrame/
+// xrBeginFrame/xrLocateViews/(acquire/wait/clear/release)/xrEndFrame
+// loop THROUGH XRFrameDriver (M9E.5's generic Frame::FrameDriver
+// implementation for OpenXR, now with real M9F view location) ->
+// convert real per-view pose/FOV into generic Frame::ViewInfo -> build
+// and submit a real XrCompositionLayerProjection via
+// OpenXRProjectionLayer (M9F's small XR-only composition helper) ->
+// repeat until a target frame count is reached -> xrRequestExitSession
 // -> observe the runtime drive STOPPING/EXITING -> clean shutdown.
 //
 // M9E.5 note: the session-state event loop (poll/BeginSession/EndSession/
 // stop-detection) and the raw xrWaitFrame/xrBeginFrame/xrEndFrame calls
 // that M9E drove manually, inline, in this file are now entirely inside
 // XRFrameDriver - this demo only calls PrepareFrame()/BeginFrame()/
-// EndFrame() and reacts to the generic FrameContext/FrameStatus/
-// shouldRender they return. What stays here, unchanged in substance: the
-// swapchain-specific Vulkan work (acquire/wait/clear/release across the
-// two OpenXRSwapchains) - a deliberate ownership decision, not an
-// oversight; see docs/ARCHITECTURE.md, "Render-Target Acquisition
-// Ownership (M9E.5)". This demo plays the "Renderer/XR integration"
-// coordinating role no dedicated module implements yet.
+// GetViews()/EndFrame() and reacts to the generic FrameContext/
+// FrameStatus/shouldRender/ViewInfo they return. What stays here,
+// unchanged in substance from M9E: the swapchain-specific Vulkan work
+// (acquire/wait/clear/release across the two OpenXRSwapchains) - a
+// deliberate ownership decision, not an oversight; see
+// docs/ARCHITECTURE.md, "Render-Target Acquisition Ownership (M9E.5)".
+// M9F note: building the XrCompositionLayerProjectionView array and
+// XrCompositionLayerProjection is this demo's own job too, via
+// OpenXRProjectionLayer (fed XRFrameDriver's raw located XrView data
+// via GetLastLocatedXrViews() - no XrView->ViewInfo->XrView round-trip)
+// - XRFrameDriver itself does not own swapchain topology or
+// composition-layer metadata; see docs/ARCHITECTURE.md, "Why
+// OpenXRProjectionLayer Is Separate From XRFrameDriver (M9F)". This
+// demo plays the "Renderer/XR integration" coordinating role no
+// dedicated module implements yet.
 //
-// Does NOT call xrLocateViews or xrLocateSpace (no real view pose/FOV
-// data exists yet - deferred to M9F), does NOT submit any
-// XrCompositionLayerProjection (submitting one would require exactly the
-// xrLocateViews data this milestone deliberately does not fabricate),
-// does NOT render any scene content (each eye's swapchain image is
-// cleared to a solid, distinct color - proof that the OpenXR-owned
-// VkImages are genuinely usable by AREngine's own Vulkan commands,
-// nothing more), does NOT create any reference space (unlike M9D's demo -
-// with zero composition layers submitted, nothing in M9E's frame loop
-// actually needs an XrSpace; see docs/ARCHITECTURE.md, "No Reference
-// Space Needed (M9E)"). See docs/ROADMAP.md.
+// Does NOT render any scene content (each eye's swapchain image is
+// still just cleared to a solid, distinct color - proof that the
+// OpenXR-owned VkImages are genuinely usable by AREngine's own Vulkan
+// commands, nothing more; the real pose/FOV/composition-layer data this
+// milestone adds is not used to draw anything). See docs/ROADMAP.md.
 //
 // This demo reaches directly into XR's private src/openxr/
 // implementation, same reasoning as M9A/M9C/M9D's demos.
 //
 // Same outcome-distinguishing discipline established since M9A: no
-// runtime, no HMD system, no stereo view configuration, and (new this
-// milestone) no supported environment blend mode or swapchain format are
-// all reported clearly and stopped on cleanly, never crashed on.
+// runtime, no HMD system, no stereo view configuration, no supported
+// environment blend mode or swapchain format, and (new this milestone)
+// no valid view pose data are all reported clearly and either stopped
+// on cleanly (the first four) or degraded gracefully to zero composition
+// layers for that frame (the last), never crashed on.
 
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Frame/Frame.hpp"
 
 #include "openxr/OpenXREnvironmentBlendMode.hpp"
 #include "openxr/OpenXRInstance.hpp"
+#include "openxr/OpenXRProjectionLayer.hpp"
+#include "openxr/OpenXRReferenceSpace.hpp"
 #include "openxr/OpenXRResult.hpp"
 #include "openxr/OpenXRSession.hpp"
 #include "openxr/OpenXRSwapchain.hpp"
@@ -68,6 +78,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <thread>
 #include <vector>
 
@@ -289,6 +300,16 @@ int main()
     OpenXRSession session(instance.Get(), systemId, binding.GetBindingData());
     AR_LOG_INFO("XrSession created successfully");
 
+    // --- M9F: LOCAL reference space (M9D's class, unused since M9E.5 -
+    // needed again now that real composition layers are submitted).
+    // Declared AFTER `session` so it is destroyed BEFORE it, same
+    // reverse-local-destruction-order discipline as M9D. LOCAL only -
+    // this is not AREngine's final AR world-origin policy; STAGE and
+    // future spatial anchors remain separate concerns. See
+    // docs/ARCHITECTURE.md, "LOCAL Reference-Space Use (M9F)". ---
+    OpenXRReferenceSpace localSpace(instance.Get(), session.Get(), XR_REFERENCE_SPACE_TYPE_LOCAL);
+    AR_LOG_INFO("Created LOCAL reference space");
+
     // --- M9E: swapchain format selection ---
     const std::vector<std::int64_t> supportedFormats = EnumerateSwapchainFormats(instance.Get(), session.Get());
     AR_LOG_INFO(std::format("Supported swapchain formats: {}", supportedFormats.size()));
@@ -322,6 +343,36 @@ int main()
         AR_LOG_INFO(std::format("Created swapchain for view {}: {}x{}, {} image(s)",
                                  i, swapchains.back()->GetWidth(), swapchains.back()->GetHeight(), swapchains.back()->GetImages().size()));
     }
+
+    // --- M9F: per-view composition sub-image metadata, built directly
+    // from each real OpenXRSwapchain's own width/height (never M9D's
+    // hard-coded 1852x2056 - those values came from this runtime and
+    // may change). imageArrayIndex is always 0: M9E chose one swapchain
+    // per view with arraySize=1 (see docs/ARCHITECTURE.md, "XR
+    // Swapchain Topology (M9E)"), so there is no array layer to index
+    // beyond the first. OpenXRProjectionLayer borrows these XrSwapchain
+    // handles - the `swapchains` vector above must outlive it. ---
+    std::vector<XrSwapchainSubImage> projectionSubImages;
+    projectionSubImages.reserve(swapchains.size());
+    for (std::size_t i = 0; i < swapchains.size(); ++i)
+    {
+        const std::unique_ptr<OpenXRSwapchain>& swapchain = swapchains[i];
+        XrSwapchainSubImage subImage{};
+        subImage.swapchain = swapchain->Get();
+        subImage.imageRect.offset = {0, 0};
+        subImage.imageRect.extent = {static_cast<std::int32_t>(swapchain->GetWidth()), static_cast<std::int32_t>(swapchain->GetHeight())};
+        subImage.imageArrayIndex = 0;
+        projectionSubImages.push_back(subImage);
+        // Diagnostic review (post-M9F): makes the index correspondence
+        // between runtime view index i, swapchains[i], and
+        // projectionSubImages[i] explicit in the log, not just true by
+        // construction (swapchains and viewConfigViews were already
+        // built in the same index order above - this line just makes
+        // that fact directly observable).
+        AR_LOG_INFO(std::format("  projectionSubImages[{}] <- swapchains[{}] ({}x{})",
+                                 i, i, subImage.imageRect.extent.width, subImage.imageRect.extent.height));
+    }
+    OpenXRProjectionLayer projectionLayer(projectionSubImages, localSpace.Get());
 
     // --- Minimal Vulkan resources for the per-eye clear: one command
     // pool, one reusable command buffer, one fence. Destroyed explicitly
@@ -358,7 +409,7 @@ int main()
     // --- Frame loop, driven through XRFrameDriver (M9E.5) ---
     AR_LOG_INFO(std::format("Beginning OpenXR frame loop - target {} completed frames before requesting exit...", kTargetFrameCount));
 
-    XRFrameDriver frameDriver(instance.Get(), session, *primaryViewConfigType, *selectedBlendMode);
+    XRFrameDriver frameDriver(instance.Get(), session, localSpace, *primaryViewConfigType, *selectedBlendMode);
 
     std::uint32_t completedFrameCount = 0;
     bool exitRequested = false;
@@ -401,6 +452,59 @@ int main()
 
         if (frameContext.timing.shouldRender)
         {
+            // --- M9F: real view location. Only called when rendering is
+            // actually requested - see docs/ARCHITECTURE.md,
+            // "xrLocateViews Lifecycle Position (M9F)" for why calling
+            // it unconditionally every tick would be wasted work with no
+            // concrete benefit. Converts real runtime pose/FOV into
+            // generic Frame::ViewInfo (proving M9F's actual deliverable:
+            // the conversion pipeline), and separately hands the exact
+            // same frame's raw XrView data (via GetLastLocatedXrViews())
+            // to OpenXRProjectionLayer, which validates the located view
+            // count against its configured sub-image count and prepares
+            // a real XrCompositionLayerProjection - or, on a mismatch or
+            // zero located views, safely prepares none (see
+            // OpenXRProjectionLayer::Prepare). ---
+            const std::vector<Frame::ViewInfo> views = frameDriver.GetViews();
+
+            const bool logSample = (completedFrameCount + 1 == 1) || ((completedFrameCount + 1) % 50 == 0);
+            if (logSample && !views.empty())
+            {
+                // Diagnostic review (post-M9F): logs the RAW
+                // XrView[i].pose.position directly, alongside the
+                // CONVERTED Frame::ViewInfo[i].position, for the same
+                // index i - side by side, so any future reader can
+                // confirm by eye (not just by reading ConvertXrPosition's
+                // source) that conversion changes nothing and index i
+                // is never reordered between the raw xrLocateViews
+                // result and the generic ViewInfo array.
+                const std::vector<XrView>& rawViews = frameDriver.GetLastLocatedXrViews();
+                for (std::size_t i = 0; i < views.size(); ++i)
+                {
+                    AR_LOG_INFO(std::format(
+                        "  View {}: RAW xrLocateViews pos=({:.4f}, {:.4f}, {:.4f})",
+                        i, rawViews[i].pose.position.x, rawViews[i].pose.position.y, rawViews[i].pose.position.z));
+                    AR_LOG_INFO(std::format(
+                        "  View {}: CONVERTED ViewInfo pos=({:.4f}, {:.4f}, {:.4f}) orient=(w={:.4f}, x={:.4f}, y={:.4f}, z={:.4f}) "
+                        "fov(L/R/U/D deg)=({:.2f}, {:.2f}, {:.2f}, {:.2f})",
+                        i, views[i].position.x, views[i].position.y, views[i].position.z,
+                        views[i].orientation.w, views[i].orientation.x, views[i].orientation.y, views[i].orientation.z,
+                        rawViews[i].fov.angleLeft * (180.0f / std::numbers::pi_v<float>),
+                        rawViews[i].fov.angleRight * (180.0f / std::numbers::pi_v<float>),
+                        rawViews[i].fov.angleUp * (180.0f / std::numbers::pi_v<float>),
+                        rawViews[i].fov.angleDown * (180.0f / std::numbers::pi_v<float>)));
+                }
+            }
+            else if (logSample && views.empty())
+            {
+                AR_LOG_INFO("  No valid views located this frame (shouldRender was true, but view state was invalid)");
+            }
+
+            if (projectionLayer.Prepare(frameDriver.GetLastLocatedXrViews()))
+            {
+                frameDriver.SetPendingProjectionLayer(projectionLayer.Get());
+            }
+
             std::vector<std::uint32_t> acquiredIndices(swapchains.size());
             for (std::size_t i = 0; i < swapchains.size(); ++i)
             {
@@ -464,13 +568,15 @@ int main()
             }
         }
 
-        // Zero composition layers submitted - see this file's header
-        // comment for why (no real xrLocateViews pose/FOV data exists
-        // yet). EndFrame() calls xrEndFrame with layerCount=0, which is
-        // spec-legal and means "the compositor shows nothing new from
-        // this application this frame" - the frame lifecycle mechanics
-        // above (wait/begin/acquire/wait/clear/release/end) are fully
-        // exercised regardless.
+        // Submits whatever OpenXRProjectionLayer prepared above (real
+        // pose/FOV, real per-view sub-image) via
+        // SetPendingProjectionLayer() - or zero layers, if shouldRender
+        // was false this tick, or no valid views were located, or the
+        // located view count didn't match the configured swapchain
+        // count. Either way, EndFrame() itself is unconditional: the
+        // frame lifecycle mechanics (wait/begin/[locate/acquire/wait/
+        // clear/release]/end) are fully exercised regardless of whether
+        // a layer was actually submitted this frame.
         frameDriver.EndFrame();
 
         ++completedFrameCount;
@@ -520,7 +626,9 @@ int main()
     return 0;
 
     // Destruction, in order (see each declaration's comment above):
-    // `swapchains` (each xrDestroySwapchain), then `session`
-    // (xrDestroySession), then `binding` (VkDevice, then VkInstance),
-    // then `instance` (xrDestroyInstance) last.
+    // `projectionLayer`/`frameDriver` (trivial - neither owns anything),
+    // `swapchains` (each xrDestroySwapchain), `localSpace`
+    // (xrDestroySpace), then `session` (xrDestroySession), then
+    // `binding` (VkDevice, then VkInstance), then `instance`
+    // (xrDestroyInstance) last.
 }

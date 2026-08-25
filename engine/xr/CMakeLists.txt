@@ -76,6 +76,17 @@ if(ARENGINE_ENABLE_OPENXR)
             src/openxr/OpenXREnvironmentBlendMode.hpp
             src/openxr/OpenXREnvironmentBlendMode.cpp
             src/openxr/OpenXRFrameTiming.hpp
+            # M9F: XrView pose/FOV -> Frame::ViewInfo conversion and
+            # composition-layer construction are both pure OpenXR
+            # concepts (XrPosef/XrFovf/XrView/XrCompositionLayer*/
+            # XrSwapchainSubImage are core openxr.h types, not
+            # openxr_platform.h Vulkan-flavored ones) - no Vulkan
+            # dependency, same tier as OpenXRSessionState above. See
+            # docs/ARCHITECTURE.md, "Where DetermineFrameStatus Lives
+            # (M9E.5)" for the precedent this follows.
+            src/openxr/OpenXRViewConversion.hpp
+            src/openxr/OpenXRProjectionLayer.hpp
+            src/openxr/OpenXRProjectionLayer.cpp
     )
 
     # Private: OpenXR is an implementation detail of this module's

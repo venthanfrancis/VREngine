@@ -3,6 +3,7 @@
 #include "OpenXRFrameTiming.hpp"
 #include "OpenXRResult.hpp"
 #include "OpenXRSessionState.hpp"
+#include "OpenXRViewConversion.hpp"
 
 #include "AREngine/Core/Log.hpp"
 
@@ -23,13 +24,17 @@ namespace AREngine::XR::OpenXR
         constexpr std::chrono::milliseconds kIdlePollInterval{16};
     }
 
-    XRFrameDriver::XRFrameDriver(XrInstance instance, OpenXRSession& session,
+    XRFrameDriver::XRFrameDriver(XrInstance instance, OpenXRSession& session, OpenXRReferenceSpace& localSpace,
                                   XrViewConfigurationType primaryViewConfigurationType,
-                                  XrEnvironmentBlendMode environmentBlendMode)
+                                  XrEnvironmentBlendMode environmentBlendMode,
+                                  float nearZ, float farZ)
         : m_instance(instance)
         , m_session(session)
+        , m_localSpace(localSpace)
         , m_primaryViewConfigurationType(primaryViewConfigurationType)
         , m_environmentBlendMode(environmentBlendMode)
+        , m_nearZ(nearZ)
+        , m_farZ(farZ)
     {
     }
 
@@ -122,18 +127,89 @@ namespace AREngine::XR::OpenXR
 
     std::vector<Frame::ViewInfo> XRFrameDriver::GetViews()
     {
-        return {};
+        m_lastLocatedViews.clear();
+
+        XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+        locateInfo.viewConfigurationType = m_primaryViewConfigurationType;
+        // THE CURRENT frame's predicted display time - stashed by this
+        // same frame's own xrWaitFrame call in PrepareFrame(). Never
+        // wall-clock time, never a previous frame's time - the located
+        // views must correspond to the frame actually being rendered/
+        // submitted.
+        locateInfo.displayTime = m_lastPredictedDisplayTime;
+        locateInfo.space = m_localSpace.Get();
+
+        XrViewState viewState{XR_TYPE_VIEW_STATE};
+        std::uint32_t viewCountOutput = 0;
+        CheckXrResult(m_instance,
+            xrLocateViews(m_session.Get(), &locateInfo, &viewState, 0, &viewCountOutput, nullptr),
+            "xrLocateViews (count query)");
+
+        std::vector<XrView> views(viewCountOutput, XrView{XR_TYPE_VIEW});
+        if (viewCountOutput > 0)
+        {
+            CheckXrResult(m_instance,
+                xrLocateViews(m_session.Get(), &locateInfo, &viewState, viewCountOutput, &viewCountOutput, views.data()),
+                "xrLocateViews (data query)");
+        }
+
+        const bool valid = IsViewStateValid(viewState.viewStateFlags);
+        if (valid != m_lastViewStateValid)
+        {
+            // Logged only on a valid<->invalid transition, not every
+            // frame - avoids log spam while still surfacing the
+            // condition clearly when it actually changes.
+            if (!valid)
+            {
+                AR_LOG_WARNING(std::format(
+                    "xrLocateViews: required pose data is not valid (XrViewState flags {:#x}) - "
+                    "returning no usable views this frame rather than fabricating an identity pose",
+                    static_cast<unsigned int>(viewState.viewStateFlags)));
+            }
+            else
+            {
+                AR_LOG_INFO("xrLocateViews: pose data is valid again");
+            }
+            m_lastViewStateValid = valid;
+        }
+
+        if (!valid)
+        {
+            return {};
+        }
+
+        m_lastLocatedViews = views;
+
+        std::vector<Frame::ViewInfo> result;
+        result.reserve(views.size());
+        for (const XrView& view : views)
+        {
+            result.push_back(ConvertXrViewToViewInfo(view, m_nearZ, m_farZ));
+        }
+        return result;
     }
 
     void XRFrameDriver::EndFrame()
     {
+        std::vector<const XrCompositionLayerBaseHeader*> layers;
+        if (m_pendingProjectionLayer != nullptr)
+        {
+            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(m_pendingProjectionLayer));
+        }
+
         XrFrameEndInfo frameEndInfo{};
         frameEndInfo.type = XR_TYPE_FRAME_END_INFO;
         frameEndInfo.displayTime = m_lastPredictedDisplayTime;
         frameEndInfo.environmentBlendMode = m_environmentBlendMode;
-        frameEndInfo.layerCount = 0;
-        frameEndInfo.layers = nullptr;
+        frameEndInfo.layerCount = static_cast<std::uint32_t>(layers.size());
+        frameEndInfo.layers = layers.data();
         CheckXrResult(m_instance, xrEndFrame(m_session.Get(), &frameEndInfo), "xrEndFrame");
+
+        // Consumed - reset so a future tick that never calls
+        // SetPendingProjectionLayer() (shouldRender was false, or no
+        // valid views) safely defaults to zero layers, not a stale
+        // pointer from a previous frame.
+        m_pendingProjectionLayer = nullptr;
     }
 
     void XRFrameDriver::RequestExit()

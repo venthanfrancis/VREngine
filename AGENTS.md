@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -489,15 +489,78 @@ every transition in order via a new pure, unit-tested
 exercised (not just theoretical) against real SteamVR runs. See
 `docs/ARCHITECTURE.md` Section 29 for the full design and validation.
 
+**M9F integrates real OpenXR view location.** `XRFrameDriver::GetViews()`
+now calls real `xrLocateViews` at the current frame's own predicted
+display time (the same value stashed for `xrEndFrame`, never wall-clock
+time), against the LOCAL reference space (M9D's `OpenXRReferenceSpace`,
+unused since M9E.5, brought back), and converts the runtime's real
+per-view pose and FOV into generic `Frame::ViewInfo` — the FOV
+conversion genuinely supports and preserves independent per-eye
+left/right/up/down angles (never collapsed to one symmetric value; see
+below for what the live runtime actually reported) — via new
+`OpenXRViewConversion.hpp` helpers — `ConvertXrPosition`
+(straight field copy: OpenXR and AREngine share the same right-handed,
++Y-up, -Z-forward convention, verified against the OpenXR spec before
+writing any conversion code, no axis flip anywhere), `ConvertXrOrientation`
+(a component **reorder** only — `XrQuaternionf{x,y,z,w}` →
+`Quaternion(w,x,y,z)`, confirmed against both types' actual definitions,
+not assumed), and a new `Core::Math::PerspectiveOffCenterRH_ZO`
+(`ViewProjection.hpp`) — the general off-center case
+`PerspectiveRH_ZO`'s formula is a special case of, preserving OpenXR's
+independent left/right/up/down angles rather than collapsing them to a
+symmetric approximation; independently re-derived and verified during
+design review (no sign error), with tests confirming each frustum edge
+maps to its correct NDC boundary. `ViewInfo` itself needed **zero**
+structural changes — `position`/`orientation` already represented
+exactly what `xrLocateViews` provides (a pose, not a view matrix); a
+precomputed `viewMatrix` field was seriously considered and explicitly
+rejected as premature (mirrors `Scene::Camera`'s own "compute on demand,
+don't duplicate stored data" precedent — nothing renders yet to need
+one). A design-review pass caught that an earlier draft let
+`XRFrameDriver` grow to own swapchain topology directly; reworked into
+a small, separate `OpenXRProjectionLayer` (new,
+`engine/xr/src/openxr/OpenXRProjectionLayer.hpp/.cpp`, Vulkan-independent,
+directly pure-logic-testable) that owns per-view `XrSwapchainSubImage`
+metadata and builds each frame's real `XrCompositionLayerProjection`
+from it plus `XRFrameDriver`'s raw located `XrView` data (exposed via a
+narrow `GetLastLocatedXrViews()` accessor — no `XrView`→`ViewInfo`→
+reconstructed-`XrView` round-trip) — `FrameDriver::EndFrame()` itself
+stays a completely generic, OpenXR-free override; a new minimal
+XR-only seam (`XRFrameDriver::SetPendingProjectionLayer`) hands the
+prepared layer across, consumed and reset to "none" every `EndFrame()`
+call so a `shouldRender=false` tick safely defaults to zero layers.
+View-state validity (`XR_VIEW_STATE_ORIENTATION_VALID_BIT`/
+`POSITION_VALID_BIT`) is checked before ever using pose data — no
+identity head pose is fabricated to hide invalid tracking. A
+view-count/swapchain-count mismatch is a genuine runtime check (logged,
+zero layers submitted), not a debug-only assertion that a Release build
+could compile away. **Asymmetric-FOV support is proven by pure
+math/conversion tests** (`PerspectiveOffCenterRH_ZO`'s frustum-boundary
+tests, `tests/core_tests.cpp`), not by the live runtime — SteamVR's
+null driver happened to report a symmetric ±45° FOV in every observed
+run, so the live run demonstrates the conversion pipeline correctly
+carries through whatever FOV the runtime provides, not that the
+runtime itself exercised genuine asymmetry (a diagnostic review after
+this milestone's initial approval corrected this exact overclaim). What
+*was* verified twice against live SteamVR: a real, plausible IPD-scale
+per-eye position offset (≈63mm) at the raw `xrLocateViews` level, a
+real composition layer accepted by the compositor with no error, and
+200/200 frames both runs. Poses could not be compared
+across frames in this run — `shouldRender` was true only on frame 1
+(the same SteamVR/null-driver behavior M9E already documented), and
+`xrLocateViews` is deliberately not called on frames that don't render
+— reported honestly as a real test-environment limitation, not papered
+over. See `docs/ARCHITECTURE.md` Section 30 for the full design,
+derivation, and validation.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, and no `xrLocateViews`/`xrLocateSpace`/head tracking/
-controllers/stereo rendering/swapchain-image ownership inside
-`XRFrameDriver` — see Sections 11–15. `Editor` is still an M0-style
-stub with no functionality. Next up is M9F (`xrLocateViews` + stereo
-rendering) or M8I+ (Scene integration, still pending within M8) — see
-`docs/ROADMAP.md` for the full plan.
+system, and no stereo scene rendering/`xrLocateSpace`/head tracking/
+controllers/`viewFromWorld` computation — see Sections 11–15. `Editor`
+is still an M0-style stub with no functionality. Next up is M9G
+(head-tracked AREngine demo) or M8I+ (Scene integration, still pending
+within M8) — see `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -513,13 +576,14 @@ rendering) or M8I+ (Scene integration, still pending within M8) — see
    for what's still pending within M8.
 3a. **OpenXR instance/system discovery + Vulkan graphics-binding +
    XrSession/session-state/reference-space bring-up + XR swapchains/
-   frame lifecycle + generic FrameDriver redesign only so far
-   (M9A–M9E.5)**: no `xrLocateViews`, no `xrLocateSpace` for tracking,
-   no head/hand/eye tracking, no passthrough, no anchors, no
-   composition layer submission with real content, no stereo rendering,
-   no swapchain-image acquisition inside `XRFrameDriver` (that stays on
+   frame lifecycle + generic FrameDriver redesign + real view location/
+   composition-layer submission only so far (M9A–M9F)**: no
+   `xrLocateSpace` for tracking, no head/hand/eye tracking, no
+   passthrough, no anchors, no stereo scene rendering, no `Scene::Camera`
+   driving XR eyes, no XR head/`viewFromWorld` camera abstraction, no
+   swapchain-image acquisition inside `XRFrameDriver` (that stays on
    `OpenXRSwapchain`, coordinated outside `Frame`/`XRFrameDriver`). See
-   `docs/ROADMAP.md`'s M9F row.
+   `docs/ROADMAP.md`'s M9G row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

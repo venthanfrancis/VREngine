@@ -40,7 +40,7 @@ all come after that chain is proven.
 | — M9D | `XrSession` created from the M9C graphics binding; `XrSessionState` tracked via `xrPollEvent`/`XrEventDataSessionStateChanged`; `xrBeginSession`/`xrEndSession` at the correct states; view configurations and reference spaces (VIEW/LOCAL/STAGE) enumerated and created. Still no swapchain, no frame loop. | **Complete** | See `docs/ARCHITECTURE.md` Section 27 |
 | — M9E | XR swapchains + frame lifecycle (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`). | **Complete** | See `docs/ARCHITECTURE.md` Section 28 |
 | — M9E.5 | Generic `Frame::FrameDriver` redesign using M9E's real evidence: `PrepareFrame`/`BeginFrame`/`GetViews`/`EndFrame`, `FrameStatus`/`shouldRender`, initial `XRFrameDriver` (wait/begin/end only). `DesktopFrameDriver`/`Runtime` refactored onto it, behavior unchanged. | **Complete** | See `docs/ARCHITECTURE.md` Section 29 |
-| — M9F | `xrLocateViews` + stereo rendering. | Not started | |
+| — M9F | Real `xrLocateViews` view location: real per-view pose/asymmetric FOV converted into generic `Frame::ViewInfo`, real `XrCompositionLayerProjection` submitted (`OpenXRProjectionLayer`). Still no scene rendering. | **Complete** | See `docs/ARCHITECTURE.md` Section 30 |
 | — M9G | Head-tracked AREngine demo. | Not started | Fulfills M9's own goal, ahead of M10's full AR/XR demo |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |

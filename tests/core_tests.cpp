@@ -241,6 +241,80 @@ namespace
         Check(upPoint.y / upPoint.w > 0.0f, "PerspectiveRH_ZO: a world-space 'up' point has POSITIVE NDC y (no flip)");
     }
 
+    void TestPerspectiveOffCenterRH_ZOSymmetricCaseMatchesPerspectiveRH_ZO()
+    {
+        // fovY=90deg, aspect=1 -> symmetric half-angle 45deg on every
+        // side. PerspectiveOffCenterRH_ZO given exactly those four
+        // angles must reproduce PerspectiveRH_ZO's own matrix exactly -
+        // the symmetric formula is a special case of the general
+        // off-center one, not a separate, independently-derived
+        // formula. See ViewProjection.hpp's own derivation comment.
+        const float half = std::numbers::pi_v<float> / 4.0f; // 45deg
+        const Mat4 symmetric = PerspectiveRH_ZO(std::numbers::pi_v<float> / 2.0f, 1.0f, 1.0f, 10.0f);
+        const Mat4 offCenter = PerspectiveOffCenterRH_ZO(-half, half, half, -half, 1.0f, 10.0f);
+
+        for (std::size_t row = 0; row < 4; ++row)
+        {
+            for (std::size_t col = 0; col < 4; ++col)
+            {
+                CheckNearlyEqual(offCenter.At(row, col), symmetric.At(row, col),
+                                  "PerspectiveOffCenterRH_ZO: symmetric angles reproduce PerspectiveRH_ZO exactly");
+            }
+        }
+    }
+
+    void TestPerspectiveOffCenterRH_ZOAsymmetricFrustumBoundaries()
+    {
+        // A genuinely asymmetric frustum - none of the four angles are
+        // mirror images of their opposite. Each frustum boundary, at
+        // the near plane, must map to exactly the corresponding NDC
+        // boundary (+-1) - proving the asymmetry is preserved and
+        // correctly positioned, not silently collapsed toward a
+        // symmetric center.
+        constexpr float kDegToRad = std::numbers::pi_v<float> / 180.0f;
+        const float angleLeft = -30.0f * kDegToRad;
+        const float angleRight = 60.0f * kDegToRad;
+        const float angleUp = 45.0f * kDegToRad;
+        const float angleDown = -20.0f * kDegToRad;
+        const float nearZ = 1.0f;
+        const float farZ = 10.0f;
+        const Mat4 proj = PerspectiveOffCenterRH_ZO(angleLeft, angleRight, angleUp, angleDown, nearZ, farZ);
+
+        // Asymmetry actually preserved, not collapsed to a symmetric
+        // matrix (m02/m12 would both be exactly 0 in the symmetric
+        // case - see the test above).
+        Check(proj.At(0, 2) != 0.0f, "PerspectiveOffCenterRH_ZO: horizontal asymmetry produces a non-zero X/Z skew term");
+        Check(proj.At(1, 2) != 0.0f, "PerspectiveOffCenterRH_ZO: vertical asymmetry produces a non-zero Y/Z skew term");
+
+        const Vec4 leftEdge = proj * Vec4(nearZ * std::tan(angleLeft), 0.0f, -nearZ, 1.0f);
+        CheckNearlyEqual(leftEdge.x / leftEdge.w, -1.0f, "PerspectiveOffCenterRH_ZO: left frustum boundary maps to NDC x=-1");
+
+        const Vec4 rightEdge = proj * Vec4(nearZ * std::tan(angleRight), 0.0f, -nearZ, 1.0f);
+        CheckNearlyEqual(rightEdge.x / rightEdge.w, 1.0f, "PerspectiveOffCenterRH_ZO: right frustum boundary maps to NDC x=+1");
+
+        const Vec4 topEdge = proj * Vec4(0.0f, nearZ * std::tan(angleUp), -nearZ, 1.0f);
+        CheckNearlyEqual(topEdge.y / topEdge.w, 1.0f, "PerspectiveOffCenterRH_ZO: top frustum boundary maps to NDC y=+1");
+
+        const Vec4 bottomEdge = proj * Vec4(0.0f, nearZ * std::tan(angleDown), -nearZ, 1.0f);
+        CheckNearlyEqual(bottomEdge.y / bottomEdge.w, -1.0f, "PerspectiveOffCenterRH_ZO: bottom frustum boundary maps to NDC y=-1");
+    }
+
+    void TestPerspectiveOffCenterRH_ZODepthMapping()
+    {
+        // Depth mapping must be exactly PerspectiveRH_ZO's own ZO
+        // convention (near -> NDC depth 0, far -> NDC depth 1) -
+        // off-center shear must not perturb it, since it only affects
+        // X/Y, not Z/W.
+        constexpr float kDegToRad = std::numbers::pi_v<float> / 180.0f;
+        const Mat4 proj = PerspectiveOffCenterRH_ZO(-30.0f * kDegToRad, 60.0f * kDegToRad, 45.0f * kDegToRad, -20.0f * kDegToRad, 2.0f, 20.0f);
+
+        const Vec4 nearPoint = proj * Vec4(0.0f, 0.0f, -2.0f, 1.0f);
+        CheckNearlyEqual(nearPoint.z / nearPoint.w, 0.0f, "PerspectiveOffCenterRH_ZO: near plane maps to NDC depth 0");
+
+        const Vec4 farPoint = proj * Vec4(0.0f, 0.0f, -20.0f, 1.0f);
+        CheckNearlyEqual(farPoint.z / farPoint.w, 1.0f, "PerspectiveOffCenterRH_ZO: far plane maps to NDC depth 1");
+    }
+
     void TestModelViewProjectionComposition()
     {
         // The exact fixed camera M8F's demo uses: eye at (0,0,3),
@@ -286,6 +360,9 @@ int main()
     TestMat4TransformFactories();
     TestLookAtRH();
     TestPerspectiveRH_ZO();
+    TestPerspectiveOffCenterRH_ZOSymmetricCaseMatchesPerspectiveRH_ZO();
+    TestPerspectiveOffCenterRH_ZOAsymmetricFrustumBoundaries();
+    TestPerspectiveOffCenterRH_ZODepthMapping();
     TestModelViewProjectionComposition();
     TestEvent();
 

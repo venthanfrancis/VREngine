@@ -70,4 +70,54 @@ namespace AREngine::Core::Math
         result.Set(3, 2, -1.0f);
         return result;
     }
+
+    // A right-handed, zero-to-one-depth perspective projection with an
+    // asymmetric (off-center) frustum — the general case
+    // PerspectiveRH_ZO's symmetric formula is a special case of. Added
+    // in M9F, once real OpenXR view data (XrFovf: independent
+    // angleLeft/angleRight/angleUp/angleDown) genuinely needed it — a
+    // stereo headset's per-eye frustum is not generally symmetric
+    // around the view's forward axis, and reducing it to one symmetric
+    // vertical FOV would throw away real runtime-provided data. Angle
+    // parameter order matches XrFovf's own member order
+    // (angleLeft, angleRight, angleUp, angleDown) purely for call-site
+    // correspondence — this function itself has no OpenXR awareness;
+    // any asymmetric-FOV description (angles in radians, signed:
+    // left/down conventionally negative, right/up conventionally
+    // positive) can drive it.
+    //
+    // Derivation: at the near plane (view-space z = -nearZ), the
+    // visible x-range is [nearZ*tan(angleLeft), nearZ*tan(angleRight)],
+    // and must map to NDC x in [-1, +1] (same for y with up/down).
+    // Solving that linear system for the near-plane's two x boundaries
+    // gives m00/m02 below (same derivation, transposed, for m11/m12).
+    // The depth terms (m22/m23/m32) are exactly PerspectiveRH_ZO's own
+    // — off-center shear does not affect depth mapping. Substituting
+    // the symmetric case (angleLeft=-angleRight, angleDown=-angleUp)
+    // collapses m02/m12 to exactly 0 and m00/m11 to exactly
+    // PerspectiveRH_ZO's own focalLength/aspect and focalLength —
+    // verified by hand, and by TestPerspectiveOffCenterRH_ZOSymmetricCaseMatchesPerspectiveRH_ZO
+    // (tests/core_tests.cpp). No Vulkan Y-flip — same policy as
+    // PerspectiveRH_ZO: that correction belongs in, and lives in,
+    // whichever graphics backend actually needs it.
+    [[nodiscard]] inline Mat4 PerspectiveOffCenterRH_ZO(
+        float angleLeftRadians, float angleRightRadians,
+        float angleUpRadians, float angleDownRadians,
+        float nearZ, float farZ)
+    {
+        const float tanLeft = std::tan(angleLeftRadians);
+        const float tanRight = std::tan(angleRightRadians);
+        const float tanUp = std::tan(angleUpRadians);
+        const float tanDown = std::tan(angleDownRadians);
+
+        Mat4 result; // zero-initialized
+        result.Set(0, 0, 2.0f / (tanRight - tanLeft));
+        result.Set(0, 2, (tanRight + tanLeft) / (tanRight - tanLeft));
+        result.Set(1, 1, 2.0f / (tanUp - tanDown));
+        result.Set(1, 2, (tanUp + tanDown) / (tanUp - tanDown));
+        result.Set(2, 2, farZ / (nearZ - farZ));
+        result.Set(2, 3, (farZ * nearZ) / (nearZ - farZ));
+        result.Set(3, 2, -1.0f);
+        return result;
+    }
 }
