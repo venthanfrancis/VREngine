@@ -7656,3 +7656,330 @@ currently allows.
   `XRFrameDriver`, `OpenXRProjectionLayer`, `OpenXRSwapchain`,
   `Scene::Transform`, `Rendering::CreateCubeMesh`/`CreateQuadMesh`) was
   reused completely unchanged.
+
+## 35. M10.6 Implementation Notes
+
+M10.6 closes the exact gap M10.5's own "Recommended Next Milestone"
+section identified: input was queried and logged, but never affected
+anything. M10.6 connects real, queried OpenXR action state (M10),
+through the existing generic `Input::*ActionState` types, through a new
+small pure interaction layer, to visible object transform/tint changes
+in the M10.5 integrated demo's shared scene - proving the generic input
+state is actually useful to engine logic, not just observable.
+
+### Audit Of The Current Integrated Demo (M10.6)
+
+Performed first, per the milestone's own requirement:
+
+1. **Where OpenXR action states are currently queried**: entirely
+   inside `tests/xr_demo.cpp`'s main loop, via
+   `OpenXRActionSystem::GetSelectState`/`GetTriggerState`/`GetMoveState`/
+   `GetAimPoseState` - four calls per hand, per running frame, already
+   established since M10.5.
+2. **Where generic `Input::*ActionState` values exist**: as the direct,
+   immediate return values of those four calls - `DigitalActionState`/
+   `AnalogActionState`/`Vector2ActionState`/`PoseActionState` local
+   variables, previously consumed only by `LogHandState` (diagnostic
+   logging - no effect on rendering).
+3. **The smallest clean place to apply those values to engine state**:
+   right where the values already exist, immediately after they're
+   queried and logged - one small function call per action type,
+   mutating one shared `XRInteractionState` local variable, applied to
+   the already-existing `sceneObjects` list a few lines later (in the
+   same per-object loop that already updates the reference cube's
+   rotation).
+4. **Whether a small reusable interaction helper is justified**: yes -
+   four small, independently-testable pure functions
+   (`ApplyDigitalToggle`/`ApplyAnalogScale`/`ApplyVectorOffset`/
+   `ApplyPoseMarker`), not a monolithic "update everything" function,
+   matching the milestone's own per-category test list exactly. See
+   "Where Interaction Logic Lives" below for why this stays a `tests/`-
+   level helper, not an engine module.
+5. **What must remain demo-only**: the exact `XRInteractionState` field
+   shapes and their mapping to this specific scene's five objects
+   (which cube gets highlighted, which gets offset, what the marker
+   looks like) - genuinely specific to this one demo's own
+   visualization choices, not a generic concept.
+
+### Input-To-State Mapping (M10.6)
+
+New `tests/XRInteractionState.hpp/.cpp`:
+
+```cpp
+struct XRInteractionState {
+    bool highlightEnabled = false;
+    float scaleFactor = 1.0f;
+    Core::Math::Vec2 moveOffset;
+    bool poseMarkerVisible = false;
+    Core::Math::Vec3 poseMarkerPosition;
+    Core::Math::Quaternion poseMarkerOrientation = Core::Math::Quaternion::Identity();
+};
+```
+
+Deliberately close to, but not copied blindly from, the milestone
+brief's own example - trimmed to exactly what this demo's chosen
+visualization needs (no unused fields). Four pure functions mutate one
+field-group each: `ApplyDigitalToggle`, `ApplyAnalogScale`,
+`ApplyVectorOffset`, `ApplyPoseMarker` - see their own header comments
+in `XRInteractionState.hpp` for the exact policy each one implements
+(reproduced below per action type). This header includes ONLY
+`AREngine::Input`/`AREngine::Core::Math` - confirmed by its own include
+list, no `<openxr/openxr.h>` anywhere - satisfying the milestone's
+"rendering must not know `XrAction`/`XrPath`" requirement one level
+more strictly: the INTERACTION LOGIC itself doesn't know either, not
+just the renderer.
+
+**Which hand drives the interaction**: the right hand only - a simple,
+deliberate choice (no two-hand combination policy has any evidence to
+justify its shape yet), applied inside the existing per-hand query loop
+(`if (hand == Hand::Right) { Apply*(...); }`), immediately after that
+hand's four states are queried and logged.
+
+### Digital Mapping (M10.6)
+
+`ApplyDigitalToggle(select, state)`: `if (select.pressed) { state.highlightEnabled = !state.highlightEnabled; }`
+- reacts to `pressed` (the up→down edge, computed by M10's own
+`ConvertActionStateBoolean`), never `down` - a held select cannot
+re-toggle every frame, confirmed by a dedicated test
+(`TestDigitalHeldWithoutPressedDoesNotToggleAgain`) that calls the
+function twice in a row with `down=true, pressed=false` and asserts no
+change. An inactive `DigitalActionState` always has `pressed=false` by
+construction (M10's own conversion guarantee), so no separate
+active-state check was needed in this function - confirmed explicitly
+by `TestDigitalInactiveDoesNotSpuriouslyToggle`, not just assumed to
+follow from the other tests.
+
+### Analog Mapping (M10.6)
+
+`ApplyAnalogScale(trigger, state)`: `state.scaleFactor = trigger.active ? (1.0f + trigger.value * kScaleFactorRange) : 1.0f`
+(`kScaleFactorRange = 0.8`) - trigger 0.0 → 1.0x (base scale), trigger
+1.0 → 1.8x. Inactive always resets to exactly 1.0, never a stale prior
+active reading - confirmed by
+`TestAnalogStaleValueNotReusedAfterInactive`, which sets an active
+max-scale reading first, then an inactive one with the SAME
+`.value=1.0` still present (as a real runtime might report), and
+asserts the neutral default wins.
+
+### Vector Mapping (M10.6)
+
+`ApplyVectorOffset(move, state)`: `state.moveOffset = clamp(move.value * kMoveOffsetMetersPerUnit, ±kMaxMoveOffsetMeters)`
+while active, `(0,0)` while inactive - a direct, unflipped, per-
+component linear mapping (positive `move.x` → positive `offset.x`,
+same for `y` - no axis inversion anywhere in this function, confirmed
+by dedicated positive/negative-X tests and a positive-Y test). No
+deadzone was added - no current input evidence (this runtime never
+reports an active move action at all) justifies one; deferred, not
+overlooked. Deliberately NOT integrated over delta time - `moveOffset`
+is a direct function of the CURRENT `move.value` each time it's called,
+never accumulated - this is a visualization of the current input
+state, not a player-controller movement system (the brief's own
+explicit "do NOT use delta-time movement like WASD gameplay"
+instruction, honored by construction: the function has no delta-time
+parameter to even accept).
+
+### Pose Mapping (M10.6)
+
+`ApplyPoseMarker(pose, state)`: the marker is visible only when
+`pose.active && pose.positionValid && pose.orientationValid` - **the
+conservative "both must be valid" policy**, chosen deliberately over a
+"partially valid" alternative (e.g. showing the marker at a valid
+position with a defaulted orientation) because a marker with only half
+its transform genuinely reflecting reality is more likely to mislead a
+reader than an honestly-hidden one; documented here as an explicit
+choice, per the brief's own "according to chosen policy" instruction,
+not left implicit. When visible, `poseMarkerPosition`/`Orientation` are
+copied directly from the generic `PoseActionState` (already in LOCAL
+space, the same space every `Scene::Transform` in this demo already
+uses - no conversion needed); when not visible, both reset to their
+type defaults (identity/zero), never a stale previous pose - confirmed
+by `TestPoseHiddenResetsToDefaultNotStalePose`. Orientation-copy
+correctness is verified with a per-component-asymmetric test quaternion
+(`TestPoseOrientationCopiedCorrectly`), not identity-only, so a
+component-reorder bug would actually be caught.
+
+### Where Interaction Logic Lives (M10.6)
+
+Kept at the `tests/` leaf (`XRInteractionState.hpp/.cpp`), **not**
+promoted into `engine/input`. Evaluated explicitly, not assumed: the
+underlying MECHANISMS (toggle-on-press, linear analog-to-range mapping,
+bounded vector offset, valid-pose gating) are each only a few lines,
+and the STRUCT's own fields (`highlightEnabled`, a single
+`scaleFactor`, one `moveOffset`, one pose marker) are tailored to this
+specific demo's own five-object scene and its own visualization
+choices - not a shape any other application would reuse verbatim. Built
+unconditionally (not gated behind `ARENGINE_ENABLE_OPENXR`/
+`ARENGINE_ENABLE_VULKAN` - confirmed by building and testing it under
+OFF/OFF), demonstrating it could technically live in a generic engine
+location, but "could" is not "should" without a second real consumer -
+promoting it now would be "engine API to make the milestone look
+larger," which the brief explicitly warns against.
+
+### InputSystem Bridge Question (M10.6)
+
+**Not needed, and not added.** M10's own `OpenXRActionSystem`/
+`OpenXRActionStateConversion.hpp` already IS the "OpenXR → generic
+Input types" bridge the brief describes - M10.6 needed nothing new
+here, only a consumer for the values that bridge already produces.
+`Input::InputSystem` itself (the keyboard/mouse class) was not touched,
+and no live bridge feeds OpenXR-sourced events into a running
+`InputSystem` instance - `tests/xr_demo.cpp` still has no
+`InputSystem` instance at all, since nothing in this demo needs
+keyboard/mouse-style action-name lookup. This matches M10's own
+explicit deferral ("M10 intentionally stopped before a full live
+bridge... M10.6 should only add a bridge if the integrated demo finds a
+concrete need") - it didn't.
+
+### Scene Question, Reconfirmed (M10.6)
+
+Still declined, unchanged from M10.5's own evaluation - the interaction
+state's effects are applied directly to the existing hand-owned
+`std::vector<SceneObject>`'s `Transform`/tint fields, not through
+`Scene::Scene`. Nothing about adding input-driven mutation changed the
+underlying calculus (still a flat, non-hierarchical, small object
+list) - re-confirmed, not just carried over without re-checking.
+
+### Update Ordering (M10.6)
+
+Verified against the current architecture, not copied blindly from the
+brief's own suggested pseudocode: `PrepareFrame()` → (`Stop`/`Idle`
+handling, unchanged) → `BeginFrame()` → `xrSyncActions` (unconditional)
+→ query + log + **apply interaction state** for both hands (right hand
+only feeds `Apply*`) → **if `shouldRender`**: `GetViews()` → apply the
+now-current `interactionState` to `sceneObjects` (tint/scale/offset/
+marker, alongside the existing rotation update) → render all visible
+objects into each view → prepare the projection layer → `EndFrame()`
+(always). The interaction-state COMPUTATION happens every running
+frame (cheap, pure logic); its APPLICATION to the renderable
+`SceneObject` transforms happens only inside the render-gated block,
+since those fields are only ever read during rendering - a deliberate
+efficiency choice, not a correctness requirement (applying it
+unconditionally would also have been correct, just wasted work on
+non-rendering frames).
+
+### shouldRender=false Behavior, Reconfirmed (M10.6)
+
+Input synchronization and `interactionState` computation both continue
+on every running frame regardless of `shouldRender` - unchanged from
+M10.5's own already-documented decision, re-confirmed here with the
+concrete new evidence that the interaction state genuinely does keep
+updating: the live run's `framesSynced` (1000) equals `framesAttempted`
+(1000), independent of `framesWithShouldRenderTrue` (1). This is
+desirable, not incidental: engine-owned interaction state should not
+freeze just because the runtime skipped a visual-render opportunity.
+
+### Shared World State, Reconfirmed (M10.6)
+
+`interactionState` is computed exactly ONCE per frame (not once per
+view) and applied to `sceneObjects` exactly once, before the per-view
+render loop begins - every view reads the SAME already-updated
+`Transform`/tint values, never a per-eye recomputation. Confirmed
+structurally (no per-view field or parameter exists anywhere in
+`XRInteractionState` or the four `Apply*` functions) and by a dedicated
+test, `TestInteractionStateIsIndependentOfViewCount`.
+
+### No Controller Rendering System, Reconfirmed (M10.6)
+
+The pose marker reuses the existing persistent cube mesh at a small
+scale (`0.15`) and a distinct tint - no `ControllerRenderer`/
+`HandRenderer`/`WeaponRenderer` was created, and none was justified by
+anything this milestone found.
+
+### Test-vs-Live Evidence Distinction (M10.6)
+
+Reported explicitly, per the brief's own "do not merge those claims"
+instruction:
+
+**A. Generic input-to-engine-state behavior, proven by pure unit
+tests** (`tests/xr_interaction_tests.cpp`, 20 tests, synthetic
+`Input::*ActionState` values, zero OpenXR/Vulkan dependency): digital
+toggle (press-only, held-does-not-retrigger, inactive-never-toggles),
+analog scaling (inactive/0/0.5/1.0/stale-value-not-reused), vector
+offset (inactive/positive-X/negative-X/positive-Y/clamping), pose
+marker (inactive-disabled/active-but-invalid-disabled/active-valid-
+shows-correct-pose/orientation-copied-correctly/hidden-resets-to-
+default), and shared-state-independent-of-view-count. All 20 pass.
+
+**B. Real OpenXR action synchronization/querying, proven against
+SteamVR/null**: `xrSyncActions` succeeded on all 1000/1000 running
+frames; `GetSelectState`/`GetTriggerState`/`GetMoveState`/
+`GetAimPoseState` were called (and their results fed into the real
+`Apply*` functions, not synthetic stand-ins) on every one of those
+frames without error; the resulting `interactionState` reached the end
+of the run in its neutral/default form (`highlightEnabled=false`,
+`scaleFactor=1.00`, `moveOffset=(0.00,0.00)`, `poseMarkerVisible=false`)
+- exactly the value a correctly-wired, correctly-inactive pipeline
+should produce.
+
+**C. Real physical controller-driven visual change - NOT yet proven**,
+because no active controller was available in this environment for the
+entire run. This is reported as a real, current limitation, not
+glossed over or implied to be equivalent to (A) or (B).
+
+### Real Active-Input Limitation / Recommended Test Environment (M10.6)
+
+Unchanged from M10/M10.5's own already-reported finding: SteamVR's
+null driver exposes no real controller bound to any interaction
+profile in this environment. For real active-controller validation, the
+recommended next test environment remains M9B's original,
+not-yet-installed recommendation - **Meta XR Simulator** - or a real
+Quest/SteamVR controller/headset. Nothing was installed for this
+milestone, per the brief's explicit instruction.
+
+### Validation (M10.6)
+
+All five practically-distinct `ARENGINE_ENABLE_OPENXR` ×
+`ARENGINE_ENABLE_VULKAN` configurations built and `ctest`-passed: ON/ON
+(`/EHsc /W4 /WX` clean) 17/17 (one new suite, `XRInteractionTests`, 20
+pure-logic tests, over M10.5's 16); ON/ON with `/EHsc /W4 /WX`
+explicitly forced 17/17; ON/OFF 15/15; OFF/ON (default) 12/12; OFF/OFF
+11/11 - `XRInteractionTests` present and passing in **every**
+configuration, including OFF/OFF, confirming the interaction logic
+genuinely has zero OpenXR/Vulkan dependency. `InputTests` passed
+unchanged in every configuration - `Input::InputSystem` itself was not
+touched by this milestone.
+
+`arengine_xr_demo` run against live SteamVR: 1000/1000 frames
+completed, 1000/1000 synced, clean session-state sequence (`IDLE →
+READY → SYNCHRONIZED → STOPPING → IDLE → EXITING`), exit code 0, no
+crash. Scene now 6 objects (5 base + 1 pose marker, hidden by default);
+the one rendered frame drew 2 views × 5 visible objects = 10 draws
+(the marker excluded, matching its default-hidden state exactly). The
+same already-traced SteamVR-internal `[BlankEyeBuffer]` validation
+noise reappeared, structurally unchanged. Sandbox and
+`arengine_vulkan_present_demo` both launched and ran without crashing.
+
+### Architectural Issues Found (M10.6)
+
+None. No engine module was added or changed - `Input::InputSystem`,
+`OpenXRActionSystem`, `Frame::ViewInfo`, and `FrameDriver` all remained
+exactly as M10/M10.5 left them.
+
+### Recommended Next Milestone (M10.6)
+
+Based on this milestone's own evidence: the full chain from real OpenXR
+input, through generic `Input::*ActionState`, through pure interaction
+logic, to a rendered visual result is now proven correct end to end -
+proven by unit test for the logic itself, proven live for the OpenXR
+plumbing around it, honestly reported as unproven for the one piece
+(a real active controller) this environment cannot supply. The most
+evidence-justified next step is **not** more input mapping (four action
+types across one demo scene is already representative, per the
+brief's own "minimal but representative" instruction) but rather
+acquiring or investigating a genuinely continuous-render/active-input-
+capable test environment (Meta XR Simulator remains the standing
+recommendation) so that a future milestone's own live validation can
+finally exercise the code paths this milestone proved only by unit
+test - `ApplyDigitalToggle`/`ApplyAnalogScale`/`ApplyVectorOffset`/
+`ApplyPoseMarker` are all fully exercised in isolation, but none has
+ever been driven by a real, changing, physically-sourced value.
+
+- Files changed: new `tests/XRInteractionState.hpp/.cpp`; new
+  `tests/xr_interaction_tests.cpp` (20 pure-logic tests); `tests/xr_demo.cpp`
+  (interaction state wired into the existing per-hand query loop and
+  per-object update loop; scene grew from 5 to 6 objects - one new pose
+  marker, hidden by default; visibility check added to the draw loop);
+  `tests/CMakeLists.txt` (`XRInteractionTests`/`arengine_xr_interaction_tests`
+  target, unconditional; `XRInteractionState.cpp` added to
+  `arengine_xr_demo`'s sources). No `engine/` source changed at all -
+  `Input::InputSystem` and every OpenXR/XR wrapper class were reused
+  completely unchanged.

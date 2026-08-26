@@ -39,6 +39,20 @@
 // the first frame (M9E onward) and no real controller bound to any
 // interaction profile (M10) in this environment - both are reported
 // honestly at the end of the run, not worked around or fabricated.
+//
+// M10.6 adds the missing link M10/M10.5 left deliberately unbuilt:
+// input still didn't affect anything. The right hand's queried generic
+// Input::*ActionState values now drive a small XRInteractionState
+// (tests/XRInteractionState.hpp - generic types only, no OpenXR/Vulkan
+// dependency, fully unit-tested with synthetic values in
+// tests/xr_interaction_tests.cpp) that this demo applies to the SAME
+// shared scene objects every view already renders: select toggles the
+// reference cube's tint, trigger scales it, move offsets one small
+// cube, and aim-pose shows/hides/positions a small marker cube. With
+// SteamVR's null driver reporting every action inactive, the honest,
+// expected live result is a neutral, unchanged scene - see
+// docs/ARCHITECTURE.md, "M10.6 Implementation Notes" for the full
+// design and the explicit test-vs-live evidence split.
 
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Frame/Frame.hpp"
@@ -47,6 +61,7 @@
 #include "AREngine/Scene/Transform.hpp"
 
 #include "OpenXRVulkanViewTarget.hpp"
+#include "XRInteractionState.hpp"
 
 #include "openxr/OpenXRActionSystem.hpp"
 #include "openxr/OpenXREnvironmentBlendMode.hpp"
@@ -130,8 +145,20 @@ namespace
         AREngine::Scene::Transform transform;
         const AREngine::Rendering::Vulkan::VulkanMesh* mesh = nullptr;
         AREngine::Core::Math::Vec4 tint;
-        bool isReferenceCube = false; // the one object M10H-style slow rotation is applied to
+        bool visible = true; // M10.6: the pose marker toggles this; every other object stays true always
+        bool isReferenceCube = false; // M10H-style slow rotation, plus M10.6's tint/scale interaction
+        bool isMoveOffsetCube = false; // M10.6: position = basePosition + XRInteractionState::moveOffset
+        bool isPoseMarker = false; // M10.6: visible/transform driven entirely by XRInteractionState::poseMarker*
+        AREngine::Core::Math::Vec3 basePosition; // only meaningful for isMoveOffsetCube
     };
+
+    // M10.6 tint/scale constants - purely a visualization choice
+    // (distinguishing "highlighted" from "neutral" by eye), not a
+    // gameplay balance decision.
+    const AREngine::Core::Math::Vec4 kReferenceCubeBaseTint(1.0f, 1.0f, 1.0f, 1.0f);
+    const AREngine::Core::Math::Vec4 kReferenceCubeHighlightTint(1.0f, 0.85f, 0.1f, 1.0f);
+    const AREngine::Core::Math::Vec3 kReferenceCubeBaseScale(0.6f, 0.6f, 0.6f);
+    const AREngine::Core::Math::Vec4 kPoseMarkerTint(0.2f, 0.85f, 1.0f, 1.0f);
 
     struct FrameDiagnostics
     {
@@ -473,9 +500,25 @@ int main()
     cubeC.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
     cubeC.mesh = cubeMesh.get();
     cubeC.tint = Math::Vec4(0.4f, 0.4f, 1.0f, 1.0f);
+    cubeC.isMoveOffsetCube = true;
+    cubeC.basePosition = cubeC.transform.position;
     sceneObjects.push_back(cubeC);
 
-    AR_LOG_INFO(std::format("Scene: {} object(s) (floor + reference cube + 3 small cubes), shared across every view", sceneObjects.size()));
+    // M10.6: a small debug marker, positioned/oriented directly from
+    // the right hand's aim-pose action state - not a controller/hand
+    // model, just the existing cube mesh at a small scale (see
+    // docs/ARCHITECTURE.md, "No Controller Rendering System (M10.6)").
+    // Starts invisible: shown only on a frame where the interaction
+    // state reports the pose active and fully valid.
+    SceneObject poseMarker;
+    poseMarker.transform.scale = Math::Vec3(0.15f, 0.15f, 0.15f);
+    poseMarker.mesh = cubeMesh.get();
+    poseMarker.tint = kPoseMarkerTint;
+    poseMarker.isPoseMarker = true;
+    poseMarker.visible = false;
+    sceneObjects.push_back(poseMarker);
+
+    AR_LOG_INFO(std::format("Scene: {} object(s) (floor + reference cube + 3 small cubes + 1 pose marker), shared across every view", sceneObjects.size()));
 
     // --- M9E/M9G: one reusable command buffer, one fence, fully
     // synchronous - unchanged from every prior XR rendering demo. ---
@@ -502,6 +545,7 @@ int main()
     const auto startTime = std::chrono::steady_clock::now();
     FrameDiagnostics diag;
     std::array<HandLogState, 2> logStates{}; // [0]=Left, [1]=Right
+    ARDemo::XRInteractionState interactionState; // M10.6 - one shared state, never per-view/per-eye
 
     while (true)
     {
@@ -541,6 +585,24 @@ int main()
             const Input::PoseActionState pose =
                 actionSystem.GetAimPoseState(instance.Get(), session.Get(), localSpace.Get(), predictedDisplayTime, hand);
             LogHandState(hand, logStates[hand == Hand::Left ? 0 : 1], select, trigger, move, pose);
+
+            // M10.6: the right hand drives the visible interaction
+            // state - a simple, single-hand mapping (no evidence yet
+            // justifies a two-hand combination policy). Computed every
+            // running frame, independent of shouldRender - engine state
+            // should not freeze just because the runtime skipped visual
+            // rendering this tick. See docs/ARCHITECTURE.md, "Input
+            // Update Order (M10.6)". These four calls only ever see
+            // REAL queried OpenXR state, converted through M10's own
+            // conversion layer - never synthetic/fabricated input; see
+            // "No Fake Live Input (M10.6)".
+            if (hand == Hand::Right)
+            {
+                ARDemo::ApplyDigitalToggle(select, interactionState);
+                ARDemo::ApplyAnalogScale(trigger, interactionState);
+                ARDemo::ApplyVectorOffset(move, interactionState);
+                ARDemo::ApplyPoseMarker(pose, interactionState);
+            }
         }
 
         bool renderedThisFrame = false;
@@ -583,9 +645,14 @@ int main()
                 vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
                     0, 1, &descriptorSet, 0, nullptr);
 
-                // Slow rotation on the reference cube only (M9H-style,
-                // for repeated-frame verification - never a stand-in
-                // for head tracking). Every other object stays static.
+                // Apply this frame's already-computed interactionState
+                // to the shared world objects - computed ONCE here, read
+                // identically by every view in the loop below (see
+                // docs/ARCHITECTURE.md, "Shared World State (M10.6)").
+                // Slow rotation on the reference cube (M9H-style, for
+                // repeated-frame verification, unchanged from M10.5)
+                // stays independent of and layered alongside the new
+                // tint/scale interaction effects.
                 for (SceneObject& object : sceneObjects)
                 {
                     if (object.isReferenceCube)
@@ -593,6 +660,22 @@ int main()
                         object.transform.rotation = Math::Quaternion::FromAxisAngle(
                             Math::Vec3(0.0f, 1.0f, 0.0f),
                             kReferenceCubeRotationRadiansPerSecond * static_cast<float>(frameContext.timing.totalTimeSeconds));
+                        object.transform.scale = kReferenceCubeBaseScale * interactionState.scaleFactor;
+                        object.tint = interactionState.highlightEnabled ? kReferenceCubeHighlightTint : kReferenceCubeBaseTint;
+                    }
+                    else if (object.isMoveOffsetCube)
+                    {
+                        object.transform.position = object.basePosition +
+                            Math::Vec3(interactionState.moveOffset.x, interactionState.moveOffset.y, 0.0f);
+                    }
+                    else if (object.isPoseMarker)
+                    {
+                        object.visible = interactionState.poseMarkerVisible;
+                        if (object.visible)
+                        {
+                            object.transform.position = interactionState.poseMarkerPosition;
+                            object.transform.rotation = interactionState.poseMarkerOrientation;
+                        }
                     }
                 }
 
@@ -605,6 +688,10 @@ int main()
                                                kEyeClearColors[i % kEyeClearColors.size()]);
                     for (const SceneObject& object : sceneObjects)
                     {
+                        if (!object.visible)
+                        {
+                            continue; // M10.6: the pose marker, when the aim-pose action isn't active+valid
+                        }
                         const Math::Mat4 mvp = projection * view * object.transform.ToMatrix();
                         DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *object.mesh, mvp, object.tint);
                         ++diag.objectsRendered;
@@ -650,8 +737,17 @@ int main()
             {
                 if (renderedThisFrame)
                 {
-                    AR_LOG_INFO(std::format("  Rendered {} view(s) x {} object(s) = {} draw(s) this frame",
-                                             views.size(), sceneObjects.size(), views.size() * sceneObjects.size()));
+                    std::size_t visibleObjectCount = 0;
+                    for (const SceneObject& object : sceneObjects)
+                    {
+                        if (object.visible) ++visibleObjectCount;
+                    }
+                    AR_LOG_INFO(std::format("  Rendered {} view(s) x {} visible object(s) = {} draw(s) this frame "
+                                             "(highlight={}, scale={:.2f}, moveOffset=({:.2f},{:.2f}), poseMarkerVisible={})",
+                                             views.size(), visibleObjectCount, views.size() * visibleObjectCount,
+                                             interactionState.highlightEnabled, interactionState.scaleFactor,
+                                             interactionState.moveOffset.x, interactionState.moveOffset.y,
+                                             interactionState.poseMarkerVisible));
                 }
                 else
                 {
@@ -700,11 +796,19 @@ int main()
             1000.0 * diag.vulkanSubmitSecondsSum / diag.timedSampleCount,
             diag.timedSampleCount));
     }
+    AR_LOG_INFO(std::format(
+        "Final interaction state (right hand): highlightEnabled={}, scaleFactor={:.2f}, moveOffset=({:.2f},{:.2f}), poseMarkerVisible={}",
+        interactionState.highlightEnabled, interactionState.scaleFactor,
+        interactionState.moveOffset.x, interactionState.moveOffset.y, interactionState.poseMarkerVisible));
     if (!logStates[0].selectActive && !logStates[0].triggerActive && !logStates[0].moveActive && !logStates[0].poseActive &&
         !logStates[1].selectActive && !logStates[1].triggerActive && !logStates[1].moveActive && !logStates[1].poseActive)
     {
         AR_LOG_INFO("No action was ever active on either hand this run - consistent with this environment's SteamVR "
-                    "null driver exposing no real controller bound to any interaction profile. Not fabricated.");
+                    "null driver exposing no real controller bound to any interaction profile. Not fabricated. "
+                    "The interaction state above is therefore the neutral/default state (highlight off, base scale, "
+                    "zero move offset, pose marker hidden) - this proves the input-to-state wiring runs cleanly "
+                    "against a real (inactive) runtime, NOT that a real controller drove a visible change - see "
+                    "docs/ARCHITECTURE.md, \"Real Active-Input Limitation (M10.6)\" for that explicit distinction.");
     }
 
     // AREngine's own submitted GPU work is already known complete (the

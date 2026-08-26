@@ -64,6 +64,21 @@ target_link_libraries(arengine_input_tests PRIVATE AREngine::Core AREngine::Plat
 target_compile_features(arengine_input_tests PRIVATE cxx_std_20)
 add_test(NAME InputTests COMMAND arengine_input_tests)
 
+# Pure-logic tests for XRInteractionState.hpp/.cpp (M10.6): input-to-
+# visual-state mapping, tested with synthetic AREngine::Input::*ActionState
+# values. Built unconditionally, not gated behind ARENGINE_ENABLE_OPENXR/
+# ARENGINE_ENABLE_VULKAN: XRInteractionState depends only on
+# AREngine::Input/AREngine::Core::Math - no OpenXR or Vulkan type
+# anywhere. See docs/ARCHITECTURE.md, "Where Interaction Logic Lives
+# (M10.6)".
+add_executable(arengine_xr_interaction_tests
+    xr_interaction_tests.cpp
+    XRInteractionState.cpp
+)
+target_link_libraries(arengine_xr_interaction_tests PRIVATE AREngine::Core AREngine::Input)
+target_compile_features(arengine_xr_interaction_tests PRIVATE cxx_std_20)
+add_test(NAME XRInteractionTests COMMAND arengine_xr_interaction_tests)
+
 # Pure-logic tests for AREngine::Rendering's generic mesh data
 # (MeshData.hpp/ProceduralMesh.hpp) — M8H. Built unconditionally, not
 # gated behind ARENGINE_ENABLE_VULKAN: none of this depends on Vulkan.
@@ -310,6 +325,7 @@ if(ARENGINE_ENABLE_OPENXR)
         add_executable(arengine_xr_demo
             xr_demo.cpp
             OpenXRVulkanViewTarget.cpp
+            XRInteractionState.cpp
         )
         target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_xr_demo PRIVATE
