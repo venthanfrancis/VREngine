@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete; M9H (XR render-path hardening — reusable per-view render-resource helper extracted, 1000-frame repeated-lifecycle validation, lightweight diagnostics, continuous-shouldRender environment limitation investigated honestly) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete; M9H (XR render-path hardening — reusable per-view render-resource helper extracted, 1000-frame repeated-lifecycle validation, lightweight diagnostics, continuous-shouldRender environment limitation investigated honestly) complete; M10 (OpenXR action/input foundation — one XrActionSet, four actions spanning both hands, KHR simple_controller bindings, xrSyncActions, new generic Input::*ActionState vocabulary) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -621,14 +621,48 @@ frame verification, explicitly not a stand-in for head tracking. See
 `docs/ARCHITECTURE.md` Section 32 for the full audit, the module-
 boundary finding, and validation.
 
+**M10 gives AREngine its first OpenXR action/input foundation** - one
+`"gameplay"` `XrActionSet`, four actions (`aim_pose`/`select`/`trigger`/
+`move` - pose/boolean/float/vector2f, one of each OpenXR action-type
+category), each spanning both hands via shared `/user/hand/left`|
+`right` subaction paths rather than duplicated left_x/right_x actions.
+KHR simple_controller bindings suggested for `select`/`aim_pose` only -
+verified against the OpenXR spec that this profile has no trigger or
+thumbstick component at all, so `trigger`/`move` are deliberately left
+unbound (they still exist and correctly report inactive) rather than
+guessing a nonexistent component path. Action set attached once;
+per-hand `aim_pose` action spaces created after attach; `xrSyncActions`
+called every running frame, independent of `shouldRender`. An
+InputSystem audit (required before any code) found M7's `ButtonState`/
+`KeyCode`/`MouseButton` model has no home for float/vector2/pose/
+"active" state and correctly left it untouched - a new, small generic
+vocabulary (`AREngine::Input::DigitalActionState`/`AnalogActionState`/
+`Vector2ActionState`/`PoseActionState`, `AREngine/Input/ActionState.hpp`)
+was added instead, with zero OpenXR dependency; `engine/xr` gained a
+new private dependency on `AREngine::Input` to produce these (mirroring
+the exact precedent `Frame::ViewInfo` already set in M9F), never the
+reverse. Digital press/release is computed from an explicit edge
+against the action system's own tracked previous state - deliberately
+not equated with `changedSinceLastSync` - and every state type clears
+to inactive/zero rather than leaving stale "held" values behind when an
+action goes inactive (mirrors M7's focus-loss key-release handling).
+New `tests/openxr_input_demo.cpp` (no swapchain, no rendering - only
+the frame lifecycle needed to keep the session running) ran 500/500
+frames clean against live SteamVR, all synced; every action on both
+hands reported inactive for the entire run, honestly reported as this
+environment's SteamVR null driver exposing no real controller, not
+worked around or fabricated. See `docs/ARCHITECTURE.md` Section 33 for
+the full design, the InputSystem audit, and validation.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, and no stereo scene rendering/`xrLocateSpace`/head tracking/
-controllers — see Sections 11–15. `Editor` is still an M0-style stub
-with no functionality. Next up is M10 (the full AR/XR demo) or M8I+
-(Scene integration, still pending within M8) — see `docs/ROADMAP.md`
-for the full plan.
+system, no stereo scene rendering driven by these controller actions,
+no hand tracking, and no haptics — see Sections 11–15. `Editor` is
+still an M0-style stub with no functionality. Next up is M10.5 (the
+full AR/XR demo, now with real controller input available where a
+runtime exposes it) or M8I+ (Scene integration, still pending within
+M8) — see `docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -646,18 +680,24 @@ for the full plan.
    XrSession/session-state/reference-space bring-up + XR swapchains/
    frame lifecycle + generic FrameDriver redesign + real view location/
    composition-layer submission + a single manually-defined cube
-   rendered into each eye's swapchain image, now hardened for repeated-
-   frame reuse (a reusable per-view render-resource helper, 1000-frame
-   validation, lightweight diagnostics) so far (M9A–M9H)**: no
-   `xrLocateSpace` for tracking, no head/hand/eye tracking, no
-   passthrough, no anchors, no `SceneRenderer`/`Scene` integration
-   driving what's rendered into XR eyes (M9G's cube is defined directly
-   in its own demo, not via `Scene`), no `Scene::Camera` driving XR
-   eyes, no XR head/`viewFromWorld` camera abstraction beyond the
-   free-function `Core::Math::ViewMatrixFromPoseRH` M9G added, no
-   swapchain-image acquisition inside `XRFrameDriver` (that stays on
-   `OpenXRSwapchain`, coordinated outside `Frame`/`XRFrameDriver`). See
-   `docs/ROADMAP.md`'s M10 row.
+   rendered into each eye's swapchain image (hardened for repeated-
+   frame reuse) + an OpenXR action/input foundation (one action set,
+   four actions spanning both hands, KHR simple_controller bindings,
+   xrSyncActions, controller pose action spaces located via
+   xrLocateSpace) so far (M9A–M10)**: no hand tracking
+   (`XR_EXT_hand_tracking`) or eye tracking, no haptics
+   (`XR_ACTION_TYPE_VIBRATION_OUTPUT`), no passthrough, no anchors, no
+   `SceneRenderer`/`Scene` integration driving what's rendered into XR
+   eyes or consuming controller actions (M9G's cube is defined directly
+   in its own demo, not via `Scene`; M10's action state is read
+   directly by its own demo, not fed into a live `Input::InputSystem`
+   instance), no `Scene::Camera` driving XR eyes, no XR head/
+   `viewFromWorld` camera abstraction beyond the free-function
+   `Core::Math::ViewMatrixFromPoseRH` M9G added, no swapchain-image
+   acquisition inside `XRFrameDriver` (that stays on `OpenXRSwapchain`,
+   coordinated outside `Frame`/`XRFrameDriver`), no rendering
+   responsibility added to `XRFrameDriver` for any of this. See
+   `docs/ROADMAP.md`'s M10.5 row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

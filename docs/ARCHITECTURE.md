@@ -6918,3 +6918,420 @@ small, narrow additions (`OpenXRVulkanViewTarget`,
   (`OpenXRVulkanViewTarget.cpp` added to the `arengine_openxr_cube_demo`
   target). No `engine/` source changed — this milestone's scope was
   entirely the demo layer and its own newly-extracted helper.
+
+## 33. M10 Implementation Notes
+
+M10 gives AREngine its first OpenXR action/input foundation: one
+`XrActionSet`, four actions (a shared pose action plus boolean/float/
+vector2f actions, each spanning both hands via subaction paths),
+bindings suggested for the KHR simple_controller interaction profile,
+the action set attached once, per-hand pose action spaces, and a
+per-frame `xrSyncActions` + state-query path that converts real OpenXR
+action state into a small, new generic vocabulary in `AREngine::Input`
+— entirely separate from, and never corrupting, M7's existing keyboard/
+mouse `KeyCode`/`MouseButton` model. No gameplay, no controller-driven
+Scene/rendering integration, no hand tracking, no haptics.
+
+### InputSystem Audit (M10)
+
+Performed first, before any code, per the milestone's own requirement -
+`engine/input/include/AREngine/Input/Input.hpp` and `Input.cpp` were
+read in full, not skimmed:
+
+1. **Reusable unchanged, as a *pattern*, not literal code**: `ButtonState`'s
+   down/wasPressed/wasReleased semantics (M7) - "held across frames,
+   pressed/released true for exactly the transition frame, never
+   re-triggered while held" - is exactly the digital semantics M10
+   needs for OpenXR boolean actions, and M10's `ConvertActionStateBoolean`
+   deliberately mirrors it edge-for-edge (see below). `Core::Math::Vec2`
+   (already used for mouse position/delta) is directly reused, unchanged,
+   for 2D vector action state - no new 2D type was needed.
+2. **Inherently keyboard/mouse-specific** (left untouched): `KeyCode`,
+   `MouseButton`, `BindActionKey`/`BindActionMouseButton`,
+   `GetMousePosition`/`GetMouseDelta`, and the `m_keys`/`m_mouseButtons`/
+   `m_actions` storage keyed by those two enums. None of these gained a
+   new case, a new enum value, or a new field for any XR concept - see
+   "Do Not Put Tracked Pose Into KeyCode" below.
+3. **Generic concepts missing for XR**: an explicit "active" bit (no
+   keyboard/mouse equivalent - a physical key is always either present
+   or absent; an OpenXR action can be bound but temporarily inactive),
+   a float value, a 2D value distinct from mouse position (normalized
+   thumbstick space, not client-area pixels), and a tracked pose
+   (position + orientation + independent validity flags) - nothing
+   resembling this existed anywhere in `Input`.
+4. **Changes actually necessary in M10**: exactly one new header,
+   `AREngine/Input/ActionState.hpp` (four small structs - see "Generic
+   Input Extension" below). Zero changes to `Input.hpp`/`Input.cpp`
+   themselves.
+5. **Deferred**: wiring a live `Input::InputSystem` instance to actually
+   receive OpenXR-sourced events (M10's demo has no `InputSystem`
+   instance at all - there is nothing for it to feed events to yet,
+   since no gameplay consumes them); a string-keyed named-action lookup
+   layer for XR actions analogous to `InputSystem::m_actions` (M10's
+   `OpenXRActionSystem` exposes typed accessors - `GetSelectState`,
+   `GetTriggerState`, etc. - not a string-name API, since exactly four
+   actions exist and typed accessors are simpler and cannot typo a
+   name); merging KeyCode-based and OpenXR-based action names into one
+   namespace.
+
+### Generic Input Extension (M10)
+
+New `AREngine/Input/ActionState.hpp`: `DigitalActionState`
+(down/pressed/released/active), `AnalogActionState` (value/active),
+`Vector2ActionState` (value/active), `PoseActionState`
+(position/orientation/positionValid/orientationValid/active) - plain
+data, zero OpenXR headers included, zero dependency on `Input.hpp`'s
+existing `InputSystem`/`KeyCode`/`MouseButton` types. Matches the
+milestone brief's own example shape closely, adjusted only for real
+XR evidence (`AnalogActionState`'s `value` deliberately not clamped to
+0..1 - the OpenXR spec does not guarantee every float component is
+normalized). No `Input.hpp` public API leaks any OpenXR type - confirmed
+by direct inspection (`ActionState.hpp` includes only `Core::Math`
+headers) and structurally guaranteed by `engine/input`'s own
+`CMakeLists.txt`, which links only `AREngine::Core`/`AREngine::Platform`
+and never `AREngine::XR`.
+
+### Do Not Put Tracked Pose Into KeyCode (M10)
+
+`KeyCode`, `MouseButton`, and `InputSystem` itself are byte-for-byte
+unchanged by this milestone. No controller pose, trigger value, or
+thumbstick value is modeled as a synthetic `KeyCode` enumerator or
+routed through `BindActionKey`/`IsActionDown` - confirmed by diffing
+`Input.hpp`/`Input.cpp` against their pre-M10 state (zero lines
+changed) and by grep (`KeyCode`, `MouseButton` never appear in any M10
+file).
+
+### Dependency Direction (M10)
+
+`engine/xr` gained a new dependency on `AREngine::Input` (private, at
+the same outer/Vulkan-independent tier as its existing `AREngine::Frame`
+dependency - see `engine/xr/CMakeLists.txt`), mirroring the exact
+precedent `OpenXRViewConversion.hpp` already set for `Frame::ViewInfo`
+in M9F: a generic, backend-independent data-type module that a leaf-
+adjacent OpenXR conversion file produces instances of. `AREngine::Input`
+itself gained **no** new dependency - it still links only
+`AREngine::Core`/`AREngine::Platform`, unaware OpenXR exists. No cycle:
+the dependency runs XR → Input, never Input → XR, satisfying the
+brief's explicit "Do NOT make InputSystem call OpenXR directly" and
+"Generic Input must remain usable when `ARENGINE_ENABLE_OPENXR=OFF`"
+requirements - confirmed by the OFF/OFF and OFF/ON build-matrix
+configurations both building and passing `InputTests` unchanged (see
+Validation below).
+
+### Action System Placement / Vulkan-Independence (M10)
+
+All seven new `engine/xr/src/openxr/` files
+(`OpenXRActionPaths`, `OpenXRActionSet`, `OpenXRAction`,
+`OpenXRActionSpace`, `OpenXRSimpleControllerBindings`,
+`OpenXRActionStateConversion`, `OpenXRActionSystem`) were placed in the
+OUTER, Vulkan-independent `target_sources` block in
+`engine/xr/CMakeLists.txt` - not nested inside the
+`if(ARENGINE_ENABLE_VULKAN)` block alongside `OpenXRSession`/
+`OpenXRSwapchain`/`XRFrameDriver`. Justification, not assumption: every
+OpenXR function this code calls (`xrCreateActionSet`, `xrCreateAction`,
+`xrStringToPath`, `xrSuggestInteractionProfileBindings`,
+`xrAttachSessionActionSets`, `xrCreateActionSpace`, `xrSyncActions`,
+`xrGetActionState*`, `xrLocateSpace`) operates on `XrInstance`/
+`XrSession`/`XrActionSet`/`XrAction`/`XrSpace`/`XrPath` - all core
+`openxr.h` types, declared without `openxr_platform.h` - and
+`OpenXRReferenceSpace.hpp` (M9D) already proves `XrSession`-consuming
+code doesn't require Vulkan headers (it creates an `XrSpace` from a
+session with zero Vulkan dependency, in this exact outer block).
+Confirmed empirically, not just by inspection: the whole action-system
+library builds and its pure-logic tests pass under `ARENGINE_ENABLE_OPENXR=ON`/
+`ARENGINE_ENABLE_VULKAN=OFF` (see Validation below) - only the demo
+executable (which needs a real `XrSession`, itself Vulkan-coupled in
+this codebase's current session-creation path) is Vulkan-gated.
+
+### Action Set (M10)
+
+One action set, `"gameplay"` / `"Gameplay"`, priority 0 - no evidence
+justifies more than one for M10's four actions. `OpenXRActionSet`
+(new) owns the `XrActionSet` and exposes `Attach(instance, session)`
+for `xrAttachSessionActionSets`.
+
+### Subaction Paths (M10)
+
+`/user/hand/left` and `/user/hand/right`, resolved once via
+`xrStringToPath` (`OpenXRActionPaths.hpp`'s `ResolveHandSubactionPaths`)
+- never a hard-coded numeric `XrPath`, per the spec's own guidance that
+`XrPath` values are runtime-defined and not guaranteed stable across
+runtimes or invocations.
+
+### Actions To Create / Left-Right Hand Representation (M10)
+
+Four actions, each created ONCE with BOTH hand paths passed as its
+`subactionPaths` (the "shared action, distinguished by which subaction
+path is passed at query time" model the brief calls for, matching
+OpenXR's own subaction design) - never `left_select`/`right_select`
+duplicate actions:
+
+| Action | Type | Concept |
+|---|---|---|
+| `aim_pose` | `XR_ACTION_TYPE_POSE_INPUT` | tracked controller aim pose |
+| `select` | `XR_ACTION_TYPE_BOOLEAN_INPUT` | primary digital select |
+| `trigger` | `XR_ACTION_TYPE_FLOAT_INPUT` | analog trigger |
+| `move` | `XR_ACTION_TYPE_VECTOR2F_INPUT` | 2D thumbstick/trackpad |
+
+No tenth controller button was added - four actions is the minimal,
+representative set the brief asked for, covering one of each OpenXR
+action-type category.
+
+### Interaction Profile / Suggested Bindings (M10)
+
+**Only `/interaction_profiles/khr/simple_controller` is targeted**,
+per the milestone's own explicit priority. Verified against the OpenXR
+1.0 specification's standard interaction-profile table, not guessed:
+simple_controller defines exactly `/input/select/click`,
+`/input/menu/click`, `/input/grip/pose`, `/input/aim/pose`, and
+`/output/haptic` per top-level user path - **no trigger and no
+thumbstick/2D component exists on this profile at all**.
+`SuggestSimpleControllerBindings` (new) therefore binds only `select`
+→ `select/click` and `aim_pose` → `aim/pose`, for both hands;
+`trigger`/`move` are deliberately left unbound under this profile -
+they remain valid, created actions that correctly report
+`isActive=false` while simple_controller is the active profile, rather
+than being bound to a component path that doesn't exist (which the
+runtime would reject, or which would silently mismap a physical input
+that isn't really a trigger). A second, richer profile (e.g. one with
+real trigger/thumbstick components) was deliberately NOT also targeted:
+this environment's SteamVR null driver exposes no real controller
+regardless of which profile(s) are suggested (confirmed - see "Runtime/
+Controller Availability Findings" below), so adding a second profile
+speculatively, with no evidence it would change observed behavior here,
+was judged not justified by the brief's own "only if runtime support/
+requirements justify it" standard. Deferred, not forgotten - see "What
+Remains Deferred" below.
+
+### Action Set / Action / Binding / Attach / Action-Space Ordering (M10)
+
+`OpenXRActionSystem`'s constructor performs, in this exact order, all
+in one place:
+
+1. Resolve hand subaction paths.
+2. Create the action set.
+3. Create all four actions (each needs the action set to already
+   exist).
+4. Suggest simple_controller bindings (`xrSuggestInteractionProfileBindings`)
+   - must precede attach, per the OpenXR spec.
+5. Attach the action set to the session (`xrAttachSessionActionSets`) -
+   **exactly once**, never repeated (no per-frame or per-sync call
+   anywhere in this codebase).
+6. Create the left/right `aim_pose` action spaces - after attach,
+   matching established best practice (the OpenXR spec does not
+   strictly require this ordering for `xrCreateActionSpace` itself, but
+   every widely-used reference sample follows it, and no evidence in
+   this milestone justified deviating).
+
+Steps 1-4 are constructed via the member initializer list (in
+declaration order); steps 5-6 happen in the constructor body, since
+they are ordered actions on already-constructed members, not
+sub-object construction themselves - the two pose-action spaces are
+`std::unique_ptr<OpenXRActionSpace>` members specifically so their
+construction can be deferred past attach (see the class's own header
+comment).
+
+### xrSyncActions Placement (M10)
+
+Called once per `Frame::FrameStatus::Continue` tick (i.e. every tick
+`PrepareFrame()` actually calls the real `xrWaitFrame`), immediately
+after `BeginFrame()` and before any `GetXState()` call - `Continue`
+itself is only ever returned once the session has reached RUNNING
+(`PrepareFrame()`'s real `xrWaitFrame` call requires a running session
+to succeed at all), so this placement satisfies "after the session is
+running" by construction, not by a separate check. Deliberately **not**
+gated on `shouldRender`: `xrSyncActions` and rendering-opportunity
+throttling are unrelated OpenXR concepts (input responsiveness has no
+principled reason to wait for a render opportunity), so this demo syncs
+and queries every running frame regardless of `shouldRender` - confirmed
+in the live run (500/500 frames synced, matching 500/500 frames
+completed, even though - as expected - `shouldRender` was true on only
+one of them, the same SteamVR/null-driver behavior every prior XR
+milestone already documented).
+
+### Digital/Analog/Vector2/Pose State Semantics (M10)
+
+New `OpenXRActionStateConversion.hpp` (header-only, pure logic):
+
+- **Digital** (`ConvertActionStateBoolean`): computed from an explicit
+  up→down/down→up EDGE against the caller's own tracked `previousDown`
+  - deliberately **not** derived from `XrActionStateBoolean::changedSinceLastSync`,
+  which the brief itself warns is a related-but-different concept
+  (it means "differs from the previous sync," not "the caller has
+  observed and reacted to a press/release edge"). Mirrors M7's
+  `ButtonState` model exactly: `pressed`/`released` true for exactly
+  one call, `down` true for every call in between, never re-triggered
+  while held. When `isActive` is false, the action is treated as
+  not-held regardless of `currentState`, and if it WAS held on the
+  previous call, a `released` transition is still synthesized -
+  mirroring M7's `WindowFocusLostEvent` handling, which similarly never
+  leaves a key/button stuck Down once the signal that would release it
+  stops arriving. `OpenXRActionSystem` tracks `previousDown` per hand
+  (`m_previousSelectDown`), updated every `GetSelectState` call.
+- **Analog** (`ConvertActionStateFloat`): `value` passes through
+  unchanged while active (never blindly clamped - the spec does not
+  guarantee a 0..1 range for every float component), zero when
+  inactive - never a stale previous reading.
+- **Vector2** (`ConvertActionStateVector2f`): same "zero when inactive,
+  pass through while active" policy, componentwise.
+- **Pose** (`ConvertActionStatePose`): two-step query, exactly as the
+  brief specifies - `xrGetActionStatePose` first (the action's own
+  activity); only if active, `xrLocateSpace` against the caller-supplied
+  base space/time. `positionValid`/`orientationValid` reflect the
+  located space's own `XR_SPACE_LOCATION_POSITION_VALID_BIT`/
+  `ORIENTATION_VALID_BIT` independently - position/orientation are only
+  populated when their own bit is set, never fabricated otherwise.
+  Reuses `ConvertXrPosition`/`ConvertXrOrientation`
+  (`OpenXRViewConversion.hpp`, M9F) directly rather than duplicating -
+  the same `XrVector3f`/`XrQuaternionf` → `Core::Math` conversion is
+  correct for any `XrPosef`, not specific to view poses.
+
+### Pose Validity Vs. Tracked (M10)
+
+`XR_SPACE_LOCATION_POSITION_TRACKED_BIT`/`ORIENTATION_TRACKED_BIT` were
+read and understood (a stricter condition than VALID - a runtime may
+report a "last known good" pose as VALID-but-not-TRACKED during a brief
+interruption, the same distinction M9F already established for view
+poses) but were deliberately **not** added as a fifth/sixth field to
+the generic `PoseActionState` - `positionValid`/`orientationValid` +
+`active` already honestly represent "position/orientation valid does
+not necessarily imply actively tracked" (an inactive action never
+reports position/orientation as valid regardless of the underlying
+space's own flags), and no concrete M10 consumer needs the finer TRACKED
+distinction yet. Deferred, not overlooked - see "What Remains Deferred."
+
+### Predicted Display Time For Poses (M10)
+
+`XRFrameDriver` gained one new accessor, `GetLastPredictedDisplayTime() -> XrTime`
+(mirroring the existing `GetLastLocatedXrViews()` "not part of the
+generic `FrameDriver` interface" pattern) - the exact same
+`XrTime` value `GetViews()`'s own `xrLocateViews` call already uses,
+never wall-clock time, never a value this demo invents. `XrTime` itself
+is never exposed to `AREngine::Input` - `OpenXRActionSystem::GetAimPoseState`
+takes it as a parameter and consumes it internally; no generic
+`Input::PoseActionState` field carries a timestamp at all (the brief's
+own "convert to seconds or defer" instruction - deferred, since no
+concrete consumer needs one yet).
+
+### No Head Pose Duplication (M10)
+
+Controller `aim_pose` action spaces are never used as, or confused
+with, the head/view pose - `xrLocateViews` (M9F, `XRFrameDriver::GetViews()`)
+remains the sole source of head/view poses; `OpenXRActionSystem::GetAimPoseState`
+is a completely separate code path (`xrGetActionStatePose`/`xrLocateSpace`
+against an action space, never a view). Both happen to use the same
+LOCAL reference space and the same current predicted display time - a
+deliberate, correct sharing of context (both need "where/when is this
+frame"), not a conflation of what they represent.
+
+### Stale/Inactive-State Behavior (M10)
+
+Verified for each generic state type, not just digital: an action
+that goes inactive never leaves `down=true`, a nonzero `value`, or a
+nonzero `value.x`/`value.y` behind (see the conversion functions above
+- each explicitly zeros/clears its own "value" field when `active` is
+false), and a pose action that goes inactive reports
+`positionValid=false`/`orientationValid=false` (via the early-return
+`Input::PoseActionState{}` in `GetAimPoseState` when
+`xrGetActionStatePose` reports `isActive=false` - the action's space is
+never even located in that case, let alone trusted). Mirrors M7's own
+focus-loss protection against stuck keys, generalized to XR's richer
+state shapes.
+
+### Runtime/Controller Availability Findings (M10)
+
+**SteamVR's null driver exposes no real controller bound to any
+interaction profile in this environment.** Confirmed by the live
+500-frame run: every one of the four actions, on both hands, reported
+`active=false` for the entire run - logged explicitly at the end
+("No action was ever active on either hand this run..."), not silently
+passed over. This is honest, expected behavior per the milestone's own
+explicit allowance ("SteamVR null driver may expose no real controllers.
+That is acceptable"), not a bug: the action set/actions/bindings/attach/
+spaces/sync/queries all completed without error on every one of 500
+frames - the *mechanism* is proven correct; only real physical input
+was unavailable to exercise it further. No controller activity was
+fabricated or worked around anywhere in this milestone's code.
+
+**What would be needed for real interactive validation**: real
+controller hardware paired with SteamVR (or another OpenXR runtime that
+exposes a real or simulated controller bound to a supported interaction
+profile) - not investigated further or installed, per the brief's
+explicit "do not install another runtime automatically" instruction.
+M9B's existing recommendation (Meta XR Simulator, Section 25) remains
+the most plausible standards-based alternative already identified, if a
+future milestone needs this; nothing was installed for M10.
+
+### No Vendor Coupling, Reconfirmed (M10)
+
+Grepped every new file for `SteamVR`, `Valve`, `driver_null`, `Meta`,
+`Oculus`, and any vendor registry path - zero matches. The one
+interaction profile targeted (`khr/simple_controller`) is a standard,
+Khronos-defined OpenXR path, not vendor-specific.
+
+### Validation (M10)
+
+All five practically-distinct `ARENGINE_ENABLE_OPENXR` ×
+`ARENGINE_ENABLE_VULKAN` configurations built and `ctest`-passed:
+ON/ON (`/EHsc /W4 /WX` clean) 16/16 (one new suite,
+`OpenXRActionTests`, over M9H's 15); ON/ON with `/EHsc /W4 /WX`
+explicitly forced 16/16; ON/OFF 14/14 (confirming the action-system
+library itself needs no Vulkan - see "Action System Placement" above);
+OFF/ON (default) 11/11; OFF/OFF 10/10. `InputTests` passed unchanged in
+every single configuration - the desktop keyboard/mouse regression the
+brief asked for is confirmed, not assumed.
+
+`arengine_openxr_input_demo` run against live SteamVR: 500/500 frames
+completed, 500/500 synced (`xrSyncActions` called every running frame),
+clean session-state sequence (`IDLE → READY → SYNCHRONIZED → STOPPING →
+IDLE → EXITING`, identical shape to every prior XR milestone), exit
+code 0, no crash. The `vkDestroyDevice` "14 leaked objects" validation
+error (SteamVR-internal `BlankEyeBuffer`-tagged compositor bookkeeping,
+same category M9E first traced) reappeared - **this time with even
+stronger evidence it is not AREngine's**: this demo allocates zero
+`VkCommandBuffer`/`VkFence`/`VkSemaphore`/`VkImage`/`VkDeviceMemory`
+objects of its own at all (no command pool, no rendering, nothing but
+the OpenXR action/space objects `OpenXRActionSystem` owns), yet the
+same category and quantity of leaked handles appeared regardless -
+conclusively SteamVR's own internal work, unrelated to anything this
+demo's code allocates.
+
+### Architectural Issues Found (M10)
+
+None. `Frame::ViewInfo`, `XRFrameDriver` (beyond the one additive
+accessor), `OpenXRSession`, and `AREngine::Input`'s existing
+`InputSystem`/`KeyCode`/`MouseButton` all needed zero or trivially
+additive changes to support this milestone - consistent with the "prove
+the seam with the minimal thing first" philosophy this project has
+followed since M0. The one new cross-module dependency
+(`engine/xr` → `AREngine::Input`) was evaluated against this
+project's established layering rules before being added and found
+consistent with existing precedent (`engine/xr` → `AREngine::Frame`,
+M9F), not a violation of anything.
+
+### What Remains Deferred (M10)
+
+A second, richer interaction profile (real trigger/thumbstick
+components) - no evidence in this environment would exercise it
+differently than simple_controller alone. `XR_SPACE_LOCATION_*_TRACKED_BIT`
+as a distinct generic field. A live bridge from `OpenXRActionSystem`
+into a running `Input::InputSystem` instance (no gameplay exists yet to
+consume one). A string-keyed named-action lookup layer for XR actions.
+`XR_EXT_hand_tracking`, `XR_ACTION_TYPE_VIBRATION_OUTPUT` (haptics),
+eye tracking, passthrough, spatial anchors, arena calibration - all
+explicitly out of scope per the brief, deferred to later milestones per
+`docs/ROADMAP.md`.
+
+- Files changed: new `engine/input/include/AREngine/Input/ActionState.hpp`;
+  `engine/input/CMakeLists.txt` (one new header); new
+  `engine/xr/src/openxr/OpenXRActionPaths.hpp/.cpp`,
+  `OpenXRActionSet.hpp/.cpp`, `OpenXRAction.hpp/.cpp`,
+  `OpenXRActionSpace.hpp/.cpp`, `OpenXRSimpleControllerBindings.hpp/.cpp`,
+  `OpenXRActionStateConversion.hpp`, `OpenXRActionSystem.hpp/.cpp`;
+  `engine/xr/src/openxr/XRFrameDriver.hpp` (one new accessor,
+  `GetLastPredictedDisplayTime()`); `engine/xr/CMakeLists.txt` (new
+  sources + `AREngine::Input` dependency); new `tests/openxr_action_tests.cpp`
+  (13 new pure-logic tests), new `tests/openxr_input_demo.cpp`;
+  `tests/CMakeLists.txt` (`OpenXRActionTests`/`arengine_openxr_input_demo`
+  targets). `engine/input/include/AREngine/Input/Input.hpp`/`.cpp`
+  themselves: unchanged.

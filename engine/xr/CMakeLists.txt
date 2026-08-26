@@ -87,6 +87,27 @@ if(ARENGINE_ENABLE_OPENXR)
             src/openxr/OpenXRViewConversion.hpp
             src/openxr/OpenXRProjectionLayer.hpp
             src/openxr/OpenXRProjectionLayer.cpp
+            # M10: the OpenXR action/input model (action set, actions,
+            # action spaces, sync, state queries) is entirely built on
+            # XrInstance/XrSession/XrActionSet/XrAction/XrSpace/XrPath -
+            # all core openxr.h types, no openxr_platform.h/Vulkan
+            # dependency (same tier as OpenXRReferenceSpace above, which
+            # already proves XrSession-consuming code doesn't need
+            # Vulkan headers). See docs/ARCHITECTURE.md, "Action System
+            # Placement / Vulkan-Independence (M10)".
+            src/openxr/OpenXRActionPaths.hpp
+            src/openxr/OpenXRActionPaths.cpp
+            src/openxr/OpenXRActionSet.hpp
+            src/openxr/OpenXRActionSet.cpp
+            src/openxr/OpenXRAction.hpp
+            src/openxr/OpenXRAction.cpp
+            src/openxr/OpenXRActionSpace.hpp
+            src/openxr/OpenXRActionSpace.cpp
+            src/openxr/OpenXRSimpleControllerBindings.hpp
+            src/openxr/OpenXRSimpleControllerBindings.cpp
+            src/openxr/OpenXRActionStateConversion.hpp
+            src/openxr/OpenXRActionSystem.hpp
+            src/openxr/OpenXRActionSystem.cpp
     )
 
     # Private: OpenXR is an implementation detail of this module's
@@ -105,6 +126,22 @@ if(ARENGINE_ENABLE_OPENXR)
     # regardless of ARENGINE_ENABLE_VULKAN. See docs/ARCHITECTURE.md,
     # "Where DetermineFrameStatus Lives (M9E.5)".
     target_link_libraries(arengine_xr PRIVATE AREngine::Frame)
+
+    # M10: OpenXRActionStateConversion.hpp/OpenXRActionSystem.* convert
+    # raw OpenXR action state into AREngine::Input's generic
+    # DigitalActionState/AnalogActionState/Vector2ActionState/
+    # PoseActionState - the first time this module has depended on
+    # Input. Private and at this outer level (Vulkan-independent, same
+    # placement as the Frame dependency above) - mirrors the exact
+    # precedent OpenXRViewConversion.hpp already set for Frame::ViewInfo
+    # (M9F): a generic, backend-independent data-type module (Input, own
+    # dependencies: Core + Platform only, no XR) that this leaf-adjacent
+    # conversion code produces instances of. No cycle: Input never
+    # depends on XR - see docs/ARCHITECTURE.md, "Dependency Direction
+    # (M10)" and AGENTS.md's explicit "Input -> OpenXR" prohibition,
+    # which this is not (the dependency runs XR -> Input, never the
+    # reverse).
+    target_link_libraries(arengine_xr PRIVATE AREngine::Input)
 
     # --- M9C: OpenXR/Vulkan integration boundary ---
     #

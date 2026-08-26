@@ -188,6 +188,20 @@ if(ARENGINE_ENABLE_OPENXR)
     target_compile_features(arengine_openxr_view_tests PRIVATE cxx_std_20)
     add_test(NAME OpenXRViewTests COMMAND arengine_openxr_view_tests)
 
+    # Pure-logic OpenXR action-state-conversion tests (M10):
+    # XrActionStateBoolean/Float/Vector2f/Pose -> AREngine::Input's
+    # generic DigitalActionState/AnalogActionState/Vector2ActionState/
+    # PoseActionState conversion, including digital press/release
+    # transition logic and inactive-state handling. No real OpenXR
+    # calls and no Vulkan dependency - see openxr_action_tests.cpp.
+    add_executable(arengine_openxr_action_tests
+        openxr_action_tests.cpp
+    )
+    target_link_libraries(arengine_openxr_action_tests PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Input OpenXR::openxr_loader)
+    target_include_directories(arengine_openxr_action_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+    target_compile_features(arengine_openxr_action_tests PRIVATE cxx_std_20)
+    add_test(NAME OpenXRActionTests COMMAND arengine_openxr_action_tests)
+
     # --- M9C: OpenXR/Vulkan integration boundary ---
     #
     # Only built when BOTH ARENGINE_ENABLE_OPENXR and
@@ -266,6 +280,20 @@ if(ARENGINE_ENABLE_OPENXR)
             ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src
             ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
         target_compile_features(arengine_openxr_cube_demo PRIVATE cxx_std_20)
+
+        # Manual-only, M10: requires a real OpenXR loader/runtime with
+        # XR_KHR_vulkan_enable2 support (this codebase's XrSession
+        # creation needs the Vulkan graphics binding, even though this
+        # demo renders nothing itself - see the demo's own header
+        # comment) which CI/headless systems lack. Built by CMake but
+        # deliberately NOT registered with add_test. Run it directly
+        # instead. See docs/ARCHITECTURE.md, "M10 Implementation Notes".
+        add_executable(arengine_openxr_input_demo
+            openxr_input_demo.cpp
+        )
+        target_link_libraries(arengine_openxr_input_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
+        target_include_directories(arengine_openxr_input_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
+        target_compile_features(arengine_openxr_input_demo PRIVATE cxx_std_20)
     endif()
 endif()
 

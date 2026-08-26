@@ -6,6 +6,11 @@ add_library(AREngine::Input ALIAS arengine_input)
 target_sources(arengine_input
     PRIVATE
         include/AREngine/Input/Input.hpp
+        # M10: generic action-state vocabulary (digital/analog/vector2/
+        # pose) for input sources richer than keyboard/mouse - header-
+        # only, no new .cpp needed. See docs/ARCHITECTURE.md, "Generic
+        # Input Extension (M10)".
+        include/AREngine/Input/ActionState.hpp
 )
 
 target_include_directories(arengine_input

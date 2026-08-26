@@ -127,6 +127,20 @@ namespace AREngine::XR::OpenXR
         // Round-Trip (M9F)".
         [[nodiscard]] const std::vector<XrView>& GetLastLocatedXrViews() const { return m_lastLocatedViews; }
 
+        // Not part of the generic FrameDriver interface (FrameTiming
+        // deliberately carries no XrTime - see FrameTiming.hpp). The
+        // current frame's own predicted display time, exactly as
+        // stashed by this frame's PrepareFrame() -> xrWaitFrame call -
+        // 0 if PrepareFrame() has not yet returned FrameStatus::Continue
+        // this run. Exists specifically so XR-only pose queries that
+        // need XrTime (M10's OpenXRActionSystem::GetAimPoseState,
+        // xrLocateSpace) can use the exact same time GetViews() already
+        // locates against, without inventing a parallel time source or
+        // ever falling back to wall-clock time. See
+        // docs/ARCHITECTURE.md, "Predicted Display Time For Poses
+        // (M10)".
+        [[nodiscard]] XrTime GetLastPredictedDisplayTime() const { return m_lastPredictedDisplayTime; }
+
         // Not part of the generic FrameDriver interface. Configures the
         // composition layer this frame's EndFrame() call should submit
         // - `layer` may be nullptr (submit zero layers this frame,
