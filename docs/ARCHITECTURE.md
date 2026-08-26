@@ -7335,3 +7335,324 @@ explicitly out of scope per the brief, deferred to later milestones per
   `tests/CMakeLists.txt` (`OpenXRActionTests`/`arengine_openxr_input_demo`
   targets). `engine/input/include/AREngine/Input/Input.hpp`/`.cpp`
   themselves: unchanged.
+
+## 34. M10.5 Implementation Notes
+
+M10.5 builds AREngine's first INTEGRATED XR demo - one process, one
+`XrSession`, one frame loop, that exercises the render path (M9G/M9H)
+and the action/input path (M10) together, rendering multiple objects
+into multiple views while syncing/querying controller state every
+running frame. No new OpenXR/Vulkan capability was added - the goal was
+proving these already-proven-independently systems coexist correctly,
+per the milestone's own stated question: "does AREngine now have a
+coherent XR application path?"
+
+### Existing-Demo Audit (M10.5)
+
+Performed first, per the milestone's own requirement. All six prior
+OpenXR demos (`openxr_demo`, `openxr_vulkan_demo`, `openxr_session_demo`,
+`openxr_frame_demo`, `openxr_cube_demo`, `openxr_input_demo`) were
+inspected:
+
+**A. Duplicated bring-up**: real and substantial - instance/system/
+view-configuration/blend-mode/graphics-binding/session/reference-space
+creation is reimplemented, near-verbatim, in every one of the six
+demos (each later demo a superset of the previous one's bring-up).
+Confirmed directly, not estimated: `tests/xr_demo.cpp` itself is a
+seventh near-identical repetition of this exact sequence.
+
+**B. Reusable engine functionality** (already properly factored into
+`engine/xr`/`engine/rendering`, never duplicated - only the demo-level
+orchestration around them is): `OpenXRInstance`, `OpenXRSystem`,
+`OpenXRSession`, `OpenXRReferenceSpace`, `OpenXRSwapchain`,
+`OpenXRProjectionLayer`, `XRFrameDriver`, `OpenXRActionSystem`
+(M10), `OpenXRVulkanViewTarget` (M9H, `tests/`-level), every
+`VulkanRenderPass`/`VulkanGraphicsPipeline`/`VulkanMesh`/etc class.
+
+**C. Still demo-only** (legitimately different per demo, correctly NOT
+shared): which of these resources each demo actually constructs
+(`openxr_session_demo` has no swapchain at all; `openxr_input_demo` has
+actions but no rendering; `openxr_cube_demo` has one object, no
+actions); each demo's own stop conditions/log messages; small
+file-local helpers (`CheckVkResultHere`, `SwapchainFormatToString`) -
+deliberately duplicated per this codebase's own long-standing,
+explicitly-documented convention (first stated in M9C/M9D, reaffirmed
+at every subsequent demo including this one).
+
+**D. Missing a clean integration boundary** - the audit's real
+finding, and the one this milestone actually acted on: **no prior demo
+exercised rendering and the action system in the same session**, and
+**no prior demo rendered more than one object per view**. This is not
+a code-duplication problem (category A) - it's an untested-integration
+gap, exactly matching the milestone's own stated purpose. Two small,
+targeted extensions closed it - see below.
+
+**Decision on category A (bring-up duplication)**: deliberately left
+UNCHANGED. This codebase's own long-standing convention (no shared
+demo-setup helper exists between any two demos, restated explicitly in
+M9G/M9H/M10's own documentation) was re-evaluated here, not just
+inherited - bring-up decisions (which extension to request, what to log
+at each stage, what counts as a graceful-stop condition) are
+legitimately application-level judgment calls a real, different
+application might make differently; consolidating them into a shared
+helper for a SEVENTH demo would be premature abstraction for a
+still-single-consumer concern, and would not have reduced any real
+duplication this milestone actually needed to solve (the earlier six
+demos are explicitly left untouched per the brief - "do not delete the
+earlier bring-up demos... remain focused regression tools").
+
+### Multi-Object Render Split (M10.5)
+
+The one concrete extraction the audit justified: `OpenXRVulkanViewTarget.hpp/.cpp`'s
+M9H/M9G-era `RecordOpenXRViewRenderPass` (one call = begin render pass +
+one object's push-constants/draw + end render pass) was split into
+three narrower functions - `BeginOpenXRViewRenderPass`,
+`DrawOpenXRViewObject`, `EndOpenXRViewRenderPass` - so a view's render
+pass can draw an arbitrary number of objects, each possibly using a
+DIFFERENT `VulkanMesh` (M10.5 draws both a cube mesh and a floor quad
+mesh into the same view). `RecordOpenXRViewRenderPass` itself is kept,
+now implemented as `Begin` + one `DrawOpenXRViewObject` + `End` -
+`tests/openxr_cube_demo.cpp` calls it unchanged and was rebuilt and
+confirmed to still compile and behave identically (bit-for-bit the same
+sequence of Vulkan calls for its single-object case). One deliberate
+behavior change from M9G/M9H: `DrawOpenXRViewObject` now calls
+`mesh.Bind()` itself (per-object), rather than assuming the caller
+bound the (single, shared) mesh once outside the loop - necessary now
+that different objects can use different meshes; harmless for
+`openxr_cube_demo.cpp`'s still-present external bind call (rebinding
+identical vertex/index buffers is idempotent, not a correctness issue -
+confirmed by reading the Vulkan spec, not assumed). Pipeline and
+descriptor-set binding remain once-per-frame (unchanged from M9G/M9H) -
+only mesh identity varies per object, not the shared pipeline/texture.
+
+### XR/Rendering Boundary, Reconfirmed (M10.5)
+
+M9H already found and documented the real constraint: a genuinely
+reusable per-view render-resource class needs both `OpenXRSwapchain`
+(XR-private) and `VulkanImage`/`VulkanFramebuffers` (Rendering-private)
+simultaneously, and promoting it into either `engine/xr` or
+`engine/rendering` would require one to gain a new dependency on the
+other - a boundary M9C/M9F/M9G each already deliberately avoided
+crossing. M10.5 re-evaluated this with fresh evidence (a second,
+harder case: multiple meshes, multiple objects, a genuine input-system
+integration in the same file) and reached the **same conclusion**: the
+extended `OpenXRVulkanViewTarget.hpp/.cpp` stays exactly where M9H put
+it (`tests/`), and the new `xr_demo.cpp` itself stays a leaf that
+crosses both boundaries directly - explicitly permitted by this
+milestone's own brief ("if the cleanest solution still belongs in a
+leaf/demo integration layer, that is acceptable. Do not force a new
+engine module just to make it official"). No new engine module was
+created. `engine/xr` gained no new dependency on `engine/rendering`;
+`engine/rendering` gained no new dependency on `engine/xr` - confirmed
+by inspecting both `CMakeLists.txt` files, unchanged by this milestone.
+
+### No God-Object Coordinator (M10.5)
+
+`xr_demo.cpp`'s `main()` directly owns every resource (instance,
+binding, session, localSpace, actionSystem, swapchains, viewTargets,
+renderPass/pipeline/meshes/texture, frameDriver) - exactly the same
+shape every prior XR demo already uses, not a new
+`XRApplicationThatOwnsEverything` wrapper class. `main()` itself is the
+"small coordinator" the brief allows, not a class with its own
+lifecycle - consistent with "avoid making one giant god object" and
+"prefer a small coordinator if justified" (justified here by exactly
+the same evidence-based reasoning as every prior demo: `main()`'s own
+declaration order already gives correct RAII destruction, and no
+runtime polymorphism or reuse-across-multiple-instances need exists to
+justify wrapping it in a class).
+
+### Scene Integration Evaluated And Declined (M10.5)
+
+`Scene::Scene` (M5) was read in full and evaluated honestly against
+this milestone's actual scene content (five flat, non-hierarchical
+objects: a floor and four cubes, none parented to any other), not
+declined by default. `Scene::Scene` provides entity identity +
+`Transform` + parent/child hierarchy + `GetWorldMatrix()` (which walks
+the parent chain) - for a scene with **zero** parent/child
+relationships, `GetWorldMatrix(entity)` degenerates to exactly
+`Transform::ToMatrix()`, which M10.5 already calls directly. `Scene`
+also has **no concept of "which mesh/tint an entity uses"** - there is
+no `MeshRenderer`-equivalent component - so using `Scene::Scene` here
+would mean creating five entities via `CreateEntity()`/
+`GetTransform()` purely to store the same transforms `SceneObject`
+already stores directly, while STILL maintaining a separate, manual
+`entity -> mesh/tint` mapping outside `Scene` (since `Scene` has
+nowhere to put it). This provides zero real value over the demo's own
+flat `std::vector<SceneObject>` for this specific scene shape -
+confirmed by evaluation, not assumed. Deferred, not rejected outright:
+a scene with real parent/child relationships, or a future
+`MeshRenderer`-equivalent component, would change this calculus - see
+"Recommended Next Milestone" below.
+
+### No Scene::Camera For XR Eyes, Reconfirmed (M10.5)
+
+Unchanged from M9G: XR view poses come exclusively from
+`XRFrameDriver::GetViews()` (real `xrLocateViews` data); no
+`Scene::Camera` was created for either eye. `Scene::Camera` remains
+appropriate only for desktop rendering (`vulkan_present_demo.cpp`'s own
+established use) - the two concepts are kept distinct, confirmed by
+`xr_demo.cpp` never including `Scene/Camera.hpp` at all.
+
+### Input Update Order (M10.5)
+
+Per running (`FrameStatus::Continue`) tick, in this order:
+`PrepareFrame()` (polls session events, calls the real `xrWaitFrame`) →
+`BeginFrame()` (`xrBeginFrame`) → `actionSystem.SyncActions()`
+(`xrSyncActions`, unconditional) → query select/trigger/move/aim-pose
+for both hands (unconditional) → **if `shouldRender`**: `GetViews()`
+(`xrLocateViews`) → render all five objects into each view → prepare
+the projection layer → `EndFrame()` (`xrEndFrame`, always). Verified
+against the OpenXR spec, not copied blindly from the brief's own
+suggested pseudocode: `xrSyncActions`/`xrGetActionState*` have no
+`shouldRender` precondition anywhere in the spec, so syncing/querying
+input every running frame (not just renderable ones) is legal and
+correct - confirmed by the live run, where `framesSynced` (1000)
+matched `framesAttempted` (1000) exactly, independent of
+`framesWithShouldRenderTrue` (1). This is the same placement M10's own
+`openxr_input_demo.cpp` already established, now proven correct
+alongside real rendering in the same tick, not just in isolation.
+
+### Multi-Object/Multi-View Render Flow (M10.5)
+
+For each rendered frame: acquire+wait both swapchain images → bind
+pipeline+descriptor set once → for each view: `BeginOpenXRViewRenderPass`
+→ for each of the five objects: compute
+`MVP = Projection(view) * ViewMatrix(view) * Model(object)`
+(`object.transform.ToMatrix()`, computed fresh each rendered frame -
+same shared `Scene::Transform` used by every view, never a per-eye
+copy) → `DrawOpenXRViewObject` → `EndOpenXRViewRenderPass` → submit
+once → wait fence → release both images. **Draw count, observed and
+matching the exact prediction**: 2 views × 5 objects = 10 draws on the
+one frame that rendered (`viewsRendered=2`, `objectsRendered=10`,
+`drawCalls=10`) - confirmed from the actual live-run log, not just
+computed in the abstract. No instancing/batching was added (explicitly
+out of scope).
+
+### Ownership/Lifetime (M10.5)
+
+Verified against actual OpenXR object-ownership rules, not assumed:
+`OpenXRVulkanViewTarget`s (owns depth image + framebuffers) destroyed
+before `swapchains` (which they borrow image views from) and before
+`renderPass`/`pipeline` (which they were built against); `swapchains`
+destroyed before `session` (each swapchain is session-scoped);
+`actionSystem` (destroys its two pose action spaces, then its four
+actions, then its action set) destroyed before `session` (action
+spaces/actions/the action set are all session- and instance-scoped,
+per the OpenXR spec's own object model - an `XrActionSet`'s actions are
+implicitly destroyed with it, but this codebase explicitly destroys
+each `OpenXRAction` first regardless, matching its own established
+"every wrapper destroys its own handle" discipline); `localSpace`
+destroyed before `session`; `session` destroyed before `binding`
+(`VkDevice`, then `VkInstance`); `binding`/`session` both destroyed
+before `instance` (`xrDestroyInstance` last). All of this follows
+directly from `main()`'s own declaration order (C++ reverse-local-
+destruction), documented explicitly in the function's own trailing
+comment - not left implicit, per the brief's own explicit requirement.
+
+### Performance Diagnostics (M10.5)
+
+Carried forward from M9H/M10 (`FrameDiagnostics`, `std::chrono`-only,
+extended with `objectsRendered`): from the live run - 1000 frames
+attempted, 1000 frames synced, 1 frame with `shouldRender=true`, 1
+frame rendered, 2 views rendered, 10 objects rendered, 10 draw calls,
+average CPU frame-prep time 5.08ms, average Vulkan submit-to-fence time
+0.72ms (both measured over the one rendered frame - higher than M9H's
+single-object 1.75ms/0.56ms, consistent with 10 draws + 2 mesh rebinds
+instead of 2 draws with one shared mesh, not a regression).
+
+### SteamVR/Null Limitations, Reconfirmed (M10.5)
+
+Both already-documented limitations reappeared, unchanged, run
+together for the first time: `shouldRender=true` on frame 1 only (same
+root cause M9E/M9H already investigated - the session never reaches
+`XR_SESSION_STATE_FOCUSED` in this environment), and zero real
+controller activity on either hand for the entire run (same finding
+M10 already established). Neither was worked around, faked, or
+special-cased - both are reported honestly in the run's own final
+summary log lines. `arengine_xr_demo` ran 1000/1000 lifecycle
+iterations cleanly regardless, proving the full integrated system
+(session, actions, frame driver, render targets) remains stable across
+a long run even though only one of those iterations exercised real
+rendering.
+
+### Validation (M10.5)
+
+All five practically-distinct `ARENGINE_ENABLE_OPENXR` ×
+`ARENGINE_ENABLE_VULKAN` configurations built and `ctest`-passed: ON/ON
+(`/EHsc /W4 /WX` clean) 16/16 (one new pure-logic test added,
+`TestQuaternionRotateFloorOrientationMapsLocalZToWorldUp`, verifying
+the hand-derived floor-orientation math this demo relies on); ON/ON
+with `/EHsc /W4 /WX` explicitly forced 16/16; ON/OFF 14/14; OFF/ON
+(default) 11/11; OFF/OFF 10/10. `InputTests` passed unchanged in every
+configuration.
+
+`arengine_xr_demo` run against live SteamVR: 1000/1000 frames
+completed, 1000/1000 synced, clean session-state sequence (`IDLE →
+READY → SYNCHRONIZED → STOPPING → IDLE → EXITING`), exit code 0, no
+crash. The `vkDestroyDevice` "14 leaked objects" validation error
+(SteamVR-internal `[BlankEyeBuffer]`-tagged compositor bookkeeping,
+same category traced since M9E) reappeared, structurally unchanged -
+still three different `VkCommandBuffer`/four different `VkFence`
+handles than this demo's own single reused pair. Sandbox and
+`arengine_vulkan_present_demo` both launched and ran without crashing.
+
+### Architectural Issues Found (M10.5)
+
+None new. The XR/Rendering boundary tension M9H first found was
+re-evaluated with harder evidence (multi-object, multi-mesh, combined
+render+input) and reached the same conclusion, not a new one - see "XR/
+Rendering Boundary, Reconfirmed" above. `Frame::ViewInfo`, `FrameDriver`,
+`OpenXRActionSystem`, and `Input::ActionState` all needed zero changes
+to support this integration (`FrameDriver` and `ViewInfo` were
+explicitly re-checked against this milestone's own new evidence per the
+brief's instruction not to speculatively refactor them, and neither
+needed to change).
+
+### What Is Now Proven As An Integrated Engine Path (M10.5)
+
+One `XrSession`, one frame loop, running the real OpenXR frame
+lifecycle (M9E.5), real per-view pose/projection data (M9F), multiple
+objects with independent transforms/tints rendered into multiple real
+XR swapchain images using M9H's hardened per-view resource model, and
+the full OpenXR action/input system (M10) synced and queried every
+running frame - all in the same process, the same session, the same
+loop, for 1000 consecutive lifecycle iterations, with zero AREngine-
+attributable errors and a clean session-state sequence both times
+(bring-up and shutdown). This is genuinely new evidence, not a
+restatement of what M9G/M9H/M10 already proved separately: those
+milestones each proved their own subsystem in isolation; this milestone
+proves none of them interfere with each other when combined.
+
+### Recommended Next Milestone (M10.5)
+
+Based on this milestone's own evidence, not a general roadmap
+restatement: the render and input paths are now proven integration-
+ready, but nothing today connects a *changing* application state
+(gameplay logic, a real Scene with parented/animated entities, an
+actual input-driven mapping) to what gets rendered - `xr_demo.cpp`'s
+scene is still a static, hand-written object list, and its action
+queries are logged, never acted on. The most evidence-justified next
+step is **not** a `SceneRenderer` (no concrete rendering-side gap
+justifies one yet - `OpenXRVulkanViewTarget`'s Begin/Draw/End split
+already handles "many objects, many views" correctly) but rather the
+first small, deliberate use of queried input to affect *something*
+already on screen (e.g. driving the reference cube's rotation from
+`select`/`trigger` instead of a hard-coded clock, if a continuous-
+render-capable runtime becomes available to actually observe it) -
+still not gameplay, but the first genuine "input affects state affects
+render" loop, which is the concrete gap this milestone's own audit
+surfaced. Continuing to investigate a continuous-`shouldRender`-capable
+runtime/simulator (Meta XR Simulator remains the standing,
+not-yet-installed recommendation from M9B) would make any such future
+milestone's own validation far more conclusive than this environment
+currently allows.
+
+- Files changed: `tests/OpenXRVulkanViewTarget.hpp/.cpp` (Begin/Draw/End
+  split, `RecordOpenXRViewRenderPass` kept as a convenience wrapper);
+  new `tests/xr_demo.cpp`; `tests/core_tests.cpp` (one new pure-logic
+  test, floor-orientation math); `tests/CMakeLists.txt`
+  (`arengine_xr_demo` target). No other `engine/` source changed -
+  every subsystem this milestone integrates (`OpenXRActionSystem`,
+  `XRFrameDriver`, `OpenXRProjectionLayer`, `OpenXRSwapchain`,
+  `Scene::Transform`, `Rendering::CreateCubeMesh`/`CreateQuadMesh`) was
+  reused completely unchanged.

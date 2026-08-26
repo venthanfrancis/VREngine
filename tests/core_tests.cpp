@@ -136,6 +136,24 @@ namespace
         Check(Rotate(Quaternion::Identity(), kWorldForward) == kWorldForward, "Rotate by identity leaves a vector unchanged");
     }
 
+    void TestQuaternionRotateFloorOrientationMapsLocalZToWorldUp()
+    {
+        // M10.5: tests/xr_demo.cpp lays its floor mesh flat by rotating
+        // CreateQuadMesh()'s local +Z-facing quad by -90deg around
+        // world Right (+X), on the claim that this maps local +Z onto
+        // world +Y (Up) - i.e. the quad ends up facing straight up, as
+        // a floor must. Verified here as a real, hand-derived math
+        // claim, not assumed correct because it "looked right" in the
+        // demo - a sign error here would have quietly rendered the
+        // floor facing sideways or straight down instead.
+        const float negativeHalfPi = -std::numbers::pi_v<float> / 2.0f;
+        const Quaternion floorOrientation = Quaternion::FromAxisAngle(kWorldRight, negativeHalfPi);
+        const Vec3 rotatedNormal = Rotate(floorOrientation, Vec3(0.0f, 0.0f, 1.0f));
+        CheckNearlyEqual(rotatedNormal.x, kWorldUp.x, "Floor orientation: local +Z rotated -90deg around Right lands on Up.x");
+        CheckNearlyEqual(rotatedNormal.y, kWorldUp.y, "Floor orientation: local +Z rotated -90deg around Right lands on Up.y");
+        CheckNearlyEqual(rotatedNormal.z, kWorldUp.z, "Floor orientation: local +Z rotated -90deg around Right lands on Up.z");
+    }
+
     void TestQuaternionConjugate()
     {
         // Added in M9G, for deriving a view matrix from a located
@@ -467,6 +485,7 @@ int main()
     TestQuaternionFromAxisAngle();
     TestQuaternionMultiplication();
     TestQuaternionRotate();
+    TestQuaternionRotateFloorOrientationMapsLocalZToWorldUp();
     TestQuaternionConjugate();
     TestMat4TransformFactories();
     TestLookAtRH();

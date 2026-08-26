@@ -21,15 +21,11 @@ namespace AREngine::XR::OpenXR
 
     OpenXRVulkanViewTarget::~OpenXRVulkanViewTarget() = default;
 
-    void RecordOpenXRViewRenderPass(
+    void BeginOpenXRViewRenderPass(
         VkCommandBuffer commandBuffer,
         VkRenderPass renderPass,
-        VkPipelineLayout pipelineLayout,
-        const Rendering::Vulkan::VulkanMesh& mesh,
         const OpenXRVulkanViewTarget& viewTarget,
         std::uint32_t acquiredImageIndex,
-        const Core::Math::Mat4& mvp,
-        const Core::Math::Vec4& tint,
         VkClearColorValue clearColor)
     {
         const VkExtent2D extent = viewTarget.GetExtent();
@@ -62,12 +58,45 @@ namespace AREngine::XR::OpenXR
         scissor.offset = {0, 0};
         scissor.extent = extent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    }
+
+    void DrawOpenXRViewObject(
+        VkCommandBuffer commandBuffer,
+        VkPipelineLayout pipelineLayout,
+        const Rendering::Vulkan::VulkanMesh& mesh,
+        const Core::Math::Mat4& mvp,
+        const Core::Math::Vec4& tint)
+    {
+        // Rebinding is always correct (idempotent if this object shares
+        // the previous one's mesh) and is what makes multiple distinct
+        // meshes per view possible - see this function's own header
+        // comment.
+        mesh.Bind(commandBuffer);
 
         const Rendering::Vulkan::MvpPushConstants pushConstants{mvp, tint};
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             0, sizeof(Rendering::Vulkan::MvpPushConstants), &pushConstants);
         mesh.Draw(commandBuffer);
+    }
 
+    void EndOpenXRViewRenderPass(VkCommandBuffer commandBuffer)
+    {
         vkCmdEndRenderPass(commandBuffer);
+    }
+
+    void RecordOpenXRViewRenderPass(
+        VkCommandBuffer commandBuffer,
+        VkRenderPass renderPass,
+        VkPipelineLayout pipelineLayout,
+        const Rendering::Vulkan::VulkanMesh& mesh,
+        const OpenXRVulkanViewTarget& viewTarget,
+        std::uint32_t acquiredImageIndex,
+        const Core::Math::Mat4& mvp,
+        const Core::Math::Vec4& tint,
+        VkClearColorValue clearColor)
+    {
+        BeginOpenXRViewRenderPass(commandBuffer, renderPass, viewTarget, acquiredImageIndex, clearColor);
+        DrawOpenXRViewObject(commandBuffer, pipelineLayout, mesh, mvp, tint);
+        EndOpenXRViewRenderPass(commandBuffer);
     }
 }

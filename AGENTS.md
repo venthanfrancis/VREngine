@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete; M9H (XR render-path hardening — reusable per-view render-resource helper extracted, 1000-frame repeated-lifecycle validation, lightweight diagnostics, continuous-shouldRender environment limitation investigated honestly) complete; M10 (OpenXR action/input foundation — one XrActionSet, four actions spanning both hands, KHR simple_controller bindings, xrSyncActions, new generic Input::*ActionState vocabulary) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete; M9H (XR render-path hardening — reusable per-view render-resource helper extracted, 1000-frame repeated-lifecycle validation, lightweight diagnostics, continuous-shouldRender environment limitation investigated honestly) complete; M10 (OpenXR action/input foundation — one XrActionSet, four actions spanning both hands, KHR simple_controller bindings, xrSyncActions, new generic Input::*ActionState vocabulary) complete; M10.5 (first integrated XR demo — render path + action/input path combined in one session/frame loop, multiple objects into multiple views, 1000-iteration validation) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -654,15 +654,46 @@ environment's SteamVR null driver exposing no real controller, not
 worked around or fabricated. See `docs/ARCHITECTURE.md` Section 33 for
 the full design, the InputSystem audit, and validation.
 
+**M10.5 builds AREngine's first INTEGRATED XR demo** - one process, one
+`XrSession`, combining the render path (M9G/M9H) and the action/input
+path (M10) in the same frame loop, proving they don't interfere with
+each other. An audit of all six prior OpenXR demos found the real gap:
+none rendered more than one object per view, and none exercised
+rendering and the action system together. Closed with the smallest
+justified extraction - `OpenXRVulkanViewTarget`'s single-object
+`RecordOpenXRViewRenderPass` (M9H) was split into
+`BeginOpenXRViewRenderPass`/`DrawOpenXRViewObject`/`EndOpenXRViewRenderPass`
+so a view's render pass can draw multiple objects across multiple
+meshes (a floor quad + four cubes) - `openxr_cube_demo.cpp` still
+calls the original single-object wrapper unchanged. `main()` in the new
+`tests/xr_demo.cpp` directly owns every resource, same shape as every
+prior demo - no `XRApplicationThatOwnsEverything` coordinator class was
+introduced. `Scene::Scene` was evaluated (not skipped by default) and
+declined: for a flat, non-hierarchical five-object scene, its
+`GetWorldMatrix()` degenerates to exactly the `Transform::ToMatrix()`
+call already used, and it has no mesh/tint concept at all, so it would
+add indirection with zero real value here. Every running frame calls
+`xrSyncActions` and queries controller state unconditionally, then
+renders (if `shouldRender`) - verified against the spec that input
+sync has no `shouldRender` precondition, confirmed live
+(`framesSynced=1000` vs. `framesWithShouldRenderTrue=1`). Ran 1000/1000
+lifecycle iterations clean against live SteamVR: 2 views x 5 objects =
+10 draws on the one frame that rendered, exactly as predicted; both
+already-known environment limitations (render-opportunity-once,
+no real controller) reappeared and were reported honestly, not worked
+around. See `docs/ARCHITECTURE.md` Section 34 for the full audit,
+boundary re-confirmation, and validation.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
-system, no stereo scene rendering driven by these controller actions,
-no hand tracking, and no haptics — see Sections 11–15. `Editor` is
-still an M0-style stub with no functionality. Next up is M10.5 (the
-full AR/XR demo, now with real controller input available where a
-runtime exposes it) or M8I+ (Scene integration, still pending within
-M8) — see `docs/ROADMAP.md` for the full plan.
+system, no gameplay, and no input-driven rendering state (M10.5's
+controller queries are logged, never acted on) — see Sections 11–15.
+`Editor` is still an M0-style stub with no functionality. Next up, per
+M10.5's own evidence-based recommendation: the first small, deliberate
+use of queried input to affect something already on screen (still not
+gameplay) - or M8I+ (Scene integration, still pending within M8) — see
+`docs/ROADMAP.md` for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -679,25 +710,27 @@ M8) — see `docs/ROADMAP.md` for the full plan.
 3a. **OpenXR instance/system discovery + Vulkan graphics-binding +
    XrSession/session-state/reference-space bring-up + XR swapchains/
    frame lifecycle + generic FrameDriver redesign + real view location/
-   composition-layer submission + a single manually-defined cube
-   rendered into each eye's swapchain image (hardened for repeated-
-   frame reuse) + an OpenXR action/input foundation (one action set,
-   four actions spanning both hands, KHR simple_controller bindings,
-   xrSyncActions, controller pose action spaces located via
-   xrLocateSpace) so far (M9A–M10)**: no hand tracking
-   (`XR_EXT_hand_tracking`) or eye tracking, no haptics
-   (`XR_ACTION_TYPE_VIBRATION_OUTPUT`), no passthrough, no anchors, no
-   `SceneRenderer`/`Scene` integration driving what's rendered into XR
-   eyes or consuming controller actions (M9G's cube is defined directly
-   in its own demo, not via `Scene`; M10's action state is read
-   directly by its own demo, not fed into a live `Input::InputSystem`
-   instance), no `Scene::Camera` driving XR eyes, no XR head/
+   composition-layer submission + multiple objects rendered into each
+   eye's swapchain image (hardened for repeated-frame reuse) + an
+   OpenXR action/input foundation (one action set, four actions
+   spanning both hands, KHR simple_controller bindings, xrSyncActions,
+   controller pose action spaces located via xrLocateSpace) + these two
+   paths proven to coexist in one integrated session/frame loop so far
+   (M9A–M10.5)**: no hand tracking (`XR_EXT_hand_tracking`) or eye
+   tracking, no haptics (`XR_ACTION_TYPE_VIBRATION_OUTPUT`), no
+   passthrough, no anchors, no `SceneRenderer`/`Scene` integration
+   driving what's rendered into XR eyes or consuming controller actions
+   (M10.5's five-object scene is a hand-written `std::vector`, not
+   `Scene::Scene` - evaluated and declined, see
+   `docs/ARCHITECTURE.md`; controller action state is logged, never
+   fed into a live `Input::InputSystem` instance or used to affect
+   rendering), no `Scene::Camera` driving XR eyes, no XR head/
    `viewFromWorld` camera abstraction beyond the free-function
    `Core::Math::ViewMatrixFromPoseRH` M9G added, no swapchain-image
    acquisition inside `XRFrameDriver` (that stays on `OpenXRSwapchain`,
    coordinated outside `Frame`/`XRFrameDriver`), no rendering
    responsibility added to `XRFrameDriver` for any of this. See
-   `docs/ROADMAP.md`'s M10.5 row.
+   `docs/ROADMAP.md`'s M11 row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

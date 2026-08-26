@@ -294,6 +294,28 @@ if(ARENGINE_ENABLE_OPENXR)
         target_link_libraries(arengine_openxr_input_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_openxr_input_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src)
         target_compile_features(arengine_openxr_input_demo PRIVATE cxx_std_20)
+
+        # Manual-only, M10.5: AREngine's first INTEGRATED XR demo -
+        # combines the render path (M9G/M9H) and the action/input path
+        # (M10) in one session/frame loop. Requires a real OpenXR
+        # loader/runtime with XR_KHR_vulkan_enable2 support which
+        # CI/headless systems lack. Built by CMake but deliberately NOT
+        # registered with add_test. Run it directly instead. Reaches
+        # into BOTH engine/xr's and engine/rendering's private
+        # src/vulkan/ implementation directly, same as
+        # openxr_cube_demo.cpp - engine/xr itself gains no new
+        # dependency on engine/rendering from this, only this leaf demo
+        # target does. See docs/ARCHITECTURE.md, "M10.5 Implementation
+        # Notes".
+        add_executable(arengine_xr_demo
+            xr_demo.cpp
+            OpenXRVulkanViewTarget.cpp
+        )
+        target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
+        target_include_directories(arengine_xr_demo PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+        target_compile_features(arengine_xr_demo PRIVATE cxx_std_20)
     endif()
 endif()
 

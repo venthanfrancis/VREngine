@@ -1,0 +1,739 @@
+// Manual M10.5 validation demo — NOT part of the automated CTest suite,
+// since it requires a real OpenXR loader/runtime with XR_KHR_vulkan_enable2
+// support (and ideally a real or simulated HMD) that CI/headless systems
+// may lack. Built by CMake but deliberately not registered with
+// add_test. Run it manually.
+//
+// AREngine's first INTEGRATED XR demo - one process that exercises every
+// major XR subsystem proven independently across M9A-M10 together, in
+// the same OpenXR instance/session: bring-up (M9A/M9C/M9D) -> the
+// generic XR frame lifecycle (M9E.5) -> real per-view pose/projection
+// data (M9F) -> multiple objects rendered into each eye's real OpenXR
+// swapchain image, using M9H's hardened per-view render-target model
+// (M9G/M9H) -> the OpenXR action/input system, synced and queried every
+// running frame alongside rendering (M10) -> a real
+// XrCompositionLayerProjection submitted through the existing
+// OpenXRProjectionLayer path (M9F). Nothing here is new OpenXR/Vulkan
+// capability - every wrapper class this file uses (OpenXRSession,
+// XRFrameDriver, OpenXRVulkanViewTarget, OpenXRActionSystem, ...) is
+// reused completely unchanged from its own milestone. What M10.5 proves
+// is that these systems coexist correctly in ONE coherent application
+// loop - see docs/ARCHITECTURE.md, "M10.5 Implementation Notes" for the
+// audit that justified this scope and the one deliberate extension it
+// required (multiple objects/meshes per view - see
+// OpenXRVulkanViewTarget.hpp's Begin/Draw/End split).
+//
+// Still no gameplay, no player, no weapons, no Scene integration (a
+// real Scene evaluation - not a decision made in advance - concluded
+// Scene provides no value for this demo's flat, non-hierarchical,
+// 5-object set; see docs/ARCHITECTURE.md), no SceneRenderer, no hand
+// tracking, no haptics. This is an ENGINE integration demo, not a game.
+//
+// Earlier bring-up demos (openxr_demo, openxr_vulkan_demo,
+// openxr_session_demo, openxr_frame_demo, openxr_cube_demo,
+// openxr_input_demo) are intentionally untouched and left in place as
+// focused regression tools - this file sits alongside them, not in
+// place of them.
+//
+// SteamVR's null driver is expected to expose shouldRender=true on only
+// the first frame (M9E onward) and no real controller bound to any
+// interaction profile (M10) in this environment - both are reported
+// honestly at the end of the run, not worked around or fabricated.
+
+#include "AREngine/Core/Core.hpp"
+#include "AREngine/Frame/Frame.hpp"
+#include "AREngine/Input/ActionState.hpp"
+#include "AREngine/Rendering/ProceduralMesh.hpp"
+#include "AREngine/Scene/Transform.hpp"
+
+#include "OpenXRVulkanViewTarget.hpp"
+
+#include "openxr/OpenXRActionSystem.hpp"
+#include "openxr/OpenXREnvironmentBlendMode.hpp"
+#include "openxr/OpenXRInstance.hpp"
+#include "openxr/OpenXRProjectionLayer.hpp"
+#include "openxr/OpenXRReferenceSpace.hpp"
+#include "openxr/OpenXRResult.hpp"
+#include "openxr/OpenXRSession.hpp"
+#include "openxr/OpenXRSwapchain.hpp"
+#include "openxr/OpenXRSystem.hpp"
+#include "openxr/OpenXRVersion.hpp"
+#include "openxr/OpenXRViewConfiguration.hpp"
+#include "openxr/OpenXRVulkanGraphicsBinding.hpp"
+#include "openxr/XRFrameDriver.hpp"
+
+#include "vulkan/VulkanCheckerboard.hpp"
+#include "vulkan/VulkanClipSpace.hpp"
+#include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDepthFormat.hpp"
+#include "vulkan/VulkanDescriptorPool.hpp"
+#include "vulkan/VulkanDescriptorSetLayout.hpp"
+#include "vulkan/VulkanGraphicsPipeline.hpp"
+#include "vulkan/VulkanMesh.hpp"
+#include "vulkan/VulkanPushConstants.hpp"
+#include "vulkan/VulkanRenderPass.hpp"
+#include "vulkan/VulkanSampler.hpp"
+
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <format>
+#include <limits>
+#include <memory>
+#include <vector>
+
+namespace
+{
+    void CheckVkResultHere(VkResult result, const char* operation)
+    {
+        if (result != VK_SUCCESS)
+        {
+            const std::string message = std::format("{} failed: VkResult({})", operation, static_cast<int>(result));
+            AR_LOG_ERROR(message);
+            AR_ASSERT_MSG(false, message.c_str());
+        }
+    }
+
+    std::string SwapchainFormatToString(std::int64_t format)
+    {
+        switch (static_cast<VkFormat>(format))
+        {
+            case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
+            case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
+            default:                      return std::format("VkFormat({})", format);
+        }
+    }
+
+    constexpr std::array<VkClearColorValue, 2> kEyeClearColors{
+        VkClearColorValue{{0.05f, 0.05f, 0.12f, 1.0f}},
+        VkClearColorValue{{0.12f, 0.05f, 0.05f, 1.0f}},
+    };
+
+    // Raised to 1000, matching M9H's own "at least 1000 lifecycle
+    // iterations" validation standard - this demo exercises both the
+    // render path AND the input path together over the same run.
+    constexpr std::uint32_t kTargetFrameCount = 1000;
+    constexpr std::chrono::seconds kMaxDemoDuration{300};
+
+    constexpr float kReferenceCubeRotationRadiansPerSecond = 0.5f;
+    constexpr float kAnalogLogThreshold = 0.05f;
+
+    // --- Scene content: a flat, non-hierarchical list of objects, each
+    // pairing a Scene::Transform (M5's TRS type, reused directly - not
+    // Scene::Scene itself; see docs/ARCHITECTURE.md, "Scene Integration
+    // Evaluated And Declined (M10.5)") with which persistent mesh it
+    // draws and its own tint. Deliberately NOT a "gameplay entity" - no
+    // behavior, no update logic beyond the one optional rotation below. ---
+    struct SceneObject
+    {
+        AREngine::Scene::Transform transform;
+        const AREngine::Rendering::Vulkan::VulkanMesh* mesh = nullptr;
+        AREngine::Core::Math::Vec4 tint;
+        bool isReferenceCube = false; // the one object M10H-style slow rotation is applied to
+    };
+
+    struct FrameDiagnostics
+    {
+        std::uint32_t framesAttempted = 0;
+        std::uint32_t framesWithShouldRenderTrue = 0;
+        std::uint32_t framesRendered = 0;
+        std::uint32_t framesSynced = 0;
+        std::uint64_t viewsRendered = 0;
+        std::uint64_t objectsRendered = 0;
+        std::uint64_t drawCalls = 0;
+        double cpuPrepSecondsSum = 0.0;
+        double vulkanSubmitSecondsSum = 0.0;
+        std::uint32_t timedSampleCount = 0;
+    };
+
+    const char* HandName(AREngine::XR::OpenXR::Hand hand)
+    {
+        return hand == AREngine::XR::OpenXR::Hand::Left ? "Left" : "Right";
+    }
+
+    // Change-only input logging bookkeeping, per hand - same discipline
+    // M10's openxr_input_demo.cpp already established, reused verbatim
+    // in shape (not literally shared code - this demo is self-contained,
+    // per this codebase's own established "no shared demo-setup helper"
+    // convention).
+    struct HandLogState
+    {
+        bool everLogged = false;
+        bool selectActive = false;
+        bool triggerActive = false;
+        float triggerValue = 0.0f;
+        bool moveActive = false;
+        AREngine::Core::Math::Vec2 moveValue;
+        bool poseActive = false;
+        bool posePositionValid = false;
+        bool poseOrientationValid = false;
+    };
+
+    void LogHandState(
+        AREngine::XR::OpenXR::Hand hand, HandLogState& logState,
+        const AREngine::Input::DigitalActionState& select,
+        const AREngine::Input::AnalogActionState& trigger,
+        const AREngine::Input::Vector2ActionState& move,
+        const AREngine::Input::PoseActionState& pose)
+    {
+        const char* name = HandName(hand);
+
+        if (!logState.everLogged)
+        {
+            AR_LOG_INFO(std::format(
+                "  [{}] first observed state: select.active={} trigger.active={} move.active={} pose.active={}",
+                name, select.active, trigger.active, move.active, pose.active));
+            logState.everLogged = true;
+        }
+
+        if (select.pressed) AR_LOG_INFO(std::format("  [{}] Select: pressed", name));
+        if (select.released) AR_LOG_INFO(std::format("  [{}] Select: released", name));
+        if (select.active != logState.selectActive)
+        {
+            AR_LOG_INFO(std::format("  [{}] Select: active {} -> {}", name, logState.selectActive, select.active));
+            logState.selectActive = select.active;
+        }
+
+        if (trigger.active != logState.triggerActive)
+        {
+            AR_LOG_INFO(std::format("  [{}] Trigger: active {} -> {}", name, logState.triggerActive, trigger.active));
+            logState.triggerActive = trigger.active;
+            logState.triggerValue = trigger.value;
+        }
+        else if (trigger.active && std::abs(trigger.value - logState.triggerValue) > kAnalogLogThreshold)
+        {
+            AR_LOG_INFO(std::format("  [{}] Trigger: {:.3f} -> {:.3f}", name, logState.triggerValue, trigger.value));
+            logState.triggerValue = trigger.value;
+        }
+
+        if (move.active != logState.moveActive)
+        {
+            AR_LOG_INFO(std::format("  [{}] Move: active {} -> {}", name, logState.moveActive, move.active));
+            logState.moveActive = move.active;
+            logState.moveValue = move.value;
+        }
+        else if (move.active)
+        {
+            const float dx = move.value.x - logState.moveValue.x;
+            const float dy = move.value.y - logState.moveValue.y;
+            if (std::sqrt(dx * dx + dy * dy) > kAnalogLogThreshold)
+            {
+                AR_LOG_INFO(std::format("  [{}] Move: ({:.3f},{:.3f}) -> ({:.3f},{:.3f})",
+                                         name, logState.moveValue.x, logState.moveValue.y, move.value.x, move.value.y));
+                logState.moveValue = move.value;
+            }
+        }
+
+        if (pose.active != logState.poseActive)
+        {
+            AR_LOG_INFO(std::format("  [{}] AimPose: active {} -> {}", name, logState.poseActive, pose.active));
+            logState.poseActive = pose.active;
+        }
+        if (pose.positionValid != logState.posePositionValid)
+        {
+            AR_LOG_INFO(std::format("  [{}] AimPose: positionValid {} -> {}", name, logState.posePositionValid, pose.positionValid));
+            logState.posePositionValid = pose.positionValid;
+        }
+        if (pose.orientationValid != logState.poseOrientationValid)
+        {
+            AR_LOG_INFO(std::format("  [{}] AimPose: orientationValid {} -> {}", name, logState.poseOrientationValid, pose.orientationValid));
+            logState.poseOrientationValid = pose.orientationValid;
+        }
+    }
+}
+
+int main()
+{
+    using namespace AREngine::XR::OpenXR;
+    using namespace AREngine::Rendering::Vulkan;
+    namespace Frame = AREngine::Frame;
+    namespace Rendering = AREngine::Rendering;
+    namespace Scene = AREngine::Scene;
+    namespace Math = AREngine::Core::Math;
+    namespace Input = AREngine::Input;
+
+    AR_LOG_INFO(std::format("AREngine integrated XR demo - header version {}, requesting API version {}",
+                             FormatXrVersion(XR_CURRENT_API_VERSION), FormatXrVersion(kTargetApiVersion)));
+
+    // --- Bring-up: identical in substance to every prior OpenXR demo in
+    // this codebase (M9A-M10) - see openxr_cube_demo.cpp/openxr_input_demo.cpp
+    // for the full reasoning behind each stop condition. Deliberately
+    // NOT factored into a shared helper - see docs/ARCHITECTURE.md,
+    // "Existing-Demo Audit (M10.5)" for why this remains demo-local,
+    // consistent with every earlier demo's own established convention. ---
+    const std::vector<XrExtensionProperties> extensions = EnumerateInstanceExtensions();
+    if (!IsExtensionSupported(extensions, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME))
+    {
+        AR_LOG_WARNING(std::format("{} is NOT supported by the active OpenXR runtime - stopping here.",
+                                    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME));
+        AR_LOG_INFO("Integrated XR demo exiting cleanly (XR_KHR_vulkan_enable2 unavailable)");
+        return 0;
+    }
+
+    const std::array<const char*, 1> requestedExtensions{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+    OpenXRInstance instance(requestedExtensions);
+    if (!instance.IsValid())
+    {
+        if (instance.CreationResult() == XR_ERROR_RUNTIME_UNAVAILABLE)
+        {
+            AR_LOG_WARNING("No active OpenXR runtime found (XR_ERROR_RUNTIME_UNAVAILABLE).");
+        }
+        else
+        {
+            AR_LOG_WARNING(std::format("xrCreateInstance failed unexpectedly: {}",
+                                        XrResultToReadableString(XR_NULL_HANDLE, instance.CreationResult())));
+        }
+        AR_LOG_INFO("Integrated XR demo exiting cleanly (no instance available)");
+        return 0;
+    }
+
+    XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
+    CheckXrResult(instance.Get(), xrGetInstanceProperties(instance.Get(), &instanceProperties), "xrGetInstanceProperties");
+    AR_LOG_INFO(std::format("Active OpenXR runtime: {} (version {})",
+                             instanceProperties.runtimeName, FormatXrVersion(instanceProperties.runtimeVersion)));
+
+    const SystemRequestResult systemResult = TryGetHmdSystem(instance.Get());
+    if (!systemResult.found)
+    {
+        if (IsFormFactorUnavailable(systemResult.rawResult))
+        {
+            AR_LOG_WARNING("OpenXR runtime is active, but no head-mounted-display system is currently available.");
+        }
+        else
+        {
+            AR_LOG_WARNING(std::format("xrGetSystem failed unexpectedly: {}",
+                                        XrResultToReadableString(instance.Get(), systemResult.rawResult)));
+        }
+        AR_LOG_INFO("Integrated XR demo exiting cleanly (runtime present, no HMD system)");
+        return 0;
+    }
+    AR_LOG_INFO(std::format("HMD system acquired: XrSystemId {}", systemResult.systemId));
+    const XrSystemId systemId = systemResult.systemId;
+
+    const std::vector<XrViewConfigurationType> viewConfigTypes = EnumerateViewConfigurationTypes(instance.Get(), systemId);
+    const std::optional<XrViewConfigurationType> primaryViewConfigType = SelectPrimaryViewConfigurationType(viewConfigTypes);
+    if (!primaryViewConfigType.has_value())
+    {
+        AR_LOG_WARNING("XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO is NOT supported by this runtime/system - stopping here.");
+        AR_LOG_INFO("Integrated XR demo exiting cleanly (no stereo view configuration)");
+        return 0;
+    }
+
+    const std::vector<XrViewConfigurationView> viewConfigViews =
+        EnumerateViewConfigurationViews(instance.Get(), systemId, *primaryViewConfigType);
+    AR_LOG_INFO(std::format("View count: {}", viewConfigViews.size()));
+
+    const std::vector<XrEnvironmentBlendMode> supportedBlendModes =
+        EnumerateEnvironmentBlendModes(instance.Get(), systemId, *primaryViewConfigType);
+    const std::optional<XrEnvironmentBlendMode> selectedBlendMode = SelectEnvironmentBlendMode(supportedBlendModes);
+    if (!selectedBlendMode.has_value())
+    {
+        AR_LOG_WARNING("None of OPAQUE/ALPHA_BLEND/ADDITIVE is supported by this runtime - stopping here.");
+        AR_LOG_INFO("Integrated XR demo exiting cleanly (no usable environment blend mode)");
+        return 0;
+    }
+    AR_LOG_INFO(std::format("Selected environment blend mode: {}", EnvironmentBlendModeToString(*selectedBlendMode)));
+
+    AR_LOG_INFO("Creating OpenXR-compatible Vulkan instance/device via XR_KHR_vulkan_enable2...");
+    OpenXRVulkanGraphicsBinding binding(instance.Get(), systemId);
+    const VulkanGraphicsBindingData& bindingData = binding.GetBindingData();
+    AR_LOG_INFO(std::format("Vulkan API version selected: {}", FormatVkApiVersion(binding.GetSelectedVulkanApiVersion())));
+
+    OpenXRSession session(instance.Get(), systemId, bindingData);
+    AR_LOG_INFO("XrSession created successfully");
+
+    OpenXRReferenceSpace localSpace(instance.Get(), session.Get(), XR_REFERENCE_SPACE_TYPE_LOCAL);
+    AR_LOG_INFO("Created LOCAL reference space");
+
+    // --- M10: action set + actions + bindings + attach + action spaces,
+    // reused completely unchanged. ---
+    OpenXRActionSystem actionSystem(instance.Get(), session.Get());
+    AR_LOG_INFO("Created 'gameplay' action set, suggested khr/simple_controller bindings, attached, created action spaces");
+
+    // --- M9E: swapchain format + one XrSwapchain per view. ---
+    const std::vector<std::int64_t> supportedFormats = EnumerateSwapchainFormats(instance.Get(), session.Get());
+    const std::optional<std::int64_t> selectedFormat = SelectSwapchainColorFormat(supportedFormats);
+    if (!selectedFormat.has_value())
+    {
+        AR_LOG_WARNING("The runtime reported zero swapchain formats - stopping here.");
+        AR_LOG_INFO("Integrated XR demo exiting cleanly (no usable swapchain format)");
+        return 0;
+    }
+    AR_LOG_INFO(std::format("Selected swapchain format: {}", SwapchainFormatToString(*selectedFormat)));
+
+    std::vector<std::unique_ptr<OpenXRSwapchain>> swapchains;
+    swapchains.reserve(viewConfigViews.size());
+    for (const XrViewConfigurationView& view : viewConfigViews)
+    {
+        swapchains.push_back(std::make_unique<OpenXRSwapchain>(
+            instance.Get(), session.Get(), bindingData.device, *selectedFormat,
+            view.recommendedImageRectWidth, view.recommendedImageRectHeight, view.recommendedSwapchainSampleCount));
+        AR_LOG_INFO(std::format("Created swapchain: {}x{}, {} image(s)/view(s)",
+                                 swapchains.back()->GetWidth(), swapchains.back()->GetHeight(), swapchains.back()->GetImages().size()));
+    }
+
+    std::vector<XrSwapchainSubImage> projectionSubImages;
+    projectionSubImages.reserve(swapchains.size());
+    for (const std::unique_ptr<OpenXRSwapchain>& swapchain : swapchains)
+    {
+        XrSwapchainSubImage subImage{};
+        subImage.swapchain = swapchain->Get();
+        subImage.imageRect.offset = {0, 0};
+        subImage.imageRect.extent = {static_cast<std::int32_t>(swapchain->GetWidth()), static_cast<std::int32_t>(swapchain->GetHeight())};
+        subImage.imageArrayIndex = 0;
+        projectionSubImages.push_back(subImage);
+    }
+    OpenXRProjectionLayer projectionLayer(projectionSubImages, localSpace.Get());
+
+    // --- M9G/M9H: shared render pass/pipeline/descriptor-set-layout
+    // (format-dependent only, safe to share across every view). ---
+    const VkFormat depthFormat = FindSupportedDepthFormat(bindingData.physicalDevice);
+    VulkanRenderPass renderPass(bindingData.device, static_cast<VkFormat>(*selectedFormat), depthFormat,
+                                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VulkanDescriptorSetLayout descriptorSetLayout(bindingData.device);
+    VulkanGraphicsPipeline pipeline(bindingData.device, renderPass.Get(), descriptorSetLayout.Get());
+
+    VulkanCommandPool commandPool(bindingData.device, bindingData.queueFamilyIndex);
+
+    // --- M10.5: TWO persistent meshes - the cube (M8H) and a quad
+    // (M8D/ProceduralMesh) used as the floor. Both uploaded exactly
+    // once, before the frame loop - never per-frame, never per-object. ---
+    auto cubeMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
+                                      Rendering::CreateCubeMesh());
+    auto floorMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
+                                       Rendering::CreateQuadMesh());
+    AR_LOG_INFO("Uploaded 2 persistent meshes (cube, floor quad) - never re-uploaded per frame");
+
+    constexpr std::uint32_t kTextureWidth = 64;
+    constexpr std::uint32_t kTextureHeight = 64;
+    constexpr std::uint32_t kTextureTileSize = 8;
+    const std::vector<std::uint8_t> checkerboardPixels = GenerateCheckerboardRGBA8(kTextureWidth, kTextureHeight, kTextureTileSize);
+    auto texture = CreateTextureFromPixels(
+        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
+        kTextureWidth, kTextureHeight, checkerboardPixels.data());
+    VulkanSampler sampler(bindingData.device);
+
+    VulkanDescriptorPool descriptorPool(bindingData.device);
+    VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
+    WriteCombinedImageSamplerDescriptor(bindingData.device, descriptorSet, texture->GetView(), sampler.Get());
+
+    AR_ASSERT_MSG(binding.GetPhysicalDeviceProperties().limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
+        "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
+
+    // --- M9H: one OpenXRVulkanViewTarget per view, built exactly once. ---
+    std::vector<std::unique_ptr<OpenXRVulkanViewTarget>> viewTargets;
+    viewTargets.reserve(swapchains.size());
+    for (const std::unique_ptr<OpenXRSwapchain>& swapchain : swapchains)
+    {
+        viewTargets.push_back(std::make_unique<OpenXRVulkanViewTarget>(
+            bindingData.physicalDevice, bindingData.device, renderPass.Get(), *swapchain, depthFormat));
+    }
+    AR_LOG_INFO(std::format("Created {} per-view render target(s), built once", viewTargets.size()));
+
+    // --- M10.5 scene content: floor + 3 small cubes + 1 larger
+    // reference cube - a flat, non-hierarchical list (see
+    // docs/ARCHITECTURE.md for why Scene::Scene itself was evaluated and
+    // declined). ALL views render these SAME five world transforms -
+    // never one set of objects per eye. ---
+    std::vector<SceneObject> sceneObjects;
+
+    SceneObject floor;
+    floor.transform.position = Math::Vec3(0.0f, -0.6f, -2.0f);
+    floor.transform.rotation = Math::Quaternion::FromAxisAngle(Math::Vec3(1.0f, 0.0f, 0.0f), -1.5707963f); // -90 deg: quad +Z -> world +Y
+    floor.transform.scale = Math::Vec3(4.0f, 4.0f, 4.0f);
+    floor.mesh = floorMesh.get();
+    floor.tint = Math::Vec4(0.6f, 0.6f, 0.6f, 1.0f);
+    sceneObjects.push_back(floor);
+
+    SceneObject referenceCube;
+    referenceCube.transform.position = Math::Vec3(0.0f, 0.0f, -2.0f);
+    referenceCube.transform.scale = Math::Vec3(0.6f, 0.6f, 0.6f);
+    referenceCube.mesh = cubeMesh.get();
+    referenceCube.tint = Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    referenceCube.isReferenceCube = true;
+    sceneObjects.push_back(referenceCube);
+
+    SceneObject cubeA;
+    cubeA.transform.position = Math::Vec3(-0.8f, 0.0f, -2.2f);
+    cubeA.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
+    cubeA.mesh = cubeMesh.get();
+    cubeA.tint = Math::Vec4(1.0f, 0.4f, 0.4f, 1.0f);
+    sceneObjects.push_back(cubeA);
+
+    SceneObject cubeB;
+    cubeB.transform.position = Math::Vec3(0.8f, 0.0f, -2.2f);
+    cubeB.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
+    cubeB.mesh = cubeMesh.get();
+    cubeB.tint = Math::Vec4(0.4f, 1.0f, 0.4f, 1.0f);
+    sceneObjects.push_back(cubeB);
+
+    SceneObject cubeC;
+    cubeC.transform.position = Math::Vec3(0.0f, 0.6f, -2.5f);
+    cubeC.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
+    cubeC.mesh = cubeMesh.get();
+    cubeC.tint = Math::Vec4(0.4f, 0.4f, 1.0f, 1.0f);
+    sceneObjects.push_back(cubeC);
+
+    AR_LOG_INFO(std::format("Scene: {} object(s) (floor + reference cube + 3 small cubes), shared across every view", sceneObjects.size()));
+
+    // --- M9E/M9G: one reusable command buffer, one fence, fully
+    // synchronous - unchanged from every prior XR rendering demo. ---
+    VkCommandBufferAllocateInfo cbAllocInfo{};
+    cbAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbAllocInfo.commandPool = commandPool.Get();
+    cbAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAllocInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    CheckVkResultHere(vkAllocateCommandBuffers(bindingData.device, &cbAllocInfo, &commandBuffer), "vkAllocateCommandBuffers");
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence renderFence = VK_NULL_HANDLE;
+    CheckVkResultHere(vkCreateFence(bindingData.device, &fenceInfo, nullptr, &renderFence), "vkCreateFence");
+
+    // --- Frame loop, driven through XRFrameDriver. ---
+    AR_LOG_INFO(std::format("Beginning integrated XR loop - target {} completed frames before requesting exit...", kTargetFrameCount));
+
+    XRFrameDriver frameDriver(instance.Get(), session, localSpace, *primaryViewConfigType, *selectedBlendMode);
+
+    std::uint32_t completedFrameCount = 0;
+    bool exitRequested = false;
+    const auto startTime = std::chrono::steady_clock::now();
+    FrameDiagnostics diag;
+    std::array<HandLogState, 2> logStates{}; // [0]=Left, [1]=Right
+
+    while (true)
+    {
+        const Frame::FrameContext frameContext = frameDriver.PrepareFrame();
+
+        if (frameContext.status == Frame::FrameStatus::Stop)
+        {
+            AR_LOG_INFO("Frame driver reports FrameStatus::Stop - stopping the main loop cleanly (not an error)");
+            break;
+        }
+
+        if (frameContext.status == Frame::FrameStatus::Idle)
+        {
+            if (std::chrono::steady_clock::now() - startTime > kMaxDemoDuration)
+            {
+                AR_LOG_WARNING("Safety timeout reached while the frame driver was idle - stopping.");
+                break;
+            }
+            continue;
+        }
+
+        frameDriver.BeginFrame();
+
+        // --- Input: synced every running (Continue) frame, independent
+        // of shouldRender - xrSyncActions/xrGetActionState* are legal
+        // and meaningful regardless of whether this tick renders. See
+        // docs/ARCHITECTURE.md, "Input Update Order (M10.5)". ---
+        actionSystem.SyncActions(instance.Get(), session.Get());
+        ++diag.framesSynced;
+
+        const XrTime predictedDisplayTime = frameDriver.GetLastPredictedDisplayTime();
+        for (const Hand hand : {Hand::Left, Hand::Right})
+        {
+            const Input::DigitalActionState select = actionSystem.GetSelectState(instance.Get(), session.Get(), hand);
+            const Input::AnalogActionState trigger = actionSystem.GetTriggerState(instance.Get(), session.Get(), hand);
+            const Input::Vector2ActionState move = actionSystem.GetMoveState(instance.Get(), session.Get(), hand);
+            const Input::PoseActionState pose =
+                actionSystem.GetAimPoseState(instance.Get(), session.Get(), localSpace.Get(), predictedDisplayTime, hand);
+            LogHandState(hand, logStates[hand == Hand::Left ? 0 : 1], select, trigger, move, pose);
+        }
+
+        bool renderedThisFrame = false;
+
+        if (frameContext.timing.shouldRender)
+        {
+            ++diag.framesWithShouldRenderTrue;
+            const auto prepStart = std::chrono::steady_clock::now();
+
+            const std::vector<Frame::ViewInfo> views = frameDriver.GetViews();
+
+            if (projectionLayer.Prepare(frameDriver.GetLastLocatedXrViews()) && views.size() == swapchains.size())
+            {
+                CheckVkResultHere(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer");
+                VkCommandBufferBeginInfo cbBeginInfo{};
+                cbBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                cbBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                CheckVkResultHere(vkBeginCommandBuffer(commandBuffer, &cbBeginInfo), "vkBeginCommandBuffer");
+
+                std::vector<std::uint32_t> acquiredIndices(swapchains.size());
+                for (std::size_t i = 0; i < swapchains.size(); ++i)
+                {
+                    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                    CheckXrResult(instance.Get(),
+                        xrAcquireSwapchainImage(swapchains[i]->Get(), &acquireInfo, &acquiredIndices[i]), "xrAcquireSwapchainImage");
+
+                    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                    waitInfo.timeout = XR_INFINITE_DURATION;
+                    CheckXrResult(instance.Get(), xrWaitSwapchainImage(swapchains[i]->Get(), &waitInfo), "xrWaitSwapchainImage");
+                }
+
+                // Pipeline + descriptor set bound once, before the first
+                // view's render pass - shared across every view/object
+                // this frame (Vulkan spec: bound state persists across
+                // vkCmdEndRenderPass -> vkCmdBeginRenderPass within one
+                // command buffer). Per-object mesh binding happens
+                // inside DrawOpenXRViewObject instead - see
+                // OpenXRVulkanViewTarget.hpp.
+                vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
+                vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
+                    0, 1, &descriptorSet, 0, nullptr);
+
+                // Slow rotation on the reference cube only (M9H-style,
+                // for repeated-frame verification - never a stand-in
+                // for head tracking). Every other object stays static.
+                for (SceneObject& object : sceneObjects)
+                {
+                    if (object.isReferenceCube)
+                    {
+                        object.transform.rotation = Math::Quaternion::FromAxisAngle(
+                            Math::Vec3(0.0f, 1.0f, 0.0f),
+                            kReferenceCubeRotationRadiansPerSecond * static_cast<float>(frameContext.timing.totalTimeSeconds));
+                    }
+                }
+
+                for (std::size_t i = 0; i < views.size(); ++i)
+                {
+                    const Math::Mat4 view = Math::ViewMatrixFromPoseRH(views[i].position, views[i].orientation);
+                    const Math::Mat4 projection = ApplyVulkanYFlip(views[i].projection);
+
+                    BeginOpenXRViewRenderPass(commandBuffer, renderPass.Get(), *viewTargets[i], acquiredIndices[i],
+                                               kEyeClearColors[i % kEyeClearColors.size()]);
+                    for (const SceneObject& object : sceneObjects)
+                    {
+                        const Math::Mat4 mvp = projection * view * object.transform.ToMatrix();
+                        DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *object.mesh, mvp, object.tint);
+                        ++diag.objectsRendered;
+                        ++diag.drawCalls;
+                    }
+                    EndOpenXRViewRenderPass(commandBuffer);
+                }
+                diag.viewsRendered += views.size();
+
+                CheckVkResultHere(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+
+                const auto submitStart = std::chrono::steady_clock::now();
+                diag.cpuPrepSecondsSum += std::chrono::duration<double>(submitStart - prepStart).count();
+
+                CheckVkResultHere(vkResetFences(bindingData.device, 1, &renderFence), "vkResetFences");
+                VkSubmitInfo submitInfo{};
+                submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submitInfo.commandBufferCount = 1;
+                submitInfo.pCommandBuffers = &commandBuffer;
+                CheckVkResultHere(vkQueueSubmit(binding.GetQueue(), 1, &submitInfo, renderFence), "vkQueueSubmit");
+
+                CheckVkResultHere(
+                    vkWaitForFences(bindingData.device, 1, &renderFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()),
+                    "vkWaitForFences");
+
+                const auto submitEnd = std::chrono::steady_clock::now();
+                diag.vulkanSubmitSecondsSum += std::chrono::duration<double>(submitEnd - submitStart).count();
+                ++diag.timedSampleCount;
+
+                for (const std::unique_ptr<OpenXRSwapchain>& swapchain : swapchains)
+                {
+                    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                    CheckXrResult(instance.Get(), xrReleaseSwapchainImage(swapchain->Get(), &releaseInfo), "xrReleaseSwapchainImage");
+                }
+
+                frameDriver.SetPendingProjectionLayer(projectionLayer.Get());
+                renderedThisFrame = true;
+                ++diag.framesRendered;
+            }
+
+            const bool logSample = (completedFrameCount + 1 == 1) || ((completedFrameCount + 1) % 100 == 0);
+            if (logSample)
+            {
+                if (renderedThisFrame)
+                {
+                    AR_LOG_INFO(std::format("  Rendered {} view(s) x {} object(s) = {} draw(s) this frame",
+                                             views.size(), sceneObjects.size(), views.size() * sceneObjects.size()));
+                }
+                else
+                {
+                    AR_LOG_INFO("  Not rendered this frame (no valid views, or view/swapchain count mismatch)");
+                }
+            }
+        }
+
+        // EndFrame() always runs - submits the projection layer set
+        // above if rendering happened this tick, zero layers otherwise
+        // (shouldRender was false, or no valid views/count mismatch).
+        frameDriver.EndFrame();
+
+        ++completedFrameCount;
+        ++diag.framesAttempted;
+        if (completedFrameCount == 1 || completedFrameCount % 100 == 0)
+        {
+            AR_LOG_INFO(std::format("Completed frame {} (rendered={}, synced={}, deltaTime={:.4f}s)",
+                                     completedFrameCount, renderedThisFrame, diag.framesSynced, frameContext.timing.deltaTimeSeconds));
+        }
+
+        if (completedFrameCount >= kTargetFrameCount && !exitRequested)
+        {
+            AR_LOG_INFO(std::format("Reached target frame count ({}) - requesting a clean session exit...", kTargetFrameCount));
+            frameDriver.RequestExit();
+            exitRequested = true;
+        }
+
+        if (std::chrono::steady_clock::now() - startTime > kMaxDemoDuration)
+        {
+            AR_LOG_WARNING("Safety timeout reached without the runtime reaching EXITING - stopping the demo loop anyway.");
+            break;
+        }
+    }
+
+    AR_LOG_INFO(std::format(
+        "Diagnostics: frames attempted={}, frames synced={}, frames shouldRender=true={}, frames rendered={}, "
+        "views rendered={}, objects rendered={}, draw calls={}",
+        diag.framesAttempted, diag.framesSynced, diag.framesWithShouldRenderTrue, diag.framesRendered,
+        diag.viewsRendered, diag.objectsRendered, diag.drawCalls));
+    if (diag.timedSampleCount > 0)
+    {
+        AR_LOG_INFO(std::format(
+            "Diagnostics: avg CPU frame-prep time={:.4f}ms, avg Vulkan submit-to-fence time={:.4f}ms (over {} rendered frame(s))",
+            1000.0 * diag.cpuPrepSecondsSum / diag.timedSampleCount,
+            1000.0 * diag.vulkanSubmitSecondsSum / diag.timedSampleCount,
+            diag.timedSampleCount));
+    }
+    if (!logStates[0].selectActive && !logStates[0].triggerActive && !logStates[0].moveActive && !logStates[0].poseActive &&
+        !logStates[1].selectActive && !logStates[1].triggerActive && !logStates[1].moveActive && !logStates[1].poseActive)
+    {
+        AR_LOG_INFO("No action was ever active on either hand this run - consistent with this environment's SteamVR "
+                    "null driver exposing no real controller bound to any interaction profile. Not fabricated.");
+    }
+
+    // AREngine's own submitted GPU work is already known complete (the
+    // fence was waited on after every render), but the shared VkDevice
+    // may still have SteamVR's own in-flight compositor work on it -
+    // same category already documented as SteamVR-internal since M9E.
+    CheckVkResultHere(vkDeviceWaitIdle(bindingData.device), "vkDeviceWaitIdle");
+
+    vkDestroyFence(bindingData.device, renderFence, nullptr);
+    // commandBuffer is freed implicitly when commandPool is destroyed.
+
+    AR_LOG_INFO("Integrated XR demo complete - shutting down");
+    return 0;
+
+    // Destruction, in exact reverse declaration order: frameDriver
+    // (trivial) -> viewTargets (each destroys its own depth image +
+    // framebuffers) -> sceneObjects (trivial - raw, non-owning mesh
+    // pointers only) -> descriptorPool -> sampler -> texture ->
+    // floorMesh -> cubeMesh -> commandPool (frees commandBuffer
+    // implicitly) -> pipeline -> descriptorSetLayout -> renderPass ->
+    // projectionLayer (trivial) -> swapchains (each xrDestroySwapchain,
+    // and its own cached AREngine-owned VkImageViews first) ->
+    // actionSystem (destroys both aim_pose action spaces, then all four
+    // actions, then the action set itself - all while `session` is
+    // still alive) -> localSpace (xrDestroySpace) -> session
+    // (xrDestroySession) -> binding (VkDevice, then VkInstance) ->
+    // instance (xrDestroyInstance) last. Every GPU/OpenXR resource this
+    // demo owns is destroyed while the handle it depends on
+    // (bindingData.device/session/instance) is still alive, a direct
+    // consequence of declaration order - verified against the actual
+    // order above, not assumed.
+}

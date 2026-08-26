@@ -87,20 +87,61 @@ namespace AREngine::XR::OpenXR
         std::unique_ptr<Rendering::Vulkan::VulkanFramebuffers> m_framebuffers; // AREngine-owned
     };
 
-    // Records one view's render pass into `commandBuffer`: begin (with
-    // `clearColor` and a depth clear of 1.0/0), dynamic viewport/
-    // scissor sized to `viewTarget`'s own extent, the MVP/tint push
-    // constants, one indexed draw, end. Assumes the pipeline, mesh, and
-    // descriptor set are already bound on `commandBuffer` by the caller
-    // - a bound pipeline/vertex+index buffer/descriptor set persists
-    // across vkCmdEndRenderPass -> vkCmdBeginRenderPass within the same
-    // command buffer (Vulkan spec), so binding once for N views is
-    // correct, not a per-view responsibility of this function (M9G).
+    // M10.5: split into three narrower functions (Begin/Draw/End) so a
+    // view's render pass can draw MULTIPLE objects, each possibly using
+    // a DIFFERENT VulkanMesh (e.g. cube + floor quad) - M9G/M9H's single
+    // combined RecordOpenXRViewRenderPass (kept below, unchanged in
+    // behavior, still used as-is by openxr_cube_demo.cpp) assumed
+    // exactly one object/one mesh per view, which M10.5's evidence
+    // (multiple distinct meshes drawn into the same view) outgrew. See
+    // docs/ARCHITECTURE.md, "Multi-Object Render Split (M10.5)".
+
+    // Begins the render pass for one view (`clearColor` + a depth clear
+    // of 1.0/0), and sets dynamic viewport/scissor sized to
+    // `viewTarget`'s own extent. Call once per view, before drawing any
+    // objects into it. Assumes the pipeline and descriptor set are
+    // already bound on `commandBuffer` by the caller - shared across
+    // every view/object this frame (one pipeline, one texture, for
+    // everything - M9G/M9H/M10.5 all rely on this), and a bound
+    // pipeline/descriptor set persists across vkCmdEndRenderPass ->
+    // vkCmdBeginRenderPass within the same command buffer (Vulkan spec),
+    // so binding once per frame (not per view) remains correct.
+    void BeginOpenXRViewRenderPass(
+        VkCommandBuffer commandBuffer,
+        VkRenderPass renderPass,
+        const OpenXRVulkanViewTarget& viewTarget,
+        std::uint32_t acquiredImageIndex,
+        VkClearColorValue clearColor);
+
+    // Binds `mesh`'s vertex/index buffers (safe to call even if the
+    // same mesh was already bound for a previous object - rebinding
+    // identical buffers is idempotent, not a correctness issue, and
+    // this codebase deliberately does not optimize away the redundant
+    // call for a handful of objects - see docs/ARCHITECTURE.md,
+    // "Draw Count / No Batching (M10.5)") and issues one indexed draw
+    // with `mvp`/`tint` pushed as this object's MvpPushConstants. Call
+    // once per object, between BeginOpenXRViewRenderPass and
+    // EndOpenXRViewRenderPass.
     //
     // Deliberately takes a plain MVP matrix, not a Frame::ViewInfo -
     // this function is Vulkan-only and does not need to know about
     // engine/frame at all; the caller computes view/projection/model
     // and multiplies them down before calling this.
+    void DrawOpenXRViewObject(
+        VkCommandBuffer commandBuffer,
+        VkPipelineLayout pipelineLayout,
+        const Rendering::Vulkan::VulkanMesh& mesh,
+        const Core::Math::Mat4& mvp,
+        const Core::Math::Vec4& tint);
+
+    // Ends the render pass begun by BeginOpenXRViewRenderPass.
+    void EndOpenXRViewRenderPass(VkCommandBuffer commandBuffer);
+
+    // M9G/M9H convenience wrapper for the single-object-per-view case:
+    // Begin + one DrawOpenXRViewObject + End. Unchanged in behavior -
+    // still exactly what openxr_cube_demo.cpp calls, still assumes the
+    // pipeline/descriptor set (and, harmlessly redundantly, the mesh)
+    // are already bound by the caller.
     void RecordOpenXRViewRenderPass(
         VkCommandBuffer commandBuffer,
         VkRenderPass renderPass,
