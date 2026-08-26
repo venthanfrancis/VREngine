@@ -259,6 +259,7 @@ if(ARENGINE_ENABLE_OPENXR)
         # docs/ARCHITECTURE.md, "M9G Implementation Notes".
         add_executable(arengine_openxr_cube_demo
             openxr_cube_demo.cpp
+            OpenXRVulkanViewTarget.cpp
         )
         target_link_libraries(arengine_openxr_cube_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_openxr_cube_demo PRIVATE

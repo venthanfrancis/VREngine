@@ -6403,3 +6403,518 @@ all explicitly out of scope for M9G, deferred to M10 or later per
   `tests/CMakeLists.txt` (`arengine_openxr_cube_demo` target);
   `tests/openxr_frame_demo.cpp` (one line, updated `OpenXRSwapchain`
   constructor call to match the new signature).
+
+## 32. M9H Implementation Notes
+
+M9H is a cleanup/hardening pass over M9G's XR render path — no new
+rendering capability, no Scene integration, no gameplay. Goal: extract
+the genuinely reusable pieces of M9G's demo into small, narrow,
+well-documented components; make per-view resource ownership and
+command/fence reuse explicit and correct across many frames, not just
+the one frame M9G's own run happened to render; validate the generic
+frame loop over a much longer run; and investigate (without adding any
+vendor-specific code) whether continuous `shouldRender=true` frames are
+achievable in this environment.
+
+### M9G Demo Audit (M9H)
+
+Performed first, before any refactoring, per the milestone's own
+requirement. Every piece of `tests/openxr_cube_demo.cpp` as it stood
+after M9G, categorized:
+
+**A. Reusable engine infrastructure** (extracted): the per-view depth-
+image + framebuffer-set construction loop (one real ownership unit,
+duplicated by a `for` loop across eyes, with real lifetime rules worth
+naming) and the per-view render-pass-begin/viewport/scissor/push-
+constants/draw/end sequence (a single, reusable "record one view's
+draw commands" operation). Both extracted into new
+`tests/OpenXRVulkanViewTarget.hpp/.cpp` — see "Reusable Helper
+Extraction (M9H)" below for why this landed at the `tests/` leaf level
+rather than inside `engine/xr` or `engine/rendering`.
+
+**B. Demo-only orchestration** (kept in the demo, unchanged in kind):
+the entire OpenXR/Vulkan bring-up sequence (instance, system, view
+config, blend mode, graphics binding, session, LOCAL space, swapchain-
+format selection) — identical in substance to `openxr_frame_demo.cpp`
+by established, deliberate precedent (no shared demo-setup helper
+exists between any two demos in this codebase); the cube's own
+`Scene::Transform` definition and the checkerboard texture setup (this
+demo's entire "scene," never promoted to a real asset/Scene concept);
+main-loop control (target frame count, exit-request timing, safety
+timeout, logging cadence); the small file-local helpers
+(`CheckVkResultHere`, `SwapchainFormatToString`, `kEyeClearColors`) —
+each duplicated per file by this codebase's own established
+convention, not accidentally.
+
+**C. Accidental duplication of existing Vulkan helpers**: none found.
+The per-view depth/framebuffer loop (category A above) is new resource-
+ownership logic, not a duplicate of any existing class — `VulkanImage`
+and `VulkanFramebuffers` are correctly reused *inside* it, unchanged.
+`CheckVkResultHere`'s per-file duplication is deliberate, established
+convention (see M9E/M9F/M9G), not an oversight.
+
+**D. Temporary one-frame assumptions** — the audit's most important
+finding: the entire real-rendering code path (command-buffer reset/
+re-record, fence reset/wait/release, the per-view draw sequence) had,
+as of M9G, been exercised by **exactly one frame** in every manual run
+performed so far (`shouldRender` was `true` only on frame 1 in every
+M9E/M9F/M9G run). The code was *written* to be repeat-frame-safe (no
+per-frame allocation anywhere in the loop; the same command buffer and
+fence reused throughout) but this had never actually been *proven*
+against repeated real GPU work — a real, if unavoidable (see
+"Continuous shouldRender Investigation" below), gap between "designed
+to be correct across many frames" and "observed to be correct across
+many frames." M9H's 1000-iteration validation run (below) closes the
+"many frames of the generic loop" half of this gap; the "many frames of
+real GPU render work" half remains unclosed, honestly, for the reason
+documented below. A second, smaller finding: the acquire/release loop
+had no explicit note that nothing is ever acquired unless the frame's
+full render-and-release contract can be completed (see "Error Recovery
+(M9H)" below) — now documented explicitly, not just true by accident of
+control flow.
+
+### Reusable Helper Extraction (M9H)
+
+New `tests/OpenXRVulkanViewTarget.hpp/.cpp`: a class,
+`OpenXRVulkanViewTarget` (owns one view's depth image + framebuffer
+set, borrows its `OpenXRSwapchain`), and a free function,
+`RecordOpenXRViewRenderPass` (records one view's render pass into an
+already-open command buffer, given an already-built MVP matrix — no
+`Frame::ViewInfo` dependency, kept Vulkan-only). Deliberately **not**
+the milestone brief's own example shape
+(`OpenXRVulkanViewRenderer::RenderView(OpenXRSwapchain&, viewIndex,
+Frame::ViewInfo, Mat4)`) — that shape bundles view-matrix derivation
+into the renderer; M9H keeps that math in the demo (already a tested,
+working call site: `Math::ViewMatrixFromPoseRH` /
+`ApplyVulkanYFlip`), and passes the *already-computed* MVP in, which is
+what let `RecordOpenXRViewRenderPass` avoid depending on `engine/frame`
+at all.
+
+**Placement — deliberately NOT `engine/xr` or `engine/rendering`.**
+This is the audit's second major architectural finding. A view-target
+class needs `OpenXRSwapchain` (XR-private) and `VulkanImage`/
+`VulkanFramebuffers` (Rendering-private) simultaneously. Checked against
+actual `CMakeLists.txt` link lines: `arengine_xr` links raw
+`Vulkan::Vulkan` but **not** `AREngine::Rendering`; `arengine_rendering`
+does not link `AREngine::XR` at all. Promoting this class into either
+module would require one of them to gain a brand-new dependency on the
+other — exactly the boundary M9C, M9F ("`engine/xr` does not include
+Rendering's private headers... same established boundary as M9C's
+`FindGraphicsQueueFamily` duplication"), and M9G ("`engine/xr` itself
+gains NO new dependency on `engine/rendering`") have each independently,
+repeatedly chosen not to cross. M9H did not silently violate that
+boundary to get a cleaner-looking class location: the helper stays at
+the same leaf level (`tests/`) the boundary-crossing already
+legitimately happens at, exactly where `openxr_cube_demo.cpp` itself
+already lives. This is a real architectural constraint, not a
+stylistic preference — reported here explicitly rather than only
+implied by file placement.
+
+### Per-View Resource Model (M9H)
+
+Unchanged from M9G, now named and owned by `OpenXRVulkanViewTarget`
+instead of two parallel loop-built vectors: per view — one
+`OpenXRSwapchain` (borrowed), N OpenXR-owned color `VkImage`s, N
+AREngine-owned color `VkImageView`s (cached on the swapchain itself,
+M9G), one AREngine-owned depth `VulkanImage`, one AREngine-owned
+`VulkanFramebuffers` set (N framebuffers, one per swapchain image).
+
+**Depth model: option A (one depth image reused sequentially for all
+of a view's swapchain images), confirmed, not changed.** Re-examined
+against the actual evidence, not just carried forward: `VulkanFramebuffers`
+itself only accepts a single `depthImageView` parameter for its whole
+image-view set (see `VulkanFramebuffers.hpp`) — option B (one depth
+image per swapchain image) isn't even representable without changing
+that class. Correct under the current fully-synchronous,
+one-frame-in-flight synchronization model: only one framebuffer is ever
+being rasterized into at a time (the single command buffer/fence pair
+is reset, recorded, submitted, and waited on to completion before the
+next acquire), so no two images ever contend for the same depth buffer
+concurrently.
+
+### Framebuffer Model (M9H)
+
+No per-frame framebuffer creation — confirmed by construction
+(`OpenXRVulkanViewTarget`'s framebuffers are built once, in its
+constructor, called exactly `swapchains.size()` times total, before the
+frame loop begins) and by the 1000-frame validation run's own log
+(`"Created 2 per-view render target(s)..."` logged exactly once, not
+once per frame). `RecordOpenXRViewRenderPass` only *selects* an
+already-built framebuffer by acquired image index
+(`viewTarget.GetFramebuffer(acquiredImageIndex)`) — it never creates
+one. Reuses M9G's generalized `VulkanFramebuffers` unchanged.
+
+### Command-Buffer and Fence Reuse Model (M9H)
+
+Confirmed unchanged from M9G and now exercised across 1000 loop
+iterations (not just one): one `VkCommandBuffer` and one `VkFence`,
+allocated/created exactly once (before the frame loop begins), reused
+every rendered frame via `vkResetCommandBuffer` + `vkBeginCommandBuffer`
+and `vkResetFences` + `vkWaitForFences` — never reallocated,
+re-created, or freed inside the loop. No complex command scheduler was
+introduced (none was needed): `vkResetCommandBuffer` on a single
+primary command buffer, called only from a single thread, is already
+the minimal correct reuse mechanism for this demo's fully-synchronous
+model. The 1000-frame run's clean exit (`vkDestroyDevice`'s "leaked
+objects" list — see below — still names only handles this demo never
+allocated) is direct evidence this reuse is correct, not just written
+to look correct.
+
+### Fence/Synchronization Model (M9H)
+
+Kept exactly as M9G documented it — correctness first: reset fence,
+record, submit with fence, wait for the fence, only then
+`xrReleaseSwapchainImage`. Still explicitly temporary (no multiple
+frames in flight), still not optimized, per the brief's own explicit
+instruction not to. `vkDeviceWaitIdle` before teardown (added in M9G)
+is unchanged.
+
+### Important Release Rule, Reconfirmed (M9H)
+
+`xrReleaseSwapchainImage` is still never called until the render
+fence has signaled — `vkWaitForFences` unconditionally precedes the
+release loop, both in the code and in every observed run's ordering.
+No change was needed; this invariant was already correct in M9G and
+the refactor preserves it verbatim (`RecordOpenXRViewRenderPass` never
+touches acquire/wait/release at all — that stays the frame loop's own
+responsibility, per the milestone's explicit "should not own... swapchain
+acquire/release" instruction for any extracted helper).
+
+### Layout Lifecycle (M9H)
+
+Unchanged from M9G, restated for completeness: color images are
+acquired in whatever layout the runtime last left them (never assumed
+by AREngine); the render pass's `loadOp=CLEAR` means the incoming
+layout genuinely doesn't matter (`initialLayout = VK_IMAGE_LAYOUT_UNDEFINED`);
+during rendering the subpass uses `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL`
+(the attachment reference's layout); the render pass's `finalLayout` is
+`VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` (M9G's `colorFinalLayout`
+fix) — never `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`, which is meaningless
+for an OpenXR-owned image and was the real bug M9G found and fixed. The
+1000-frame run reproduced zero layout-mismatch errors of the kind M9G
+found and fixed (the only remaining `vkCreateImage`/`vkQueueSubmit`
+errors are the already-documented `BlankEyeBuffer` category — see
+below), confirming the fix holds under repeated use, not just the one
+run that discovered it.
+
+### Depth, Reconfirmed Internal-Only (M9H)
+
+No `XR_KHR_composition_layer_depth`, not considered, per the brief.
+Depth exists solely so AREngine's own 3D rendering (occlusion between
+the cube's own faces) is correct — never submitted to or read by the
+compositor.
+
+### Pipeline and Mesh Reuse, Reconfirmed (M9H)
+
+Unchanged from M9G, now explicitly re-verified as part of this
+milestone's own audit rather than only inherited: one
+`VulkanGraphicsPipeline`, built once, bound once per rendered frame
+(not once per view — the bind-once-per-frame, draw-many-views pattern
+M9G established), reused across both eyes via different per-view MVP
+push constants. One `VulkanMesh` (`Rendering::CreateCubeMesh()`),
+uploaded once via `CreateVulkanMesh`, bound once per rendered frame,
+drawn once per view. No new class or code path was needed to preserve
+either — both were already correct in M9G and untouched by this
+milestone's refactor.
+
+### Model State (M9H)
+
+Still one shared `Scene::Transform` for the whole cube — never one
+per eye. **New in M9H**: slow, constant-rate rotation
+(`kCubeRotationRadiansPerSecond = 0.5` rad/s about world Up), driven by
+`FrameTiming::totalTimeSeconds` (the frame driver's own elapsed clock,
+recomputed fresh each rendered frame — never a per-frame delta
+accumulator, which would drift under variable frame timing), added
+specifically so a repeated-frame run has *some* independently
+observable evidence of change across frames, since this runtime's real
+head poses remain static (M9F/M9G, reconfirmed below). This is
+motion added for repeated-frame verification, explicitly not a
+stand-in for head tracking — the cube's own rotation and the (still
+static) camera pose are never conflated in this document or the demo's
+own logging.
+
+### Performance Diagnostics (M9H)
+
+New, lightweight, `std::chrono`-only (`FrameDiagnostics`, a plain
+struct of running sums/counts, no profiler framework): frames
+attempted, frames with `shouldRender=true`, frames rendered, views
+rendered, draw calls, average CPU frame-preparation time (view
+location + command recording, measured from just after `BeginFrame()`
+plus the render gate to just before `vkQueueSubmit`), average Vulkan
+submit-to-fence-signal time. From the validation run (below): 1000
+frames attempted, 1 frame with `shouldRender=true`, 1 frame rendered, 2
+views rendered, 2 draw calls, average CPU prep time 1.75ms, average
+Vulkan submit time 0.56ms — consistent with a single simple textured
+cube drawn twice, not a meaningful FPS benchmark (the brief's own
+stated goal for this instrumentation is catching lifetime/stale-state
+bugs, not measuring performance, and it's treated that way here).
+
+### Continuous shouldRender Investigation (M9H)
+
+Investigated as an **environment configuration question**, per the
+brief's explicit instruction that AREngine's own source code must stay
+standard OpenXR/Vulkan with zero vendor-specific logic — no code was
+added or considered for this.
+
+- **SteamVR null-driver settings inspected directly**: both
+  `drivers/null/resources/settings/default.vrsettings` (the driver's
+  own shipped defaults: `windowWidth`/`windowHeight`/`renderWidth`/
+  `renderHeight`/`displayFrequency` — nothing related to focus or
+  continuous rendering) and the active
+  `config/steamvr.vrsettings` (`driver_null.enable: true`,
+  `steamvr.forcedDriver: "null"`, `steamvr.requireHmd: false`) were
+  read. Neither exposes any setting that changes whether the
+  compositor keeps issuing `shouldRender=true` to a background
+  application.
+- **Root-cause hypothesis, evidence-backed**: every session-state trace
+  captured across M9E, M9F, M9G, and this milestone's own 1000-frame
+  run shows the identical sequence `IDLE → READY → SYNCHRONIZED →
+  STOPPING → IDLE → EXITING` — the session **never reaches
+  `XR_SESSION_STATE_VISIBLE` or `XR_SESSION_STATE_FOCUSED`** in any
+  observed run. Per the OpenXR spec's session-state model, a runtime is
+  expected to keep issuing meaningful render opportunities to the
+  *focused* scene application; SteamVR's compositor most plausibly
+  treats this console-only, no-window OpenXR client as never becoming
+  the focused application (there is no dashboard interaction, no real
+  display surface, and nothing in this environment that would cause
+  SteamVR to hand it focus) — `shouldRender=true` on frame 1 only is
+  consistent with "the runtime offers one opportunistic frame, then
+  stops asking for more from a background/unfocused client." This is a
+  hypothesis about the *runtime's* compositor logic, not a claim about
+  AREngine's own code, and is reported as a hypothesis, not a proven
+  fact — but it is the same category of "traced to its actual source,
+  not just observed" standard M9E/M9F/M9G held every other finding to.
+- **No standards-based alternative already installed.** M9B's own
+  investigation (Section 25) already evaluated the realistic options on
+  this machine and concluded SteamVR's null driver was the best fit;
+  the only legitimate secondary option it identified, **Meta XR
+  Simulator**, is still not installed and was not installed for this
+  milestone either, per the brief's explicit "do not install another
+  runtime automatically" instruction. If continuous-render validation
+  becomes a hard requirement for a future milestone, Meta XR Simulator
+  remains the recommended next thing to evaluate — reported here as the
+  option to pursue, not acted on.
+- **Conclusion, honestly reported**: no continuous-render option is
+  available in this environment without new software. M9H proceeded
+  with the current runtime and validated repeated frame-lifecycle
+  behavior as thoroughly as it allows (1000 iterations of the generic
+  loop; 1 frame of real GPU render work) rather than fabricating or
+  simulating continuous rendering evidence that didn't happen.
+
+### Stale-Frame Protections (M9H)
+
+Confirmed by direct code inspection (same verification standard as
+M9F/M9G — every claim below was checked against the actual current
+source, not assumed carried over):
+- `XRFrameDriver::GetViews()` (`XRFrameDriver.cpp`) clears
+  `m_lastLocatedViews` unconditionally at the very start of every call,
+  before doing anything else, and only repopulates it if
+  `IsViewStateValid` returns true; on an invalid-view frame it returns
+  early with `m_lastLocatedViews` left empty (never stale data from a
+  previous valid frame).
+- `XRFrameDriver::EndFrame()` unconditionally resets
+  `m_pendingProjectionLayer = nullptr` after every `xrEndFrame` call,
+  regardless of whether `SetPendingProjectionLayer` was called that
+  tick — a `shouldRender=false` (or invalid-view, or count-mismatch)
+  frame that never calls `SetPendingProjectionLayer` submits zero
+  layers this tick and cannot possibly submit a previous frame's
+  pointer next tick, because that pointer no longer exists by the time
+  the next `EndFrame()` runs.
+  `TestOpenXRProjectionLayerRepreparingReplacesPreviousLayer`
+  (`tests/openxr_view_tests.cpp`, M9F) already covers the equivalent
+  guarantee one layer lower, at `OpenXRProjectionLayer::Prepare`/`Get`
+  itself.
+- The acquired-image-index vector (`acquiredIndices`) is declared fresh
+  inside the render branch on every iteration — there is no member
+  variable or static state an index could leak through between frames.
+- No acquire ever happens unless `Prepare(...)` and the view/swapchain
+  count check both succeed first (see "Error Recovery" below) — so an
+  invalid or mismatched frame never reaches the acquire loop at all,
+  and therefore can never leave an unreleased image behind.
+
+`XRFrameDriver` itself needed **zero** changes for any of this — every
+guarantee above was already correct as of M9E.5/M9F/M9G; M9H's
+contribution is re-verifying and explicitly documenting it, plus
+confirming (by construction) that the newly-extracted
+`OpenXRVulkanViewTarget` introduces no new place for staleness to hide
+(it holds no per-frame state at all — only the depth image/framebuffers
+built once at construction).
+
+### Error Recovery (M9H)
+
+Two genuinely different situations, handled differently, both reported
+honestly:
+
+1. **Expected render-skip conditions** (`shouldRender=false`, invalid
+   view state, view/swapchain count mismatch) — already handled
+   correctly, by construction: the `Prepare(...) && views.size() ==
+   swapchains.size()` gate runs *before* any `xrAcquireSwapchainImage`
+   call, so on any of these conditions nothing is ever acquired, there
+   is nothing to release, zero composition layers are submitted, and
+   the loop continues cleanly to the next `PrepareFrame()`. This *is*
+   the error-recovery story for every condition the brief lists as
+   "expected" (count mismatch, invalid views) — no additional code was
+   needed because the existing gate already produces exactly the
+   required outcome.
+2. **Unexpected mid-frame API failures** (e.g. `vkQueueSubmit` or
+   `xrAcquireSwapchainImage` itself returning an unexpected error after
+   a prior view's image was already successfully acquired) — genuinely
+   **not** recoverable under this codebase's own established
+   `CheckVkResultHere`/`CheckXrResult` idiom, which calls
+   `AR_ASSERT_MSG` → `std::abort()` immediately at the point of failure
+   (confirmed by reading `engine/core/src/Assert.cpp`: no exception is
+   thrown, so there is no `catch` block opportunity to run cleanup code
+   afterward — the process terminates at the exact line that detected
+   the failure). This fail-fast policy is deliberate and used
+   identically by every Vulkan/OpenXR demo in this codebase, not a
+   gap introduced by M9H. Building a partial-release-then-continue path
+   around it would mean replacing that codebase-wide idiom — explicitly
+   out of scope ("do not build a full exception/recovery framework").
+   Reported here as a known, deliberate limitation rather than silently
+   left undocumented: an unexpected failure between a successful
+   partial acquire and the matching release will still abort without
+   releasing the already-acquired image(s), exactly as every other
+   unexpected Vulkan/OpenXR API failure in this codebase already does.
+
+### Runtime-Independent Architecture, Reconfirmed (M9H)
+
+Grepped `engine/xr` and `engine/rendering` for any of `SteamVR`,
+`Valve`, `driver_null`, `Meta`, `Oculus`, or a vendor registry path —
+zero matches, unchanged from every prior XR milestone. The
+`shouldRender` investigation above was conducted entirely by reading
+files *outside* the repository (SteamVR's own installed config) and
+reasoning about the OpenXR spec's session-state model — nothing it
+found was translated into engine code.
+
+### Validation (M9H)
+
+All five practically-distinct `ARENGINE_ENABLE_OPENXR` ×
+`ARENGINE_ENABLE_VULKAN` configurations built and `ctest`-passed:
+ON/ON (`/EHsc /W4 /WX` clean) 15/15; ON/ON with `/EHsc /W4 /WX`
+explicitly forced via `CMAKE_CXX_FLAGS` 15/15 (same count, confirming
+the refactor introduces no new warning); ON/OFF 13/13; OFF/ON (the
+project's default configuration) 11/11; OFF/OFF 10/10. No existing test
+needed to change to keep passing — the M9F/M9G suite already covers
+stale-layer reset, count-mismatch handling, and MVP/view-matrix/
+Y-flip math (see "Tests" below for the explicit per-checklist-item
+mapping).
+
+`arengine_openxr_cube_demo` run against live SteamVR for 1000 completed
+frame-lifecycle iterations (up from M9G's 200): clean exit (code 0),
+clean session-state sequence identical in shape to every prior run
+(`IDLE → READY → SYNCHRONIZED → STOPPING → IDLE → EXITING`), 2 per-view
+render targets logged as created exactly once (not per frame), 1 frame
+rendered (`shouldRender=true` on frame 1 only, matching the
+already-documented runtime limitation), 2 views rendered, 2 draw calls,
+diagnostics reported as above. The `vkDestroyDevice` "14 leaked
+objects" validation error at shutdown reappeared, structurally
+unchanged from M9G (different `VkCommandBuffer`/`VkFence` handle
+addresses than this demo's own single reused pair, same
+`[BlankEyeBuffer]`-tagged memory) — traced the same way M9E originally
+established, confirming this refactor changed nothing about that
+already-understood, non-AREngine-attributable category. Sandbox and
+`arengine_vulkan_present_demo` both launched and ran without crashing
+(neither was touched by this milestone).
+
+**Resource-growth findings**: no per-frame `VkImageView`, framebuffer,
+or mesh-upload call exists anywhere in the loop (confirmed by
+construction — `OpenXRVulkanViewTarget` construction and
+`CreateVulkanMesh`/`CreateTextureFromPixels` all happen before the loop
+begins, and the "Created 2 per-view render target(s)" log line, which
+would print once per construction, printed exactly once across the
+1000-iteration run); the command buffer and fence are the same two
+handles for the entire run (allocated/created once, only
+reset/re-recorded, never reallocated); `acquiredIndices` is a small,
+bounded (`swapchains.size()`-length) vector, freshly constructed and
+immediately discarded each render, not an accumulating container.
+Since only one frame in this run actually exercised the real render
+path, this is a structural (by-construction) resource-growth argument,
+not an observed-over-many-real-renders one — honestly distinguished
+from a claim that repeated *real* rendering was proven leak-free, which
+would require the continuous-render environment this milestone
+established isn't available here.
+
+### Tests (M9H)
+
+Per the checklist's own 9 categories, the existing M9F/M9G suite was
+checked item by item rather than assumed sufficient:
+
+1. Stale projection-layer reset —
+   `TestOpenXRProjectionLayerRepreparingReplacesPreviousLayer` (M9F).
+2. Render-target bookkeeping — not unit-testable without a real
+   `VkDevice`/`OpenXRSwapchain` (same category as `OpenXRSwapchain`'s
+   own image-view creation, M9G: "a real Vulkan API call... not
+   unit-tested, only exercised by the manual demo"); validated by the
+   live 1000-frame run instead (constant render-target count, above).
+3. Acquired/released state transitions — same category as (2), same
+   reasoning.
+4. Repeated frame state — validated by the live 1000-frame run (no
+   crash, no hang, no session-lifecycle error across 1000 iterations),
+   not separable into a pure-logic unit.
+5. Count-mismatch behavior —
+   `TestOpenXRProjectionLayerCountMismatchProducesNoLayer` (M9F).
+6. No previous-frame data reuse — confirmed by code inspection (see
+   "Stale-Frame Protections" above) plus (1)/(5)'s existing coverage.
+7. Existing Vulkan Y-flip regression —
+   `TestApplyVulkanYFlipSymmetricInputUnchanged`/
+   `TestApplyVulkanYFlipNegatesOffCenterSkewToo`/
+   `TestApplyVulkanYFlipComposesWithAsymmetricProjection` (M9G) — all
+   still pass unchanged, confirming M9H's refactor didn't disturb them.
+8. Render-pass final-layout behavior — `VulkanRenderPass` only exposes
+   an opaque `VkRenderPass` handle (no accessor for its internal
+   `VkAttachmentDescription`s), so the `colorFinalLayout` value itself
+   isn't pure-logic-testable without either changing that class's
+   public surface (not justified by this milestone) or GPU-side
+   validation-layer capture; validated live instead (the 1000-frame
+   run reproduced zero layout-mismatch errors of the kind M9G's fix
+   addressed).
+9. View/model/MVP math — `TestViewMatrixFromPoseRH`/
+   `TestViewMatrixFromPoseRHRotated`/`TestMvpMultiplicationOrderMatters`/
+   `TestTwoEyePosesProduceDifferentMvps` (M9G), all still passing.
+
+No new `ctest` entries were added: every checklist category maps to
+either existing, still-passing test coverage or a GPU-coupled
+concern that this codebase's own established convention (M9G, and
+`OpenXRSwapchain` before it) already treats as manually-validated
+rather than unit-tested. Adding a test that only re-asserts what an
+existing test already proves, or that mocks out real GPU/OpenXR state
+to force a unit-testable shape, was judged not to be "useful" in the
+brief's own sense — consistent with "do not overbuild."
+
+### Architectural Issues Found (M9H)
+
+One real, load-bearing finding: a genuinely reusable per-view render-
+resource class cannot be promoted into either `engine/xr` or
+`engine/rendering` under the current module layering without one of
+them gaining a new dependency on the other — see "Reusable Helper
+Extraction (M9H)" above. This is not a defect to fix; it is a
+constraint this milestone respected rather than worked around, and is
+reported explicitly so a future milestone (most plausibly M10, once
+`SceneRenderer` needs to drive XR rendering for real) can make an
+informed, deliberate decision about whether to finally cross that
+boundary, rather than rediscovering the same tension from scratch. No
+other architectural issues were found — `XRFrameDriver`,
+`OpenXRProjectionLayer`, `Frame::ViewInfo`, `VulkanFramebuffers`,
+`VulkanRenderPass`, `VulkanGraphicsPipeline`, and `VulkanMesh` all
+needed zero changes to support this milestone's refactor.
+
+### Not Implemented (M9H, by design)
+
+No `SceneRenderer`/`Scene` integration, no gameplay/player/weapon/
+physics/audio/networking, no controller input or OpenXR actions, no
+hand/eye tracking, no passthrough/anchors, no AR arena calibration, no
+PBR/lighting/shadows/post-processing, no custom AR glasses integration
+— all explicitly out of scope for M9H, deferred to M10 or later per
+`docs/ROADMAP.md`. `XR_KHR_composition_layer_depth` was deliberately
+not added. No new "XRRenderer"/"RenderGraph"/"FrameGraph"/"Renderer2"
+class was created — the audit's own evidence justified exactly two
+small, narrow additions (`OpenXRVulkanViewTarget`,
+`RecordOpenXRViewRenderPass`), nothing larger.
+
+- Files changed: new `tests/OpenXRVulkanViewTarget.hpp/.cpp`;
+  `tests/openxr_cube_demo.cpp` (refactored to use the new helper,
+  raised target frame count 200 → 1000, added slow cube rotation,
+  added `FrameDiagnostics`); `tests/CMakeLists.txt`
+  (`OpenXRVulkanViewTarget.cpp` added to the `arengine_openxr_cube_demo`
+  target). No `engine/` source changed — this milestone's scope was
+  entirely the demo layer and its own newly-extracted helper.

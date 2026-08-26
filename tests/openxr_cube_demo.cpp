@@ -38,6 +38,8 @@
 #include "AREngine/Rendering/ProceduralMesh.hpp"
 #include "AREngine/Scene/Transform.hpp"
 
+#include "OpenXRVulkanViewTarget.hpp"
+
 #include "openxr/OpenXREnvironmentBlendMode.hpp"
 #include "openxr/OpenXRInstance.hpp"
 #include "openxr/OpenXRProjectionLayer.hpp"
@@ -57,9 +59,7 @@
 #include "vulkan/VulkanDepthFormat.hpp"
 #include "vulkan/VulkanDescriptorPool.hpp"
 #include "vulkan/VulkanDescriptorSetLayout.hpp"
-#include "vulkan/VulkanFramebuffers.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
-#include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanMesh.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
@@ -108,8 +108,41 @@ namespace
         VkClearColorValue{{0.12f, 0.05f, 0.05f, 1.0f}},
     };
 
-    constexpr std::uint32_t kTargetFrameCount = 200;
-    constexpr std::chrono::seconds kMaxDemoDuration{120};
+    // M9H: raised from M9G's 200 to validate the generic frame loop
+    // (PrepareFrame/BeginFrame/GetViews/EndFrame, session-state
+    // handling, and - on the frames that do render - repeated command-
+    // buffer reset/re-record and fence reuse) over a much longer run,
+    // per the milestone's explicit "at least 1000 lifecycle iterations"
+    // ask. kMaxDemoDuration raised in proportion (observed ~0.03s/frame
+    // in M9G's own run, so 1000 frames is on the order of 30s - 300s
+    // leaves ample margin without changing the safety-timeout's actual
+    // purpose, which is "never hang forever," not "target this exact
+    // duration").
+    constexpr std::uint32_t kTargetFrameCount = 1000;
+    constexpr std::chrono::seconds kMaxDemoDuration{300};
+
+    // M9H: slow, constant-rate rotation about world Up, driven by the
+    // frame driver's own elapsed clock (never a per-frame accumulator,
+    // which would drift under variable frame timing) - added per the
+    // milestone's explicit "optionally rotate slowly for repeated-frame
+    // verification" allowance, distinct from and never conflated with
+    // real head-tracking motion (M9F already established this
+    // runtime's own head poses are static - see docs/ARCHITECTURE.md).
+    constexpr float kCubeRotationRadiansPerSecond = 0.5f;
+
+    // Lightweight, std::chrono-only diagnostics - no profiler framework.
+    // Running sums + counts, averaged once at the end.
+    struct FrameDiagnostics
+    {
+        std::uint32_t framesAttempted = 0;
+        std::uint32_t framesWithShouldRenderTrue = 0;
+        std::uint32_t framesRendered = 0;
+        std::uint64_t viewsRendered = 0;
+        std::uint64_t drawCalls = 0;
+        double cpuPrepSecondsSum = 0.0;
+        double vulkanSubmitSecondsSum = 0.0;
+        std::uint32_t timedSampleCount = 0;
+    };
 }
 
 int main()
@@ -308,47 +341,42 @@ int main()
     AR_ASSERT_MSG(binding.GetPhysicalDeviceProperties().limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
         "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
 
-    // --- Per-view depth image + framebuffers. TWO independent
-    // VulkanFramebuffers instances (not one) - VulkanFramebuffers
-    // itself is built around one shared extent/depth view per instance
-    // (matching one desktop swapchain, whose images are always the
-    // same size); two eyes are two independent OpenXRSwapchains that
-    // could in principle have different extents, so each gets its own
-    // depth image + framebuffers, sized to THAT view's own real
+    // --- Per-view render targets (M9H: extracted into
+    // OpenXRVulkanViewTarget - see that header for the full ownership
+    // rationale). TWO independent instances (not one) - each owns its
+    // own depth image + framebuffer set, sized to THAT view's own real
     // swapchain extent - never hard-coded, never assumed equal across
-    // eyes even though both happen to be 1852x2056 on this runtime. ---
-    std::vector<std::unique_ptr<VulkanImage>> depthImages;
-    std::vector<std::unique_ptr<VulkanFramebuffers>> framebuffers;
-    depthImages.reserve(swapchains.size());
-    framebuffers.reserve(swapchains.size());
+    // eyes even though both happen to be 1852x2056 on this runtime.
+    // Built exactly once here, before the frame loop begins - never
+    // recreated per frame. ---
+    std::vector<std::unique_ptr<OpenXRVulkanViewTarget>> viewTargets;
+    viewTargets.reserve(swapchains.size());
     for (const std::unique_ptr<OpenXRSwapchain>& swapchain : swapchains)
     {
-        const VkExtent2D extent{swapchain->GetWidth(), swapchain->GetHeight()};
-        depthImages.push_back(std::make_unique<VulkanImage>(
-            bindingData.physicalDevice, bindingData.device, extent.width, extent.height,
-            depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            VK_IMAGE_ASPECT_DEPTH_BIT));
-        framebuffers.push_back(std::make_unique<VulkanFramebuffers>(
-            bindingData.device, renderPass.Get(), swapchain->GetImageViews(), depthImages.back()->GetView(), extent));
+        viewTargets.push_back(std::make_unique<OpenXRVulkanViewTarget>(
+            bindingData.physicalDevice, bindingData.device, renderPass.Get(), *swapchain, depthFormat));
     }
+    AR_LOG_INFO(std::format("Created {} per-view render target(s) (depth image + framebuffers each, built once)", viewTargets.size()));
 
     // --- One cube, one world transform, shared across every view -
-    // this is the invariant M9G exists to prove: N views of the SAME
-    // model, not N cube instances. Stationary (identity rotation) -
-    // "a stationary cube is preferred first because spatial stability
-    // is easier to reason about" - optional slow rotation was
-    // deliberately not added: SteamVR's null driver gives no way to
-    // visually confirm motion either way in this environment, and M9F
-    // already established this runtime's poses are static, so motion
-    // would add complexity with no way to observe its effect here. See
-    // docs/ARCHITECTURE.md, "Cube Placement (M9G)" for the pose-derived
-    // visibility check that justifies these exact numbers (not a blind
-    // guess). ---
+    // this is the invariant M9G/M9H exist to prove: N views of the SAME
+    // model, not N cube instances. Position/scale unchanged from M9G
+    // (see docs/ARCHITECTURE.md, "Cube Placement (M9G)" for the pose-
+    // derived visibility check that justifies these exact numbers).
+    // Rotation is now driven by the frame driver's own elapsed clock
+    // each frame (see kCubeRotationRadiansPerSecond above) - added in
+    // M9H specifically so a repeated-frame run has SOME independently
+    // observable evidence of change across frames, since this
+    // runtime's head poses remain static (M9F/M9G). This is motion
+    // added for repeated-frame verification, never a stand-in for real
+    // head tracking - the two are kept explicitly separate in every
+    // report this demo produces. ---
     Scene::Transform cubeTransform;
     cubeTransform.position = Math::Vec3(0.0f, 0.0f, -2.0f);
     cubeTransform.scale = Math::Vec3(0.5f, 0.5f, 0.5f);
-    AR_LOG_INFO(std::format("Cube: position=({:.2f},{:.2f},{:.2f}) scale={:.2f} (LOCAL space, stationary)",
-                             cubeTransform.position.x, cubeTransform.position.y, cubeTransform.position.z, cubeTransform.scale.x));
+    AR_LOG_INFO(std::format("Cube: position=({:.2f},{:.2f},{:.2f}) scale={:.2f} (LOCAL space, rotating {:.2f} rad/s about world Up)",
+                             cubeTransform.position.x, cubeTransform.position.y, cubeTransform.position.z, cubeTransform.scale.x,
+                             kCubeRotationRadiansPerSecond));
 
     // --- Minimal Vulkan synchronization: one reusable command buffer,
     // one fence, fully synchronous - same "correctness first, prefer a
@@ -376,9 +404,9 @@ int main()
     XRFrameDriver frameDriver(instance.Get(), session, localSpace, *primaryViewConfigType, *selectedBlendMode);
 
     std::uint32_t completedFrameCount = 0;
-    std::uint32_t renderedFrameCount = 0;
     bool exitRequested = false;
     const auto startTime = std::chrono::steady_clock::now();
+    FrameDiagnostics diag;
 
     while (true)
     {
@@ -406,6 +434,9 @@ int main()
 
         if (frameContext.timing.shouldRender)
         {
+            ++diag.framesWithShouldRenderTrue;
+            const auto prepStart = std::chrono::steady_clock::now();
+
             // Real view location - only when rendering is actually
             // requested (never call xrLocateViews unnecessarily).
             const std::vector<Frame::ViewInfo> views = frameDriver.GetViews();
@@ -414,7 +445,14 @@ int main()
             // vs-sub-image-count check (already logs a clear error and
             // fails safely on a mismatch, and views/rawViews are always
             // the same size by construction - see
-            // docs/ARCHITECTURE.md) - no redundant second check.
+            // docs/ARCHITECTURE.md) - no redundant second check. Note
+            // this gate runs BEFORE any xrAcquireSwapchainImage call -
+            // on a count mismatch or invalid-view frame, NOTHING is
+            // ever acquired, so there is nothing to release: the "avoid
+            // submitting stale data, release anything safely
+            // releasable" error-recovery goal is satisfied by
+            // construction for this case, not by a separate recovery
+            // path (see docs/ARCHITECTURE.md, "Error Recovery (M9H)").
             if (projectionLayer.Prepare(frameDriver.GetLastLocatedXrViews()) && views.size() == swapchains.size())
             {
                 CheckVkResultHere(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer");
@@ -445,62 +483,38 @@ int main()
                 vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
                     0, 1, &descriptorSet, 0, nullptr);
 
+                // M9H: slow rotation about world Up, driven by the frame
+                // driver's own elapsed clock - see kCubeRotationRadiansPerSecond.
+                cubeTransform.rotation = Math::Quaternion::FromAxisAngle(
+                    Math::Vec3(0.0f, 1.0f, 0.0f),
+                    kCubeRotationRadiansPerSecond * static_cast<float>(frameContext.timing.totalTimeSeconds));
                 const Math::Mat4 model = cubeTransform.ToMatrix();
 
                 for (std::size_t i = 0; i < views.size(); ++i)
                 {
-                    const VkExtent2D extent{swapchains[i]->GetWidth(), swapchains[i]->GetHeight()};
-
-                    std::array<VkClearValue, 2> clearValues{};
-                    clearValues[0].color = kEyeClearColors[i % kEyeClearColors.size()];
-                    clearValues[1].depthStencil = {1.0f, 0};
-
-                    VkRenderPassBeginInfo renderPassBegin{};
-                    renderPassBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-                    renderPassBegin.renderPass = renderPass.Get();
-                    renderPassBegin.framebuffer = framebuffers[i]->Get(acquiredIndices[i]);
-                    renderPassBegin.renderArea.offset = {0, 0};
-                    renderPassBegin.renderArea.extent = extent;
-                    renderPassBegin.clearValueCount = static_cast<std::uint32_t>(clearValues.size());
-                    renderPassBegin.pClearValues = clearValues.data();
-
-                    vkCmdBeginRenderPass(commandBuffer, &renderPassBegin, VK_SUBPASS_CONTENTS_INLINE);
-
-                    VkViewport viewport{};
-                    viewport.x = 0.0f;
-                    viewport.y = 0.0f;
-                    viewport.width = static_cast<float>(extent.width);
-                    viewport.height = static_cast<float>(extent.height);
-                    viewport.minDepth = 0.0f;
-                    viewport.maxDepth = 1.0f;
-                    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-
-                    VkRect2D scissor{};
-                    scissor.offset = {0, 0};
-                    scissor.extent = extent;
-                    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
                     // The real per-view pieces: viewFromWorld derived
-                    // from this view's own located pose (M9G's new
+                    // from this view's own located pose (M9G's
                     // ViewMatrixFromPoseRH - NOT worldFromView used
                     // directly), and the real asymmetric projection
                     // xrLocateViews produced (M9F), Vulkan-Y-flipped via
-                    // the SAME ApplyVulkanYFlip the desktop path uses
-                    // (now fixed to correctly negate the whole row, not
-                    // just m11 - see docs/ARCHITECTURE.md). Never
-                    // Scene::Camera, never a symmetric/60-degree
+                    // the SAME ApplyVulkanYFlip the desktop path uses.
+                    // Never Scene::Camera, never a symmetric/60-degree
                     // fallback - the runtime's own FOV is authoritative.
                     const Math::Mat4 view = Math::ViewMatrixFromPoseRH(views[i].position, views[i].orientation);
                     const Math::Mat4 projection = ApplyVulkanYFlip(views[i].projection);
-                    const MvpPushConstants pushConstants{projection * view * model, Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f)};
-                    vkCmdPushConstants(commandBuffer, pipeline.GetLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                        0, sizeof(MvpPushConstants), &pushConstants);
-                    cubeMesh->Draw(commandBuffer);
-
-                    vkCmdEndRenderPass(commandBuffer);
+                    RecordOpenXRViewRenderPass(
+                        commandBuffer, renderPass.Get(), pipeline.GetLayout(), *cubeMesh,
+                        *viewTargets[i], acquiredIndices[i],
+                        projection * view * model, Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        kEyeClearColors[i % kEyeClearColors.size()]);
+                    ++diag.drawCalls;
                 }
+                diag.viewsRendered += views.size();
 
                 CheckVkResultHere(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+
+                const auto submitStart = std::chrono::steady_clock::now();
+                diag.cpuPrepSecondsSum += std::chrono::duration<double>(submitStart - prepStart).count();
 
                 CheckVkResultHere(vkResetFences(bindingData.device, 1, &renderFence), "vkResetFences");
                 VkSubmitInfo submitInfo{};
@@ -514,10 +528,18 @@ int main()
                 // be called while GPU work targeting that image is
                 // still in flight. Same fence-based, fully-synchronous,
                 // deliberately temporary strategy M9E already
-                // documented.
+                // documented; reused unchanged across every one of this
+                // run's frames (the SAME renderFence is reset and
+                // rewaited every time, never recreated - see
+                // docs/ARCHITECTURE.md, "Fence/Synchronization Model
+                // (M9H)").
                 CheckVkResultHere(
                     vkWaitForFences(bindingData.device, 1, &renderFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()),
                     "vkWaitForFences");
+
+                const auto submitEnd = std::chrono::steady_clock::now();
+                diag.vulkanSubmitSecondsSum += std::chrono::duration<double>(submitEnd - submitStart).count();
+                ++diag.timedSampleCount;
 
                 for (const std::unique_ptr<OpenXRSwapchain>& swapchain : swapchains)
                 {
@@ -527,10 +549,10 @@ int main()
 
                 frameDriver.SetPendingProjectionLayer(projectionLayer.Get());
                 renderedThisFrame = true;
-                ++renderedFrameCount;
+                ++diag.framesRendered;
             }
 
-            const bool logSample = (completedFrameCount + 1 == 1) || ((completedFrameCount + 1) % 50 == 0);
+            const bool logSample = (completedFrameCount + 1 == 1) || ((completedFrameCount + 1) % 100 == 0);
             if (logSample)
             {
                 if (renderedThisFrame)
@@ -552,11 +574,18 @@ int main()
 
         // EndFrame() always runs - submits the projection layer set
         // above if rendering happened this tick, zero layers otherwise
-        // (shouldRender was false, or no valid views were located).
+        // (shouldRender was false, or no valid views were located) -
+        // XRFrameDriver::EndFrame() unconditionally resets its own
+        // pending-layer pointer to nullptr after every call (see
+        // XRFrameDriver.cpp), so a tick that never calls
+        // SetPendingProjectionLayer() cannot submit a previous frame's
+        // stale layer - confirmed by direct code inspection, same
+        // verification standard M9F/M9G already established.
         frameDriver.EndFrame();
 
         ++completedFrameCount;
-        if (completedFrameCount == 1 || completedFrameCount % 50 == 0)
+        ++diag.framesAttempted;
+        if (completedFrameCount == 1 || completedFrameCount % 100 == 0)
         {
             AR_LOG_INFO(std::format("Completed frame {} (rendered={}, deltaTime={:.4f}s)",
                                      completedFrameCount, renderedThisFrame, frameContext.timing.deltaTimeSeconds));
@@ -576,8 +605,17 @@ int main()
         }
     }
 
-    AR_LOG_INFO(std::format("Total completed frames: {}, rendered frames: {}, draw calls per rendered frame: {}",
-                             completedFrameCount, renderedFrameCount, swapchains.size()));
+    AR_LOG_INFO(std::format(
+        "Diagnostics: frames attempted={}, frames shouldRender=true={}, frames rendered={}, views rendered={}, draw calls={}",
+        diag.framesAttempted, diag.framesWithShouldRenderTrue, diag.framesRendered, diag.viewsRendered, diag.drawCalls));
+    if (diag.timedSampleCount > 0)
+    {
+        AR_LOG_INFO(std::format(
+            "Diagnostics: avg CPU frame-prep time={:.4f}ms, avg Vulkan submit-to-fence time={:.4f}ms (over {} rendered frame(s))",
+            1000.0 * diag.cpuPrepSecondsSum / diag.timedSampleCount,
+            1000.0 * diag.vulkanSubmitSecondsSum / diag.timedSampleCount,
+            diag.timedSampleCount));
+    }
 
     // AREngine's own submitted GPU work is already known complete (the
     // fence was waited on after every render), but the shared VkDevice
@@ -603,7 +641,12 @@ int main()
     return 0;
 
     // Destruction, in exact reverse declaration order: frameDriver
-    // (trivial - owns nothing) -> framebuffers -> depthImages ->
+    // (trivial - owns nothing) -> viewTargets (M9H: each
+    // OpenXRVulkanViewTarget destroys its own depth image + framebuffers;
+    // the OpenXRSwapchain& each one borrows is only ever read during its
+    // own destruction, never written, so destroying viewTargets before
+    // swapchains - itself still correct, reverse-declaration-order as
+    // always - is not load-bearing here, just consistent) ->
     // descriptorPool -> sampler -> texture -> cubeMesh -> commandPool
     // (frees commandBuffer implicitly) -> pipeline -> descriptorSetLayout
     // -> renderPass -> projectionLayer (trivial) -> swapchains (each
@@ -611,12 +654,12 @@ int main()
     // AREngine-owned VkImageViews first) -> localSpace (xrDestroySpace)
     // -> session (xrDestroySession) -> binding (VkDevice, then
     // VkInstance) -> instance (xrDestroyInstance) last. Every GPU
-    // resource this demo owns (framebuffers, depth images, pipeline,
-    // render pass, mesh, texture) is destroyed while the VkDevice that
-    // created it (bindingData.device, owned by `binding`) is still
-    // alive, since `binding` is declared before all of them - this
-    // ordering is a direct consequence of declaration order, not left
-    // implicit or accidental (every dependency above is satisfied by
-    // C++'s own reverse-local-destruction rule, verified against the
-    // actual declaration order in this function, not assumed).
+    // resource this demo owns (view targets, pipeline, render pass,
+    // mesh, texture) is destroyed while the VkDevice that created it
+    // (bindingData.device, owned by `binding`) is still alive, since
+    // `binding` is declared before all of them - this ordering is a
+    // direct consequence of declaration order, not left implicit or
+    // accidental (every dependency above is satisfied by C++'s own
+    // reverse-local-destruction rule, verified against the actual
+    // declaration order in this function, not assumed).
 }

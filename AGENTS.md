@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete; M9H (XR render-path hardening — reusable per-view render-resource helper extracted, 1000-frame repeated-lifecycle validation, lightweight diagnostics, continuous-shouldRender environment limitation investigated honestly) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -588,6 +588,39 @@ reported as exactly that limitation, not glossed over. See
 `docs/ARCHITECTURE.md` Section 31 for the full design, both bugs' fixes,
 and validation.
 
+**M9H hardens M9G's render path — a cleanup milestone, no new rendering
+capability.** M9G's demo code was audited first (per the milestone's own
+requirement) into reusable-infrastructure/demo-only/duplicated/
+one-frame-assumption categories; the one genuinely reusable piece (per-
+view depth image + framebuffer ownership, and the per-view render-pass
+recording sequence) was extracted into a new, narrow
+`OpenXRVulkanViewTarget` class + `RecordOpenXRViewRenderPass` free
+function (`tests/OpenXRVulkanViewTarget.hpp/.cpp`) — deliberately kept
+at the `tests/` leaf level, **not** promoted into `engine/xr` or
+`engine/rendering`, because doing so would require one of those modules
+to gain a brand-new dependency on the other (confirmed by reading their
+actual `CMakeLists.txt` link lines), which M9C/M9F/M9G each already
+deliberately chose not to do. `arengine_openxr_cube_demo`'s target
+frame count was raised from M9G's 200 to 1000 to validate the generic
+frame loop (`PrepareFrame`/`BeginFrame`/`GetViews`/`EndFrame`,
+session-state handling, command-buffer/fence reuse) over a much longer
+run — 1000/1000 frames completed cleanly against live SteamVR, same
+session-state sequence and same already-documented SteamVR-internal
+validation noise as every prior XR milestone, no new AREngine-
+attributable error. `shouldRender` was still `true` on frame 1 only;
+this was investigated as an environment-configuration question (SteamVR
+null-driver settings files read directly, zero related toggle found;
+the session never reaches `XR_SESSION_STATE_FOCUSED` in any observed
+run, the most plausible explanation) without adding any vendor-specific
+code to the engine, per the milestone's explicit instruction — reported
+as an honest, unresolved environment limitation, not worked around.
+Lightweight `std::chrono`-only performance diagnostics (frames
+attempted/rendered, views rendered, draw calls, average CPU prep/Vulkan
+submit time) were added; a slow cube rotation was added for repeated-
+frame verification, explicitly not a stand-in for head tracking. See
+`docs/ARCHITECTURE.md` Section 32 for the full audit, the module-
+boundary finding, and validation.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
@@ -613,7 +646,9 @@ for the full plan.
    XrSession/session-state/reference-space bring-up + XR swapchains/
    frame lifecycle + generic FrameDriver redesign + real view location/
    composition-layer submission + a single manually-defined cube
-   rendered into each eye's swapchain image so far (M9A–M9G)**: no
+   rendered into each eye's swapchain image, now hardened for repeated-
+   frame reuse (a reusable per-view render-resource helper, 1000-frame
+   validation, lightweight diagnostics) so far (M9A–M9H)**: no
    `xrLocateSpace` for tracking, no head/hand/eye tracking, no
    passthrough, no anchors, no `SceneRenderer`/`Scene` integration
    driving what's rendered into XR eyes (M9G's cube is defined directly
