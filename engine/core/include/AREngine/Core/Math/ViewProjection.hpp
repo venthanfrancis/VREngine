@@ -71,6 +71,33 @@ namespace AREngine::Core::Math
         return result;
     }
 
+    // Computes viewFromWorld — the matrix that transforms world-space
+    // points into a view's own local space — from that view's pose
+    // (worldFromView, expressed as a position + orientation, exactly
+    // what Frame::ViewInfo stores). Do NOT confuse the two: `position`/
+    // `orientation` describe worldFromView (where the view is, in world
+    // space); this function returns its inverse. worldFromView =
+    // Translation(position) * Rotation(orientation) for a rigid
+    // transform (no scale/shear - `orientation` is guaranteed unit-
+    // length by construction, so its rotation matrix is orthonormal);
+    // therefore viewFromWorld = Rotation(orientation)^-1 *
+    // Translation(-position) = Rotation(Conjugate(orientation)) *
+    // Translation(-position) — a closed-form rigid-transform inverse
+    // (quaternion conjugate = inverse for a unit quaternion), not a
+    // general 4x4 matrix inverse, which this engine has no need for
+    // and does not implement. Added in M9G, once real rendering
+    // (into OpenXR swapchains) first needed to turn a located view's
+    // pose into a usable view matrix — see docs/ARCHITECTURE.md,
+    // "worldFromView -> viewFromWorld Derivation (M9G)".
+    //
+    // Worked example: eye at (1,0,0), identity orientation. A world
+    // point at (1,0,-2) becomes (0,0,-2) in view space — translate by
+    // -1 on X (cancelling the eye's own offset), no rotation needed.
+    [[nodiscard]] inline Mat4 ViewMatrixFromPoseRH(const Vec3& position, const Quaternion& orientation)
+    {
+        return Mat4::Rotation(Conjugate(orientation)) * Mat4::Translation(-position);
+    }
+
     // A right-handed, zero-to-one-depth perspective projection with an
     // asymmetric (off-center) frustum — the general case
     // PerspectiveRH_ZO's symmetric formula is a special case of. Added

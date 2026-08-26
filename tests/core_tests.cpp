@@ -136,6 +136,33 @@ namespace
         Check(Rotate(Quaternion::Identity(), kWorldForward) == kWorldForward, "Rotate by identity leaves a vector unchanged");
     }
 
+    void TestQuaternionConjugate()
+    {
+        // Added in M9G, for deriving a view matrix from a located
+        // view's pose. Identity is its own conjugate/inverse.
+        Check(Conjugate(Quaternion::Identity()) == Quaternion::Identity(), "Conjugate of identity is identity");
+
+        // A deliberately per-component-nonzero quaternion (not
+        // identity, so this would actually catch a sign-flip-on-the-
+        // wrong-component bug).
+        const Quaternion q(0.5f, 0.1f, 0.2f, 0.3f);
+        const Quaternion conjugate = Conjugate(q);
+        CheckNearlyEqual(conjugate.w, 0.5f, "Conjugate: w unchanged");
+        CheckNearlyEqual(conjugate.x, -0.1f, "Conjugate: x negated");
+        CheckNearlyEqual(conjugate.y, -0.2f, "Conjugate: y negated");
+        CheckNearlyEqual(conjugate.z, -0.3f, "Conjugate: z negated");
+
+        // The defining property that makes Conjugate usable as a
+        // rotation inverse: q * Conjugate(q) == Identity, for a unit
+        // quaternion.
+        const Quaternion yaw90 = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f);
+        const Quaternion shouldBeIdentity = yaw90 * Conjugate(yaw90);
+        CheckNearlyEqual(shouldBeIdentity.w, 1.0f, "q * Conjugate(q): w is 1 (identity)");
+        CheckNearlyEqual(shouldBeIdentity.x, 0.0f, "q * Conjugate(q): x is 0 (identity)");
+        CheckNearlyEqual(shouldBeIdentity.y, 0.0f, "q * Conjugate(q): y is 0 (identity)");
+        CheckNearlyEqual(shouldBeIdentity.z, 0.0f, "q * Conjugate(q): z is 0 (identity)");
+    }
+
     void TestMat4TransformFactories()
     {
         const Mat4 translation = Mat4::Translation(Vec3(2.0f, 3.0f, 4.0f));
@@ -315,6 +342,89 @@ namespace
         CheckNearlyEqual(farPoint.z / farPoint.w, 1.0f, "PerspectiveOffCenterRH_ZO: far plane maps to NDC depth 1");
     }
 
+    void TestViewMatrixFromPoseRH()
+    {
+        // The milestone's own worked example: eye offset along +X only,
+        // identity orientation - transforming a world point should just
+        // cancel the eye's own X offset, changing nothing else.
+        const Mat4 view = ViewMatrixFromPoseRH(Vec3(1.0f, 0.0f, 0.0f), Quaternion::Identity());
+        const Vec3 viewPoint = TransformPoint(view, Vec3(1.0f, 0.0f, -2.0f));
+        CheckNearlyEqual(viewPoint.x, 0.0f, "ViewMatrixFromPoseRH: eye's own X offset is cancelled");
+        CheckNearlyEqual(viewPoint.y, 0.0f, "ViewMatrixFromPoseRH: Y unchanged");
+        CheckNearlyEqual(viewPoint.z, -2.0f, "ViewMatrixFromPoseRH: Z unchanged (identity orientation)");
+
+        // Sanity: transforming the eye's own world position must always
+        // land at the view-space origin, regardless of pose - this is
+        // what "view space is centered on the eye" means.
+        const Vec3 eyeInView = TransformPoint(view, Vec3(1.0f, 0.0f, 0.0f));
+        CheckNearlyEqual(eyeInView.x, 0.0f, "ViewMatrixFromPoseRH: the eye itself maps to the view-space origin (x)");
+        CheckNearlyEqual(eyeInView.y, 0.0f, "ViewMatrixFromPoseRH: the eye itself maps to the view-space origin (y)");
+        CheckNearlyEqual(eyeInView.z, 0.0f, "ViewMatrixFromPoseRH: the eye itself maps to the view-space origin (z)");
+    }
+
+    void TestViewMatrixFromPoseRHRotated()
+    {
+        // Eye at the origin, yawed 90 degrees (reusing the exact yaw90
+        // already established in TestQuaternionRotate: Right rotates
+        // onto Forward - i.e. this eye's own world-space forward
+        // direction is now -kWorldRight = (-1,0,0)). A world point
+        // directly in front of this rotated eye must land on view-space
+        // -Z ("straight ahead"), proving rotation - not just
+        // translation - is correctly inverted.
+        const Quaternion yaw90 = Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f);
+        const Mat4 view = ViewMatrixFromPoseRH(Vec3(0.0f, 0.0f, 0.0f), yaw90);
+        const Vec3 viewPoint = TransformPoint(view, Vec3(-1.0f, 0.0f, 0.0f));
+        CheckNearlyEqual(viewPoint.x, 0.0f, "ViewMatrixFromPoseRH (rotated): point directly ahead has view-space x=0");
+        CheckNearlyEqual(viewPoint.y, 0.0f, "ViewMatrixFromPoseRH (rotated): point directly ahead has view-space y=0");
+        CheckNearlyEqual(viewPoint.z, -1.0f, "ViewMatrixFromPoseRH (rotated): point directly ahead is at view-space -Z (in front)");
+    }
+
+    void TestMvpMultiplicationOrderMatters()
+    {
+        // model translates the origin to (1,0,0); "view" here is a pure
+        // 90-degree yaw (testing composition order itself, not full
+        // view-matrix semantics - reuses the exact yaw90 fact already
+        // established in TestQuaternionRotate/TestMat4TransformFactories);
+        // projection is identity. The CORRECT order (projection*view*model)
+        // translates first, then rotates - the translated point actually
+        // moves under rotation. The WRONG order (model*view*projection)
+        // rotates first (rotating the origin does nothing), then
+        // translates - a completely different result. This tells the
+        // two orders apart by their actual output, not just by
+        // asserting the intended one "works."
+        const Mat4 model = Mat4::Translation(Vec3(1.0f, 0.0f, 0.0f));
+        const Mat4 view = Mat4::Rotation(Quaternion::FromAxisAngle(kWorldUp, std::numbers::pi_v<float> / 2.0f));
+        const Mat4 projection = Mat4::Identity();
+
+        const Vec4 correctResult = (projection * view * model) * Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        CheckNearlyEqual(correctResult.x, 0.0f, "MVP order (proj*view*model): translated-then-rotated point has x=0");
+        CheckNearlyEqual(correctResult.z, -1.0f, "MVP order (proj*view*model): translated-then-rotated point has z=-1");
+
+        const Vec4 wrongResult = (model * view * projection) * Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        CheckNearlyEqual(wrongResult.x, 1.0f, "MVP order (WRONG model*view*proj): rotated-then-translated origin has x=1 (visibly different)");
+        CheckNearlyEqual(wrongResult.z, 0.0f, "MVP order (WRONG model*view*proj): rotated-then-translated origin has z=0 (visibly different)");
+    }
+
+    void TestTwoEyePosesProduceDifferentMvps()
+    {
+        // Same model, same projection, two different eye positions (a
+        // small, IPD-scale offset - mirroring the real M9F/M9G evidence:
+        // two views, only their pose differs) - the resulting MVPs must
+        // differ, proving the "one model, N views" pipeline actually
+        // uses each view's own pose, not accidentally sharing one view
+        // matrix across both eyes.
+        const Mat4 model = Mat4::Translation(Vec3(0.0f, 0.0f, -2.0f));
+        const Mat4 projection = PerspectiveRH_ZO(std::numbers::pi_v<float> / 2.0f, 1.0f, 0.1f, 100.0f);
+
+        const Mat4 viewLeft = ViewMatrixFromPoseRH(Vec3(-0.03f, 0.0f, 0.0f), Quaternion::Identity());
+        const Mat4 viewRight = ViewMatrixFromPoseRH(Vec3(0.03f, 0.0f, 0.0f), Quaternion::Identity());
+
+        const Mat4 mvpLeft = projection * viewLeft * model;
+        const Mat4 mvpRight = projection * viewRight * model;
+
+        Check(!(mvpLeft == mvpRight), "Two different eye poses produce two different MVPs for the same model transform");
+    }
+
     void TestModelViewProjectionComposition()
     {
         // The exact fixed camera M8F's demo uses: eye at (0,0,3),
@@ -357,12 +467,17 @@ int main()
     TestQuaternionFromAxisAngle();
     TestQuaternionMultiplication();
     TestQuaternionRotate();
+    TestQuaternionConjugate();
     TestMat4TransformFactories();
     TestLookAtRH();
     TestPerspectiveRH_ZO();
     TestPerspectiveOffCenterRH_ZOSymmetricCaseMatchesPerspectiveRH_ZO();
     TestPerspectiveOffCenterRH_ZOAsymmetricFrustumBoundaries();
     TestPerspectiveOffCenterRH_ZODepthMapping();
+    TestViewMatrixFromPoseRH();
+    TestViewMatrixFromPoseRHRotated();
+    TestMvpMultiplicationOrderMatters();
+    TestTwoEyePosesProduceDifferentMvps();
     TestModelViewProjectionComposition();
     TestEvent();
 

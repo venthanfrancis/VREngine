@@ -62,6 +62,13 @@ namespace AREngine::XR::OpenXR
     //     destroyed by this class, and are never backed by
     //     application-allocated VkDeviceMemory. This class only ever
     //     reads them (GetImages()), never destroys or reallocates them.
+    //   - DOES own the VkImageViews it creates over those images (M9G) -
+    //     AREngine-owned views over OpenXR-owned images, per the
+    //     ownership split M9E's own comments already anticipated ("If
+    //     image views are not already created/cached by OpenXRSwapchain,
+    //     add the smallest clean capability needed"). Destroyed in this
+    //     object's destructor, before xrDestroySwapchain - see
+    //     docs/ARCHITECTURE.md, "OpenXR Swapchain Image Views (M9G)".
     //
     // Not copyable or movable: exactly one XrSwapchain per
     // OpenXRSwapchain, destroyed exactly once (xrDestroySwapchain), by
@@ -69,22 +76,32 @@ namespace AREngine::XR::OpenXR
     class OpenXRSwapchain
     {
     public:
+        // `device` (new in M9G) is needed to create the per-image
+        // VkImageViews below - borrowed, not owned (same discipline as
+        // every other Vulkan handle this codebase borrows rather than
+        // owns; the caller's OpenXRVulkanGraphicsBinding/session already
+        // keep the real VkDevice alive for at least as long as any
+        // OpenXRSwapchain constructed from it).
+        //
         // `usageFlags` defaults to COLOR_ATTACHMENT + TRANSFER_DST:
         // COLOR_ATTACHMENT because this is a color swapchain the
-        // compositor will read, TRANSFER_DST specifically because M9E's
-        // minimal per-eye proof-of-life uses vkCmdClearColorImage, which
-        // requires VK_IMAGE_USAGE_TRANSFER_DST_BIT on the target image
-        // (XrSwapchainUsageFlags bits map directly onto the
-        // corresponding VkImageUsageFlags bits for a Vulkan-backed
-        // swapchain, per the OpenXR spec). No SAMPLED bit - nothing in
-        // M9E samples from these images. `sampleCount`/`width`/`height`
-        // must come from the runtime's own XrViewConfigurationView
+        // compositor will read (and, as of M9G, an actual render-pass
+        // color attachment), TRANSFER_DST because M9E's per-eye proof-
+        // of-life used vkCmdClearColorImage, which requires
+        // VK_IMAGE_USAGE_TRANSFER_DST_BIT (XrSwapchainUsageFlags bits
+        // map directly onto the corresponding VkImageUsageFlags bits for
+        // a Vulkan-backed swapchain, per the OpenXR spec) - kept as the
+        // default so M9E's own demo is unaffected; M9G's render-pass-
+        // based clear doesn't strictly need it but the flag is harmless
+        // to keep set. No SAMPLED bit - nothing in this engine samples
+        // from these images (yet). `sampleCount`/`width`/`height` must
+        // come from the runtime's own XrViewConfigurationView
         // (recommendedSwapchainSampleCount/recommendedImageRectWidth/
         // recommendedImageRectHeight) - never hard-coded. `faceCount`
         // and `arraySize` are always 1 (one view per swapchain, not a
         // cubemap); `mipCount` is always 1 (no mipmapping for a
         // compositor target).
-        OpenXRSwapchain(XrInstance instance, XrSession session, std::int64_t format,
+        OpenXRSwapchain(XrInstance instance, XrSession session, VkDevice device, std::int64_t format,
                          std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
                          XrSwapchainUsageFlags usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT);
         ~OpenXRSwapchain();
@@ -96,16 +113,21 @@ namespace AREngine::XR::OpenXR
 
         [[nodiscard]] XrSwapchain Get() const { return m_swapchain; }
         [[nodiscard]] const std::vector<VkImage>& GetImages() const { return m_images; }
+        // AREngine-owned VkImageViews, one per image in GetImages(), same
+        // order/index. See the class comment above for ownership.
+        [[nodiscard]] const std::vector<VkImageView>& GetImageViews() const { return m_imageViews; }
         [[nodiscard]] std::int64_t GetFormat() const { return m_format; }
         [[nodiscard]] std::uint32_t GetWidth() const { return m_width; }
         [[nodiscard]] std::uint32_t GetHeight() const { return m_height; }
 
     private:
         XrInstance m_instance = XR_NULL_HANDLE; // borrowed, not owned
+        VkDevice m_device = VK_NULL_HANDLE; // borrowed, not owned
         XrSwapchain m_swapchain = XR_NULL_HANDLE;
         std::int64_t m_format = 0;
         std::uint32_t m_width = 0;
         std::uint32_t m_height = 0;
         std::vector<VkImage> m_images; // OpenXR-owned - never destroyed by this class
+        std::vector<VkImageView> m_imageViews; // AREngine-owned - destroyed by this class, before xrDestroySwapchain
     };
 }

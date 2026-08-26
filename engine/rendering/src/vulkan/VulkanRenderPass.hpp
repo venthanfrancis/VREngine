@@ -27,7 +27,16 @@ namespace AREngine::Rendering::Vulkan
     class VulkanRenderPass
     {
     public:
-        VulkanRenderPass(VkDevice device, VkFormat swapchainImageFormat, VkFormat depthFormat);
+        // colorFinalLayout defaults to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        // correct for the desktop VulkanSwapchain/vkQueuePresentKHR
+        // path every call site used before M9G. OpenXR-owned swapchain
+        // images are never presented via vkQueuePresentKHR - that
+        // layout is meaningless for them and validation-layer-rejected
+        // (see docs/ARCHITECTURE.md, "VulkanRenderPass colorFinalLayout
+        // Generalization (M9G)") - so the M9G XR cube demo passes
+        // VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL explicitly instead.
+        VulkanRenderPass(VkDevice device, VkFormat swapchainImageFormat, VkFormat depthFormat,
+                          VkImageLayout colorFinalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         ~VulkanRenderPass();
 
         VulkanRenderPass(const VulkanRenderPass&) = delete;

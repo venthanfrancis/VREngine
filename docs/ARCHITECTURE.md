@@ -6010,3 +6010,396 @@ source changed). `arengine_openxr_frame_demo` rerun twice against live
 SteamVR: raw/converted positions identical and stable across both runs
 (see above), composition layer still accepted (no `CheckXrResult`
 failure, no crash), 200/200 frames both runs, exit code 0 both times.
+
+## 31. M9G Implementation Notes
+
+M9G renders AREngine's first real 3D geometry — a cube, reusing M8H's
+exact mesh/pipeline infrastructure unchanged — into each eye's real
+OpenXR-owned Vulkan swapchain image, using the real per-view pose
+`xrLocateViews` produces (inverted into a proper view matrix) and the
+real asymmetric per-view projection M9F already produces, submitted
+through the existing `XrCompositionLayerProjection` path. This is the
+low-level XR render path proven end to end, deliberately before any
+`SceneRenderer`/`Scene` integration exists.
+
+### ViewInfo Sufficiency, Reconfirmed (M9G)
+
+M9F already concluded `Frame::ViewInfo` needed zero structural changes
+and explicitly deferred the "does a real renderer need more?" question
+to whenever one first existed. M9G is that renderer, and the answer is
+still no: `position`/`orientation` (a pose) is exactly what
+`ViewMatrixFromPoseRH` (below) needs, and `projection` is exactly what
+`ApplyVulkanYFlip` needs. Consistent with `Scene::Camera`'s own
+"derive on demand, don't duplicate stored data" precedent, the new
+capability is a free function (`Core::Math::ViewMatrixFromPoseRH`), not
+a field — `ViewInfo` itself is untouched by this milestone.
+
+### View-Pose Semantics and the Rigid-Transform-Inverse View Matrix (M9G)
+
+`ViewInfo.position`/`.orientation` represent `worldFromView =
+Translation(position) * Rotation(orientation)` — the pose that places
+the eye in the world, **not** the matrix rendering needs. Rendering
+needs `viewFromWorld`, its inverse. Because this is a rigid transform
+(pure rotation + translation, `orientation` guaranteed unit-length),
+the inverse has a closed form and does **not** require a general 4×4
+matrix inverse:
+
+```cpp
+// Quaternion.hpp
+[[nodiscard]] constexpr Quaternion Conjugate(const Quaternion& q) {
+    return Quaternion(q.w, -q.x, -q.y, -q.z);
+}
+
+// ViewProjection.hpp
+[[nodiscard]] inline Mat4 ViewMatrixFromPoseRH(const Vec3& position, const Quaternion& orientation) {
+    return Mat4::Rotation(Conjugate(orientation)) * Mat4::Translation(-position);
+}
+```
+
+`Conjugate(q) = q^-1` for any unit quaternion — a standard identity,
+used here (rather than a general matrix inverse) precisely because
+`orientation` is always unit-length by construction. Verified three
+independent ways before implementation: (1) term-by-term, confirming
+`Rotation(Conjugate(q))` is exactly `Rotation(q)`'s transpose, which
+equals its inverse for a pure rotation; (2) a worked numeric example —
+eye at world `(1,0,0)`, identity orientation; world point `(1,0,-2)`
+transforms to view-space `(0,0,-2)` exactly, matching intuition (the
+eye's own local -Z axis, at the expected distance) — now a permanent
+regression test (`TestViewMatrixFromPoseRH`); (3) propagated through
+M9F's actual observed null-driver pose (`orientation =
+(w=0,x=0,y=0,z=-1)`, a 180°-about-Z rotation) to confirm a world-space
+cube at `(0,0,-2)` genuinely lands at negative view-space Z (visible,
+per `PerspectiveOffCenterRH_ZO`'s `w=-z` convention) under this
+runtime's specific default pose — the cube's placement (below) is a
+verified choice, not a guess.
+
+Naming is deliberately backend-neutral (`ViewMatrixFromPoseRH`, not
+`OpenXRViewMatrix`) and lives in `Core::Math` — `Core` must not know
+OpenXR exists, and this is exactly the same rigid-pose-to-matrix
+operation `Scene::Camera::GetViewMatrix` already performs for desktop,
+just extracted so both call sites share it in spirit (not literally
+merged — `Camera` composes from a `Scene::Transform`, `ViewInfo` from a
+raw pose — but the underlying math and its correctness argument are
+identical).
+
+### The ApplyVulkanYFlip Row-1 Bug (found and fixed, M9G)
+
+Before this milestone, `ApplyVulkanYFlip` (`VulkanClipSpace.cpp`, M8F)
+negated exactly one matrix element:
+
+```cpp
+projection.Set(1, 1, -projection.At(1, 1));   // old
+```
+
+This was only ever correct because every projection built before M9G
+was symmetric — `PerspectiveRH_ZO`'s off-center skew term (`m12`) is
+always exactly 0 for a symmetric frustum. M9F's
+`PerspectiveOffCenterRH_ZO` produces a genuinely nonzero `m12` whenever
+`angleUp ≠ -angleDown` (the general case for a real HMD's per-eye FOV).
+Since `clip.y = m10*x + m11*y + m12*z + m13*w` for any matrix with a
+nonzero row-1, negating only `m11` produces `clip.y = -m11*y + m12*z`
+instead of the required `-(m10*x + m11*y + m12*z + m13*w)` — a real,
+previously-latent bug, caught by design review (independently
+re-deriving the math from `Mat4::operator*(Mat4,Vec4)` and
+`PerspectiveOffCenterRH_ZO`'s actual source) before it ever ran against
+real asymmetric data. Fixed by negating the entire row:
+
+```cpp
+projection.Set(1, 0, -projection.At(1, 0));
+projection.Set(1, 1, -projection.At(1, 1));
+projection.Set(1, 2, -projection.At(1, 2));
+projection.Set(1, 3, -projection.At(1, 3));
+```
+
+Backward-compatible **by construction**: every desktop call site builds
+a symmetric projection, where `m10`/`m12`/`m13` are already 0 — negating
+0 is 0, so the output is bit-for-bit identical to the old single-element
+version for every existing caller. `tests/vulkan_tests.cpp` gained a
+regression test proving exactly that
+(`TestApplyVulkanYFlipSymmetricInputUnchanged`), plus two tests that
+would have caught the bug directly: `TestApplyVulkanYFlipNegatesOffCenterSkewToo`
+(a synthetic all-nonzero row-1 input, confirming all four terms get
+negated) and `TestApplyVulkanYFlipComposesWithAsymmetricProjection`
+(an end-to-end check against a real `PerspectiveOffCenterRH_ZO` matrix,
+confirming `flipped.y == -original.y` exactly).
+
+**Culling/front-face needs no change.** `VK_CULL_MODE_BACK_BIT`/
+`VK_FRONT_FACE_CLOCKWISE` (M8H, baked into `VulkanGraphicsPipeline`) was
+re-examined, not just assumed safe: the off-center shear terms
+(`m02`/`m12`) are additive per-vertex-Z offsets, not functions of the
+local `(x,y)` Jacobian that determines 2D screen-space winding — they
+cannot flip winding. Only the row-1 negation affects winding, and that
+operation is unchanged in *kind* (now just correctly complete) from
+what M8F already established as compatible with `VK_FRONT_FACE_CLOCKWISE`.
+This reasoning depends on the row-1 fix above being applied — the old
+half-flip's effect on winding was not cleanly characterizable and was
+not relied upon.
+
+### The VulkanRenderPass colorFinalLayout Bug (found and fixed during live validation, M9G)
+
+Not part of the original design — found only once the cube demo
+actually ran against live SteamVR. `VulkanRenderPass` (M8C) hard-coded
+its color attachment's `finalLayout` to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`,
+correct for every desktop caller (`tests/vulkan_present_demo.cpp`),
+whose swapchain images are eventually handed to `vkQueuePresentKHR`.
+OpenXR-owned swapchain images are **never** presented that way —
+`VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` requires `VK_KHR_swapchain`-semantics
+this compositor path doesn't have, and the validation layer rejected it
+outright (`vkCreateRenderPass(): pCreateInfo->pAttachments[0].finalLayout
+... requires the extension VK_KHR_swapchain`), with the resulting layout
+mismatch then failing every subsequent `vkQueueSubmit` for that image.
+
+Generalized rather than duplicated (mirroring the same reuse-first
+philosophy already applied to `OpenXRSwapchain`/`VulkanFramebuffers`):
+`VulkanRenderPass` gained a fourth constructor parameter,
+`VkImageLayout colorFinalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` —
+the default preserves every existing desktop call site exactly (both
+`vulkan_present_demo.cpp` and every other caller omit the new
+parameter, unchanged). `openxr_cube_demo.cpp` passes
+`VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` explicitly — correct because
+nothing downstream of AREngine's own render pass needs a specific final
+layout for an OpenXR-owned image; the compositor consumes it directly.
+After this fix, the render pass creates cleanly and every subsequent
+frame's `vkQueueSubmit` and `xrReleaseSwapchainImage` succeed with no
+AREngine-attributable validation error.
+
+### Depth Strategy and Framebuffer Granularity (M9G)
+
+OpenXR provides no depth image (`XR_KHR_composition_layer_depth` is not
+enabled or needed here) — AREngine owns one depth `VulkanImage` per eye,
+sized to that eye's own swapchain extent (found supported format via
+the existing `FindSupportedDepthFormat`, M8F, reused unchanged).
+
+Framebuffers are **two independent `VulkanFramebuffers` instances**, not
+one shared instance — `VulkanFramebuffers` is built around one shared
+extent/depth-view per instance (matching one desktop swapchain, whose
+images are always uniform size); the two eyes are independent
+`OpenXRSwapchain`s that could in principle report different extents
+(never assumed equal here, even though both happened to be 1852×2056 on
+the test runtime). `VulkanRenderPass`/`VulkanGraphicsPipeline`/
+`VulkanDescriptorSetLayout`, by contrast, depend only on *format*, not
+extent, and are safely shared across both eyes — one instance of each,
+reused for both framebuffers.
+
+### OpenXRSwapchain Gains AREngine-Owned Image Views (M9G)
+
+`OpenXRSwapchain`'s constructor gained a required `VkDevice device`
+parameter; after enumerating the runtime's own `VkImage`s (unchanged),
+it now creates one `VkImageView` per image — `VK_IMAGE_VIEW_TYPE_2D`,
+this swapchain's own format, `VK_IMAGE_ASPECT_COLOR_BIT`, 1 mip, 1
+layer, identity swizzle — mirroring `VulkanSwapchain.cpp`'s own
+image-view creation exactly. New `GetImageViews() ->
+const std::vector<VkImageView>&`. The destructor destroys these views
+(AREngine-owned) **before** `xrDestroySwapchain` (which owns the
+`VkImage`s/`XrSwapchain` itself) — the same "OpenXR owns `VkImage`,
+AREngine may own `VkImageView`" split already documented for M9E's
+swapchain, now actually exercised.
+
+### Vulkan Command Recording and Synchronization (M9G)
+
+One command buffer, one fence, fully synchronous — the same
+"correctness first," deliberately temporary strategy M9E already
+established and documented, reused rather than redesigned. Per
+rendering frame: acquire + wait both swapchain images first; bind
+pipeline/mesh/descriptor-set **once**, before the first eye's render
+pass (confirmed via Vulkan-spec review that bound state survives
+`vkCmdEndRenderPass` → `vkCmdBeginRenderPass` within one command
+buffer, so no per-eye rebinding is needed); then per eye: begin render
+pass, set dynamic viewport/scissor from that eye's own extent, push
+`MvpPushConstants{ApplyVulkanYFlip(views[i].projection) *
+ViewMatrixFromPoseRH(views[i].position, views[i].orientation) * model,
+tint}`, draw, end render pass. One submit, one fence wait, then release
+both images — `xrReleaseSwapchainImage` never runs while GPU work
+targeting that image could still be in flight.
+
+At shutdown, a `vkDeviceWaitIdle` was added before tearing down any
+Vulkan resource (matching `vulkan_present_demo.cpp`'s own shutdown
+discipline) — AREngine's own submitted work is already known complete
+by the per-frame fence wait, but the shared `VkDevice` (handed to the
+runtime via `XR_KHR_vulkan_enable2`) may still have SteamVR's own
+in-flight compositor work on it. See "SteamVR-Internal Vulkan
+Validation Noise, Continued (M9G)" below for what this did and didn't
+change.
+
+### One Model, Multiple Views (M9G)
+
+One `Scene::Transform cubeTransform` (position `(0,0,-2)`, scale `0.5`,
+identity rotation — LOCAL space, stationary), one `model =
+cubeTransform.ToMatrix()` computed once per frame — never once per eye,
+never one cube instance per eye. Each eye's MVP is computed as
+`projection_i * view_i * model` (never the reverse order — a dedicated
+test, `TestMvpMultiplicationOrderMatters`, confirms `model * view *
+proj` gives a different, wrong result for the same inputs), and a
+second test (`TestTwoEyePosesProduceDifferentMvps`) confirms the same
+shared `model` genuinely produces two different MVPs when combined with
+two different eye poses — proving the "one world object, N views"
+pipeline is wired correctly, not just assumed. View order is preserved
+exactly as the runtime provides it (`view[0]` → `swapchains[0]`,
+`view[1]` → `swapchains[1]`, matching the same discipline M9F's
+diagnostic review already established for this codebase) — no
+sign-based or identity-based reordering anywhere.
+
+### Render-Gate Reuse, Not a New Check (M9G)
+
+Rather than adding an independent view-count-vs-swapchain-count check,
+the demo reuses `OpenXRProjectionLayer::Prepare(const
+std::vector<XrView>&) -> bool` (M9F) directly as the render gate:
+`if (projectionLayer.Prepare(frameDriver.GetLastLocatedXrViews()) &&
+views.size() == swapchains.size())`. `Prepare` already logs a clear
+error and returns `false` safely on a count mismatch without indexing
+blindly; `views` and the raw located `XrView`s are always the same size
+by construction (both derived from the same `xrLocateViews` call inside
+`XRFrameDriver::GetViews()`), so no redundant second check was added.
+When `shouldRender` is false, or `Prepare` fails: no acquire, no GPU
+submission, zero composition layers, `EndFrame()` still runs — unchanged
+from M9E/M9F.
+
+### Vulkan Reuse Report (M9G)
+
+Reused **completely unchanged**: `VulkanMesh`/`CreateVulkanMesh`,
+`VulkanImage` (for both the depth images and the existing M8E
+checkerboard texture), `VulkanDescriptorSetLayout`/`VulkanDescriptorPool`/
+`VulkanSampler`, `VulkanCommandPool`, `MvpPushConstants`,
+`GenerateCheckerboardRGBA8`/`CreateTextureFromPixels`,
+`FindSupportedDepthFormat`, `VulkanGraphicsPipeline`.
+
+Reused with a **small, backward-compatible generalization**:
+`VulkanRenderPass` (new `colorFinalLayout` parameter, default-preserved
+— see above), `OpenXRSwapchain` (new `VkDevice` parameter + cached
+image views — see above). `VulkanFramebuffers` itself needed **no**
+change — it was already generic (`device, renderPass,
+vector<VkImageView>, depthView, extent`), just instantiated twice
+instead of once.
+
+**New, not reused**: `Core::Math::Conjugate`/`ViewMatrixFromPoseRH` —
+Core math, not XR-specific, following the same "no OpenXR types leak
+into Core" rule already established.
+
+### New Demo: openxr_cube_demo.cpp, Not Extending openxr_frame_demo.cpp (M9G)
+
+A new, self-contained `tests/openxr_cube_demo.cpp` (not part of
+`ctest`, same manual-validation convention as every other OpenXR demo)
+rather than extending `openxr_frame_demo.cpp`: the latter is already a
+complete, coherent frame-lifecycle/view-location diagnostic at roughly
+650 lines; adding a full render pass/pipeline/depth/descriptor-set/mesh
+setup on top would have doubled it and mixed two concerns that this
+codebase otherwise keeps as separate, self-contained leaf demos (the
+same pattern `vulkan_present_demo.cpp` and `openxr_frame_demo.cpp`
+already establish independently of each other). `openxr_cube_demo.cpp`
+reaches directly into both `engine/xr/src/openxr/*` and
+`engine/rendering/src/vulkan/*` private headers — the first demo to
+cross both boundaries in one file, explicitly permitted by this
+milestone's brief ("the M9G demo may coordinate these systems
+directly"). Neither `engine/xr` nor `engine/rendering` gained a new
+*library-level* dependency on each other — only this leaf demo target
+links both.
+
+### SteamVR-Internal Vulkan Validation Noise, Continued (M9G)
+
+The same category of noise M9E/M9E.5/M9F already traced conclusively to
+SteamVR's own compositor internals (not AREngine's code) reappears here,
+now with more objects — expected, since M9G is the first milestone to
+submit real rendering work on the shared `VkDevice`, giving SteamVR's
+compositor correspondingly more of its own internal work to do:
+`vkCreateImage`/`PREINITIALIZED` warnings during session start, and at
+shutdown, a `vkDestroyDevice` "N leaked objects" validation error
+listing several `VkCommandBuffer`/`VkFence`/`VkDeviceMemory` handles
+(one explicitly tagged `[BlankEyeBuffer]`). Traced the same way M9E
+established: this demo allocates exactly one command buffer (freed via
+`VulkanCommandPool`'s destructor) and one fence (`vkDestroyFence`,
+explicit, before `vkDeviceWaitIdle`'s caller returns) — the leaked list
+names three *different* command-buffer addresses and four different
+fences across a single run, structurally ruling out AREngine's own
+single, reused handles. Adding `vkDeviceWaitIdle` before any teardown
+(new in M9G, matching `vulkan_present_demo.cpp`'s own shutdown
+discipline) is still correct hygiene and was kept, but — consistent
+with this being SteamVR's own internal bookkeeping rather than a
+synchronization gap in AREngine's own code — it did not make the
+message disappear, which is itself further evidence for, not against,
+the M9E-established conclusion. **AREngine's own Vulkan usage in M9G
+produced zero validation errors or warnings traced to its own handles.**
+
+### Spatial Stability and Visual Verification Limits (M9G)
+
+`shouldRender` was `true` only on frame 1 of this 200-frame run — the
+same SteamVR/null-driver behavior M9E and M9F already documented, not a
+regression introduced here. Consequently only frame 1 actually
+rendered (`renderedFrameCount == 1`, 2 draw calls), and no
+frame-to-frame pose comparison is possible on this runtime — the same
+honest limitation M9F already reported, reconfirmed rather than
+re-litigated. The cube's position and both eyes' real, distinct
+per-view poses (`(0.0315,0,0)` / `(-0.0315,0,0)`, a plausible ≈63mm IPD
+split) were logged on the one frame that did render, confirming real
+per-view data reached the render call. SteamVR's null driver has no
+window or visual output in this environment, so **this milestone
+reports code-path correctness (the right matrices, in the right order,
+from the right data, submitted through the right composition layer) —
+it does not and cannot claim a human visually confirmed a stereo cube**,
+consistent with the brief's own instruction not to claim visual
+verification that didn't happen. Optional cube rotation (to make
+motion visible independent of head tracking) was deliberately not
+implemented, per the brief's stated preference for a stationary cube
+first and because this runtime offers no way to visually confirm
+rotation either way.
+
+### Validation (M9G)
+
+All four `ARENGINE_ENABLE_OPENXR` × `ARENGINE_ENABLE_VULKAN`
+combinations: full build succeeds, `/EHsc /W4 /WX` clean (verified on
+ON/ON), `ctest` green on every combination (ON/ON: 15/15 — 5 new pure-
+logic tests over M9F's count: `TestQuaternionConjugate`,
+`TestViewMatrixFromPoseRH`, `TestViewMatrixFromPoseRHRotated`,
+`TestMvpMultiplicationOrderMatters`, `TestTwoEyePosesProduceDifferentMvps`,
+plus 3 revised/new `ApplyVulkanYFlip` tests in `vulkan_tests.cpp`;
+ON/OFF: 13/13; OFF/ON default: 11/11; the `/W4 /WX` combination also
+15/15).
+
+`arengine_openxr_cube_demo` run against live SteamVR: 200/200 frames
+completed, clean session-state sequence (`IDLE → READY →
+SYNCHRONIZED → STOPPING → IDLE → EXITING`, identical shape to M9E/M9F),
+exit code 0, no crash. Real per-view poses and the real asymmetric
+projection path confirmed in use (by direct code inspection —
+`views[i].projection` flows straight from `Frame::ViewInfo`, never
+`Scene::Camera` or a symmetric fallback), `view[0]`/`swapchains[0]`
+correspondence preserved with no reordering, a real
+`XrCompositionLayerProjection` referencing the actually-rendered
+swapchains submitted via `SetPendingProjectionLayer`. Sandbox and
+`vulkan_present_demo` both launched and ran without crashing (neither
+was touched by this milestone; `ApplyVulkanYFlip`'s fix is behavior-
+preserving for every desktop call site, confirmed by the new regression
+test, not just assumed).
+
+### Architectural Issues Found (M9G)
+
+Two real, previously-latent bugs were found and fixed, both before or
+during this milestone's own validation (not carried over from an
+earlier milestone): the `ApplyVulkanYFlip` row-1 truncation (found by
+design review, before ever running against real hardware) and the
+`VulkanRenderPass` hard-coded `colorFinalLayout` (found only once the
+cube demo actually ran against live SteamVR — the first real GPU
+submission this codebase has made into an OpenXR-owned image). Both are
+documented above with their fixes. No other architectural issues were
+found — `Frame::ViewInfo`, `OpenXRProjectionLayer`, and
+`VulkanFramebuffers` all needed zero or trivial changes to serve as a
+real rendering consumer, consistent with the "prove the seam with the
+minimal thing first" philosophy this project has followed since M0.
+
+### Not Implemented (M9G, by design)
+
+No `SceneRenderer`/`Scene` integration, no gameplay/networking/physics/
+audio systems, no controller input or OpenXR actions, no hand/eye
+tracking, no passthrough/anchors, no PBR/lighting/shadows/post-
+processing, no custom AR glasses integration, no arena calibration —
+all explicitly out of scope for M9G, deferred to M10 or later per
+`docs/ROADMAP.md`.
+
+- Files changed: `engine/rendering/src/vulkan/VulkanClipSpace.cpp/.hpp`
+  (row-1 flip fix), `VulkanRenderPass.hpp/.cpp` (`colorFinalLayout`
+  parameter); `engine/core/include/AREngine/Core/Math/Quaternion.hpp`
+  (`Conjugate`), `ViewProjection.hpp` (`ViewMatrixFromPoseRH`);
+  `engine/xr/src/openxr/OpenXRSwapchain.hpp/.cpp` (`VkDevice` + cached
+  image views); new `tests/openxr_cube_demo.cpp`; `tests/core_tests.cpp`
+  (5 new tests), `tests/vulkan_tests.cpp` (3 new/revised tests),
+  `tests/CMakeLists.txt` (`arengine_openxr_cube_demo` target);
+  `tests/openxr_frame_demo.cpp` (one line, updated `OpenXRSwapchain`
+  constructor call to match the new signature).

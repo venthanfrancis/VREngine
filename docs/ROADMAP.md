@@ -41,7 +41,7 @@ all come after that chain is proven.
 | — M9E | XR swapchains + frame lifecycle (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`). | **Complete** | See `docs/ARCHITECTURE.md` Section 28 |
 | — M9E.5 | Generic `Frame::FrameDriver` redesign using M9E's real evidence: `PrepareFrame`/`BeginFrame`/`GetViews`/`EndFrame`, `FrameStatus`/`shouldRender`, initial `XRFrameDriver` (wait/begin/end only). `DesktopFrameDriver`/`Runtime` refactored onto it, behavior unchanged. | **Complete** | See `docs/ARCHITECTURE.md` Section 29 |
 | — M9F | Real `xrLocateViews` view location: real per-view pose/asymmetric FOV converted into generic `Frame::ViewInfo`, real `XrCompositionLayerProjection` submitted (`OpenXRProjectionLayer`). Still no scene rendering. | **Complete** | See `docs/ARCHITECTURE.md` Section 30 |
-| — M9G | Head-tracked AREngine demo. | Not started | Fulfills M9's own goal, ahead of M10's full AR/XR demo |
+| — M9G | First real 3D rendering into OpenXR: a cube, using real per-view poses (inverted into proper view matrices) and real asymmetric per-view projections, rendered into each eye's OpenXR swapchain image and submitted via the existing `XrCompositionLayerProjection` path. Still no Scene/SceneRenderer integration. | **Complete** | See `docs/ARCHITECTURE.md` Section 31 |
 | M10 | **Simple AR/XR demo**: a minimal scene, rendered stereo through Vulkan, driven by real head tracking | Not started | Fulfills the project's primary goal chain |
 | M11 | `Physics`: minimal implementation | Deprioritized | Starts only after M10 |
 | M12 | `Audio`: minimal implementation | Deprioritized | Starts only after M10 |

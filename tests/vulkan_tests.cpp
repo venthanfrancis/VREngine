@@ -15,6 +15,7 @@
 // part of this suite, since CTest must not depend on a GPU being
 // present.
 
+#include "AREngine/Core/Math/MathUtil.hpp"
 #include "AREngine/Core/Math/ViewProjection.hpp"
 #include "AREngine/Rendering/MeshData.hpp"
 #include "AREngine/Rendering/ProceduralMesh.hpp"
@@ -366,17 +367,67 @@ namespace
               "SelectDepthFormat skips candidates lacking DEPTH_STENCIL_ATTACHMENT_BIT and picks the first that has it");
     }
 
-    void TestApplyVulkanYFlipNegatesOnlyYScale()
+    void TestApplyVulkanYFlipSymmetricInputUnchanged()
     {
+        // M9G generalized ApplyVulkanYFlip from "negate only m11" to
+        // "negate the whole of row 1" (m10/m11/m12/m13) - see
+        // docs/ARCHITECTURE.md, "ApplyVulkanYFlip Row-1 Fix (M9G)".
+        // Every symmetric-projection input (every call site before
+        // M9G) has m10=m12=m13=0 already, so this must produce
+        // bit-for-bit the same output as the pre-fix version - a
+        // regression check, not just a fresh assertion.
         Mat4 m = Mat4::Identity();
         m.Set(0, 0, 3.0f);
         m.Set(1, 1, 2.5f);
         m.Set(2, 3, 7.0f);
 
         const Mat4 flipped = ApplyVulkanYFlip(m);
+        Check(flipped.At(1, 0) == 0.0f, "ApplyVulkanYFlip: m10 stays 0 for a symmetric-shaped input (was already 0)");
         Check(flipped.At(1, 1) == -2.5f, "ApplyVulkanYFlip negates the Y-scale term");
+        Check(flipped.At(1, 2) == 0.0f, "ApplyVulkanYFlip: m12 stays 0 for a symmetric-shaped input (was already 0)");
+        Check(flipped.At(1, 3) == 0.0f, "ApplyVulkanYFlip: m13 stays 0 for a symmetric-shaped input (was already 0)");
         Check(flipped.At(0, 0) == 3.0f, "ApplyVulkanYFlip leaves the X-scale term unchanged");
         Check(flipped.At(2, 3) == 7.0f, "ApplyVulkanYFlip leaves unrelated entries unchanged");
+    }
+
+    void TestApplyVulkanYFlipNegatesOffCenterSkewToo()
+    {
+        // The actual bug M9G found and fixed: PerspectiveOffCenterRH_ZO
+        // produces a genuinely nonzero m12 (the Y/Z skew term) whenever
+        // angleUp != -angleDown. The old, single-element-only flip left
+        // this term un-negated - an incorrect partial flip. This input
+        // deliberately sets every row-1 term nonzero to catch exactly
+        // that.
+        Mat4 m = Mat4::Identity();
+        m.Set(1, 0, 1.5f);
+        m.Set(1, 1, 2.5f);
+        m.Set(1, 2, 0.4f);
+        m.Set(1, 3, 0.1f);
+
+        const Mat4 flipped = ApplyVulkanYFlip(m);
+        Check(flipped.At(1, 0) == -1.5f, "ApplyVulkanYFlip negates m10 too");
+        Check(flipped.At(1, 1) == -2.5f, "ApplyVulkanYFlip negates m11");
+        Check(flipped.At(1, 2) == -0.4f, "ApplyVulkanYFlip negates m12 (the off-center skew term) - this is the actual bug fix");
+        Check(flipped.At(1, 3) == -0.1f, "ApplyVulkanYFlip negates m13 too");
+    }
+
+    void TestApplyVulkanYFlipComposesWithAsymmetricProjection()
+    {
+        // End-to-end confirmation using a real asymmetric projection
+        // (mirroring M9G's real XR usage): after the fix, clip.y really
+        // is the full negation of the pre-flip clip.y for every point,
+        // not just points where the skew term happens to contribute 0.
+        constexpr float kDegToRad = std::numbers::pi_v<float> / 180.0f;
+        const Mat4 proj = PerspectiveOffCenterRH_ZO(-30.0f * kDegToRad, 60.0f * kDegToRad, 45.0f * kDegToRad, -20.0f * kDegToRad, 1.0f, 10.0f);
+        const Mat4 flippedProj = ApplyVulkanYFlip(proj);
+
+        const Vec4 testPoint(0.3f, 0.4f, -2.0f, 1.0f);
+        const Vec4 original = proj * testPoint;
+        const Vec4 flipped = flippedProj * testPoint;
+        Check(NearlyEqual(flipped.y, -original.y), "ApplyVulkanYFlip on an off-center projection: clip.y is the FULL negation, not a partial one");
+        Check(NearlyEqual(flipped.x, original.x), "ApplyVulkanYFlip on an off-center projection: clip.x is unaffected");
+        Check(NearlyEqual(flipped.z, original.z), "ApplyVulkanYFlip on an off-center projection: clip.z is unaffected");
+        Check(NearlyEqual(flipped.w, original.w), "ApplyVulkanYFlip on an off-center projection: clip.w is unaffected");
     }
 
     void TestApplyVulkanYFlipComposesWithProjection()
@@ -429,7 +480,9 @@ int main()
 
     TestSelectDepthFormatPrefersFirstSupported();
     TestSelectDepthFormatSkipsUnsupported();
-    TestApplyVulkanYFlipNegatesOnlyYScale();
+    TestApplyVulkanYFlipSymmetricInputUnchanged();
+    TestApplyVulkanYFlipNegatesOffCenterSkewToo();
+    TestApplyVulkanYFlipComposesWithAsymmetricProjection();
     TestApplyVulkanYFlipComposesWithProjection();
 
     if (g_failureCount == 0)

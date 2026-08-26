@@ -75,6 +75,20 @@ namespace AREngine::Core::Math
         );
     }
 
+    // The inverse rotation, for a unit quaternion (every Quaternion
+    // this engine constructs is unit-length - see FromAxisAngle). For a
+    // unit quaternion, the conjugate (negate the vector part, keep w)
+    // equals the inverse: q * Conjugate(q) == Identity. Added in M9G
+    // specifically for deriving a view matrix (viewFromWorld) from a
+    // pose's orientation (worldFromView) — a closed-form rigid-
+    // transform inverse, not a general quaternion-division operation.
+    // See docs/ARCHITECTURE.md, "worldFromView -> viewFromWorld
+    // Derivation (M9G)".
+    [[nodiscard]] constexpr Quaternion Conjugate(const Quaternion& q)
+    {
+        return Quaternion(q.w, -q.x, -q.y, -q.z);
+    }
+
     // Rotates `v` by `q`. Standard optimized form of q * (0,v) * q^-1
     // that avoids constructing a full pure-quaternion intermediate.
     // Added in M8G specifically so Transform can derive its

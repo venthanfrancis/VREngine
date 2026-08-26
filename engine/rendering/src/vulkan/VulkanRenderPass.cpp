@@ -7,7 +7,8 @@
 
 namespace AREngine::Rendering::Vulkan
 {
-    VulkanRenderPass::VulkanRenderPass(VkDevice device, VkFormat swapchainImageFormat, VkFormat depthFormat)
+    VulkanRenderPass::VulkanRenderPass(VkDevice device, VkFormat swapchainImageFormat, VkFormat depthFormat,
+                                        VkImageLayout colorFinalLayout)
         : m_device(device)
     {
         VkAttachmentDescription colorAttachment{};
@@ -21,7 +22,7 @@ namespace AREngine::Rendering::Vulkan
         // (loadOp=CLEAR), so the image's previous contents - and thus
         // its previous layout - genuinely don't matter going in.
         colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        colorAttachment.finalLayout = colorFinalLayout;
 
         VkAttachmentReference colorAttachmentRef{};
         colorAttachmentRef.attachment = 0;

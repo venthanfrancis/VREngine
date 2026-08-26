@@ -18,7 +18,7 @@ Full context lives in `docs/`:
 
 ## Current status
 
-**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete.** `Core`
+**M0 through M7 complete; M8A through M8H (Vulkan bring-up + presentation + first triangle + vertex/index buffers + textures + genuine 3D/depth + a movable camera + a reusable mesh representation) complete; M9A (OpenXR bring-up) complete; M9B (runtime/simulator environment planning — no engine code changes) complete; M9C (OpenXR/Vulkan graphics binding bring-up) complete; M9D (first real XrSession + session-state lifecycle) complete; M9E (XR swapchains + frame lifecycle) complete; M9E.5 (generic FrameDriver redesign from real OpenXR evidence) complete; M9F (real xrLocateViews view location + composition-layer submission) complete; M9G (first real 3D rendering into OpenXR — a cube, real per-view poses/projections, rendered into each eye's swapchain image) complete.** `Core`
 (math, logging, assertions, `Event`, `KeyCode`/`MouseButton`), `Frame`
 (`FrameTiming`/`ViewInfo`/`FrameDriver`), `Platform` (`Window` +
 Windows/Win32 backend + `SteadyClock` + keyboard/mouse/focus events),
@@ -553,14 +553,49 @@ across frames in this run — `shouldRender` was true only on frame 1
 over. See `docs/ARCHITECTURE.md` Section 30 for the full design,
 derivation, and validation.
 
+**M9G renders AREngine's first real geometry into OpenXR** — a cube
+(M8H's exact mesh/pipeline infrastructure, reused unchanged) drawn into
+each eye's real OpenXR-owned Vulkan swapchain image, using a real view
+matrix derived from `xrLocateViews`' own pose (new
+`Core::Math::ViewMatrixFromPoseRH`/`Conjugate` — a closed-form rigid-
+transform inverse, since a unit-quaternion orientation's inverse is
+just its conjugate, not a general matrix inverse) and M9F's real
+asymmetric per-view projection, submitted through the existing
+`XrCompositionLayerProjection` path (`OpenXRProjectionLayer`, reused
+with no changes to its own logic). `ViewInfo` needed **zero** further
+changes — M9F already established it as sufficient, and M9G (the first
+real renderer to consume it) confirms that conclusion rather than
+overturning it. Two real, previously-latent bugs were found and fixed:
+`ApplyVulkanYFlip` (M8F) only ever negated one matrix element, which
+was silently correct only because every projection before M9G was
+symmetric — M9F's genuinely asymmetric projections have a nonzero
+off-center skew term that the old code left un-flipped; fixed by
+negating the whole row (bit-for-bit unchanged for every existing
+symmetric caller, confirmed by a new regression test). Separately,
+found only once real rendering ran against live SteamVR:
+`VulkanRenderPass` hard-coded a `PRESENT_SRC_KHR` final layout that's
+meaningless for an OpenXR-owned (never `vkQueuePresentKHR`-ed) image
+and was rejected by validation — generalized into an optional
+constructor parameter, defaulted to the old value so every desktop call
+site is unaffected. New `tests/openxr_cube_demo.cpp` (a separate demo
+from `openxr_frame_demo.cpp`, keeping frame-lifecycle diagnostics and
+actual rendering as distinct, coherently-sized concerns) ran 200/200
+frames clean against live SteamVR; `shouldRender` was true only on
+frame 1 (the same SteamVR/null-driver behavior M9E/M9F already
+documented — not a regression), so only one frame actually rendered,
+and this runtime offers no visual window to confirm the result by eye —
+reported as exactly that limitation, not glossed over. See
+`docs/ARCHITECTURE.md` Section 31 for the full design, both bugs' fixes,
+and validation.
+
 There is still no real image loading (PNG/JPEG/stb_image), no uniform
 buffers, no `SceneRenderer`/Scene integration, no `MeshAsset`/glTF/OBJ
 loading, no normals/lighting, no frame limiting, no ECS/component
 system, and no stereo scene rendering/`xrLocateSpace`/head tracking/
-controllers/`viewFromWorld` computation — see Sections 11–15. `Editor`
-is still an M0-style stub with no functionality. Next up is M9G
-(head-tracked AREngine demo) or M8I+ (Scene integration, still pending
-within M8) — see `docs/ROADMAP.md` for the full plan.
+controllers — see Sections 11–15. `Editor` is still an M0-style stub
+with no functionality. Next up is M10 (the full AR/XR demo) or M8I+
+(Scene integration, still pending within M8) — see `docs/ROADMAP.md`
+for the full plan.
 
 ## Hard rules — do not violate without the project owner's explicit approval
 
@@ -577,13 +612,17 @@ within M8) — see `docs/ROADMAP.md` for the full plan.
 3a. **OpenXR instance/system discovery + Vulkan graphics-binding +
    XrSession/session-state/reference-space bring-up + XR swapchains/
    frame lifecycle + generic FrameDriver redesign + real view location/
-   composition-layer submission only so far (M9A–M9F)**: no
+   composition-layer submission + a single manually-defined cube
+   rendered into each eye's swapchain image so far (M9A–M9G)**: no
    `xrLocateSpace` for tracking, no head/hand/eye tracking, no
-   passthrough, no anchors, no stereo scene rendering, no `Scene::Camera`
-   driving XR eyes, no XR head/`viewFromWorld` camera abstraction, no
+   passthrough, no anchors, no `SceneRenderer`/`Scene` integration
+   driving what's rendered into XR eyes (M9G's cube is defined directly
+   in its own demo, not via `Scene`), no `Scene::Camera` driving XR
+   eyes, no XR head/`viewFromWorld` camera abstraction beyond the
+   free-function `Core::Math::ViewMatrixFromPoseRH` M9G added, no
    swapchain-image acquisition inside `XRFrameDriver` (that stays on
    `OpenXRSwapchain`, coordinated outside `Frame`/`XRFrameDriver`). See
-   `docs/ROADMAP.md`'s M9G row.
+   `docs/ROADMAP.md`'s M10 row.
 4. **No custom container types.** Use `std::` containers directly unless
    there is a measured (profiled) reason to do otherwise.
 5. **Respect the dependency layering** in `docs/ARCHITECTURE.md` — a

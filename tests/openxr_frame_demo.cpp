@@ -338,7 +338,7 @@ int main()
     {
         const XrViewConfigurationView& view = viewConfigViews[i];
         swapchains.push_back(std::make_unique<OpenXRSwapchain>(
-            instance.Get(), session.Get(), *selectedFormat,
+            instance.Get(), session.Get(), binding.GetBindingData().device, *selectedFormat,
             view.recommendedImageRectWidth, view.recommendedImageRectHeight, view.recommendedSwapchainSampleCount));
         AR_LOG_INFO(std::format("Created swapchain for view {}: {}x{}, {} image(s)",
                                  i, swapchains.back()->GetWidth(), swapchains.back()->GetHeight(), swapchains.back()->GetImages().size()));
