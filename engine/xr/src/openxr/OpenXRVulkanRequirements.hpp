@@ -89,6 +89,51 @@ namespace AREngine::XR::OpenXR
         return IsVulkanApiVersionSupported(preferredVkApiVersion, range) ? preferredVkApiVersion : range.minVkApiVersion;
     }
 
+    // Decides whether AREngine's XR-compatible VkDevice should request
+    // the `timelineSemaphore` feature (see docs/ARCHITECTURE.md, "Timeline
+    // Semaphore Device-Feature Negotiation (M11.2)") - purely from
+    // queried capability, never a runtime-name check. Pure logic, no API
+    // calls - directly unit-testable.
+    struct TimelineSemaphoreSelection
+    {
+        // Whether to chain VkPhysicalDeviceTimelineSemaphoreFeatures
+        // (timelineSemaphore = VK_TRUE) into VkDeviceCreateInfo::pNext.
+        bool enable = false;
+
+        // Whether the VK_KHR_timeline_semaphore device extension string
+        // must also be enabled. Only relevant below Vulkan 1.2 (where
+        // timeline semaphores are core and the extension would be
+        // redundant) - see the "Vulkan Version Cases" reasoning in
+        // docs/ARCHITECTURE.md's M11.2 section.
+        bool requiresExtension = false;
+    };
+
+    [[nodiscard]] constexpr TimelineSemaphoreSelection SelectTimelineSemaphoreSupport(
+        std::uint32_t selectedVkApiVersion,
+        bool physicalDeviceSupportsTimelineSemaphore,
+        bool timelineSemaphoreExtensionAvailable)
+    {
+        if (!physicalDeviceSupportsTimelineSemaphore)
+        {
+            // Case C: no support at all - never enabled, never
+            // speculative.
+            return TimelineSemaphoreSelection{false, false};
+        }
+        if (selectedVkApiVersion >= VK_API_VERSION_1_2)
+        {
+            // Case A: core in the selected version, no extension needed.
+            return TimelineSemaphoreSelection{true, false};
+        }
+        // Case B: pre-1.2, needs VK_KHR_timeline_semaphore too - but
+        // only if the runtime's VkPhysicalDevice actually reports it;
+        // never enable an extension that isn't there.
+        if (timelineSemaphoreExtensionAvailable)
+        {
+            return TimelineSemaphoreSelection{true, true};
+        }
+        return TimelineSemaphoreSelection{false, false};
+    }
+
     // Human-readable "major.minor.patch" for a Vulkan-encoded version
     // (VK_MAKE_API_VERSION layout - NOT an XrVersion; see
     // XrVersionToVkApiVersion above for why the two are not

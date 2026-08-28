@@ -301,25 +301,111 @@ namespace AREngine::XR::OpenXR
         std::vector<VkExtensionProperties> availableDeviceExtensions(deviceExtensionCount);
         vkEnumerateDeviceExtensionProperties(m_bindingData.physicalDevice, nullptr, &deviceExtensionCount, availableDeviceExtensions.data());
 
+        bool timelineSemaphoreExtensionAvailable = false;
         std::vector<const char*> enabledDeviceExtensions;
         for (const VkExtensionProperties& extension : availableDeviceExtensions)
         {
             if (std::strcmp(extension.extensionName, "VK_EXT_shader_viewport_index_layer") == 0)
             {
                 enabledDeviceExtensions.push_back("VK_EXT_shader_viewport_index_layer");
-                break;
+            }
+            else if (std::strcmp(extension.extensionName, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0)
+            {
+                timelineSemaphoreExtensionAvailable = true;
             }
         }
 
+        // --- Timeline semaphore device-feature negotiation (M11.2) ---
+        // See docs/ARCHITECTURE.md, "Timeline Semaphore Device-Feature
+        // Negotiation (M11.2)": Meta XR Simulator's compositor uses a
+        // timeline semaphore on this shared VkDevice and fails
+        // (VUID-VkSemaphoreTypeCreateInfo-timelineSemaphore-03252) unless
+        // the feature is enabled. SteamVR never hit this because its own
+        // xrCreateVulkanDeviceKHR unconditionally injects its own
+        // VkPhysicalDeviceTimelineSemaphoreFeatures - so this device
+        // already had the feature there, just never requested by
+        // AREngine. Deliberately the NARROW VkPhysicalDeviceTimelineSemaphoreFeatures
+        // struct, never VkPhysicalDeviceVulkan12Features - the M9D
+        // conflict was specifically the aggregate struct colliding with
+        // that same runtime-injected narrow one (Vulkan forbids
+        // supplying both an aggregate promoted-feature struct and one of
+        // its individually-promoted structs in the same pNext chain);
+        // the narrow struct alone was never actually tried against
+        // SteamVR before this milestone. Purely capability-driven - no
+        // runtime-name check anywhere in this decision.
+        VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphoreFeatures{};
+        timelineSemaphoreFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+
+        bool physicalDeviceSupportsTimelineSemaphore = false;
+        if (m_selectedVulkanApiVersion >= VK_API_VERSION_1_1)
+        {
+            // vkGetPhysicalDeviceFeatures2 is core Vulkan 1.1 - only
+            // safe to call via vkGetInstanceProcAddr against an instance
+            // created targeting >= 1.1 (VK_KHR_get_physical_device_properties2
+            // is not enabled on this instance, so there is no pre-1.1
+            // fallback path; both real runtimes tested select 1.2.0, so
+            // this guard is not currently limiting anything observed).
+            auto getPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(m_bindingData.instance, "vkGetPhysicalDeviceFeatures2"));
+            if (getPhysicalDeviceFeatures2 != nullptr)
+            {
+                VkPhysicalDeviceFeatures2 queryFeatures2{};
+                queryFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                queryFeatures2.pNext = &timelineSemaphoreFeatures;
+                getPhysicalDeviceFeatures2(m_bindingData.physicalDevice, &queryFeatures2);
+                physicalDeviceSupportsTimelineSemaphore = (timelineSemaphoreFeatures.timelineSemaphore == VK_TRUE);
+                // Reset - queryFeatures2 wrote the queried (supported)
+                // value; the struct is reused below to REQUEST the
+                // feature, not report on it, so it must not retain
+                // query-time contents beyond what's explicitly set again.
+                timelineSemaphoreFeatures = VkPhysicalDeviceTimelineSemaphoreFeatures{};
+                timelineSemaphoreFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+            }
+        }
+
+        const TimelineSemaphoreSelection timelineSemaphoreSelection = SelectTimelineSemaphoreSupport(
+            m_selectedVulkanApiVersion, physicalDeviceSupportsTimelineSemaphore, timelineSemaphoreExtensionAvailable);
+
+        AR_LOG_INFO(std::format("Timeline semaphore: physical device supports={}, selected Vulkan version={}, "
+                                 "extension available={}, will enable={}, requires VK_KHR_timeline_semaphore={}",
+            physicalDeviceSupportsTimelineSemaphore, FormatVkApiVersion(m_selectedVulkanApiVersion),
+            timelineSemaphoreExtensionAvailable, timelineSemaphoreSelection.enable, timelineSemaphoreSelection.requiresExtension));
+
+        if (timelineSemaphoreSelection.requiresExtension)
+        {
+            enabledDeviceExtensions.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+        }
+
+        VkPhysicalDeviceFeatures2 enabledFeatures2{};
+        enabledFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        enabledFeatures2.features = enabledFeatures;
+
         VkDeviceCreateInfo vulkanDeviceCreateInfo{};
         vulkanDeviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        vulkanDeviceCreateInfo.pEnabledFeatures = &enabledFeatures;
         vulkanDeviceCreateInfo.queueCreateInfoCount = 1;
         vulkanDeviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
         vulkanDeviceCreateInfo.enabledExtensionCount = static_cast<std::uint32_t>(enabledDeviceExtensions.size());
         vulkanDeviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.data();
         // No VK_KHR_swapchain - see docs/ARCHITECTURE.md, "Why the
         // Desktop VkSurfaceKHR/Swapchain Is Absent (M9C)".
+
+        if (timelineSemaphoreSelection.enable)
+        {
+            // Vulkan forbids supplying both pEnabledFeatures and a
+            // VkPhysicalDeviceFeatures2 in pNext - the core-1.0 features
+            // move into enabledFeatures2.features instead, unchanged in
+            // value, just relocated.
+            timelineSemaphoreFeatures.timelineSemaphore = VK_TRUE;
+            enabledFeatures2.pNext = &timelineSemaphoreFeatures;
+            vulkanDeviceCreateInfo.pNext = &enabledFeatures2;
+            vulkanDeviceCreateInfo.pEnabledFeatures = nullptr;
+        }
+        else
+        {
+            // Unchanged from before M11.2: plain core-1.0 features via
+            // pEnabledFeatures, no pNext feature chain at all.
+            vulkanDeviceCreateInfo.pEnabledFeatures = &enabledFeatures;
+        }
 
         XrVulkanDeviceCreateInfoKHR xrDeviceCreateInfo{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
         xrDeviceCreateInfo.systemId = systemId;

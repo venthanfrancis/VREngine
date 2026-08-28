@@ -7983,3 +7983,193 @@ ever been driven by a real, changing, physically-sourced value.
   `arengine_xr_demo`'s sources). No `engine/` source changed at all -
   `Input::InputSystem` and every OpenXR/XR wrapper class were reused
   completely unchanged.
+
+## M11 - Environment Research and Timeline Semaphore Negotiation
+
+### Meta XR Simulator (M11/M11.1, research and installation only)
+
+M11 was a research-only milestone investigating a headset-free OpenXR
+development environment. It recommended Meta XR Simulator (v205.0,
+official Meta distribution) as the primary candidate: a real, conformant
+OpenXR runtime supporting `XR_KHR_vulkan_enable2`, with simulated
+head/controller input, distinct from SteamVR's null driver. M11.1
+installed and validated it: activated via Meta's own official
+`activate_simulator.ps1`/`deactivate_simulator.ps1` toggle scripts (never
+a manual registry edit), which preserve the prior `ActiveRuntime` into a
+`PreviousActiveRuntime` registry value and restore it on deactivation -
+confirmed by reading both scripts' source directly, not merely by
+documentation.
+
+Validated against the real simulator (system name "Meta Quest 3",
+`XrSystemId` reported, `XR_KHR_vulkan_enable2` present): the full OpenXR
+session-state sequence (`IDLE`→`READY`→`SYNCHRONIZED`→`VISIBLE`→`FOCUSED`)
+is reached, and `shouldRender` becomes **continuously true** across
+hundreds of frames - a genuine improvement over SteamVR/null, which
+never sustains that (see M9H). Real per-view stereo poses (~30mm IPD)
+and differing per-eye asymmetric FOV are reported. The 1000-frame
+integrated demo (`arengine_xr_demo`, M10.5/M10.6) rendered all 1000
+frames successfully with real M10.6 interaction state wired, but the
+process crashed during clean session exit - see "Clean-Exit Crash"
+below, which M11.1 found and M11.2 investigated further.
+
+### Timeline Semaphore Device-Feature Negotiation (M11.2)
+
+**Finding**: Meta XR Simulator's compositor uses a
+`VK_SEMAPHORE_TYPE_TIMELINE` semaphore on AREngine's shared XR `VkDevice`
+and fails Vulkan validation
+(`VUID-VkSemaphoreTypeCreateInfo-timelineSemaphore-03252`) unless the
+`timelineSemaphore` feature is enabled at device creation.
+`OpenXRVulkanGraphicsBinding`'s device only enabled core Vulkan 1.0
+features via `pEnabledFeatures` (see "Vulkan Device Feature Requirement
+Discovered in M9D" above) - deliberately, because that section's own
+history found a real conflict when the app supplied a
+`VkPhysicalDeviceVulkan12Features` struct: SteamVR's own
+`xrCreateVulkanDeviceKHR` unconditionally injects its own
+`VkPhysicalDeviceFeatures2`-wrapped `VkPhysicalDeviceTimelineSemaphoreFeatures`,
+and Vulkan's spec forbids an app-supplied `VkPhysicalDeviceVulkan12Features`
+co-existing with any of its individually-promoted structs (including
+`VkPhysicalDeviceTimelineSemaphoreFeatures`) in the same `pNext` chain.
+Re-auditing that history in M11.2 found every variation tried in M9D
+used the *aggregate* `VkPhysicalDeviceVulkan12Features` struct - the
+*narrow* `VkPhysicalDeviceTimelineSemaphoreFeatures` struct alone,
+without the aggregate, had never actually been tried.
+
+**Fix**: `OpenXRVulkanGraphicsBinding.cpp` now queries
+`vkGetPhysicalDeviceFeatures2`/`VkPhysicalDeviceTimelineSemaphoreFeatures`
+capability directly (gated on the selected Vulkan API version being
+>= 1.1, since `vkGetPhysicalDeviceFeatures2` is core-1.1) and decides
+whether to enable the feature via a new pure-logic helper,
+`SelectTimelineSemaphoreSupport` (`OpenXRVulkanRequirements.hpp`):
+purely capability-driven (physical-device support + selected API
+version + `VK_KHR_timeline_semaphore` extension availability below
+1.2), with **zero runtime-name checks anywhere**. When the feature is
+supported, the device is created via `VkPhysicalDeviceFeatures2` (chaining
+only the narrow `VkPhysicalDeviceTimelineSemaphoreFeatures`, never the
+aggregate `VkPhysicalDeviceVulkan12Features`) with the existing core-1.0
+`enabledFeatures` moved into `VkPhysicalDeviceFeatures2::features`
+unchanged; when unsupported, device creation is byte-for-byte the same
+`pEnabledFeatures` path as before M11.2. Below Vulkan 1.2 with the
+feature supported, `VK_KHR_timeline_semaphore` is added to the device
+extension list; at 1.2+, it's core and the extension is never requested.
+Desktop Vulkan device creation (`engine/rendering/src/vulkan/`) is
+completely untouched.
+
+**Result on Meta XR Simulator**: the physical device (NVIDIA RTX 3060
+Laptop GPU) reports `timelineSemaphore` support; Vulkan 1.2.0 selected
+(core, no extension needed); the original
+`VUID-VkSemaphoreTypeCreateInfo-timelineSemaphore-03252` error is
+**completely gone** across every post-fix run of `arengine_openxr_vulkan_demo`,
+`arengine_openxr_session_demo`, `arengine_openxr_frame_demo`, and
+`arengine_xr_demo`.
+
+**Result on SteamVR**: device creation itself (`arengine_openxr_vulkan_demo`,
+`arengine_openxr_session_demo`) remains completely clean - zero
+validation errors or warnings, confirming the narrow
+`VkPhysicalDeviceTimelineSemaphoreFeatures` struct does **not**
+reintroduce the M9D aggregate-struct conflict. `timelineSemaphore` is
+now genuinely requested by AREngine on SteamVR too (previously it
+worked only because SteamVR's own unconditional injection supplied it
+independently of anything AREngine asked for).
+
+### M11.2 Result Summary: Three Separate Problems
+
+```
+Problem A - Timeline semaphore used without the feature enabled -> FIXED
+Problem B - Meta XR Simulator crashes during teardown           -> STILL OPEN
+Problem C - SteamVR shows new teardown validation noise once
+            timeline semaphores are genuinely enabled            -> NEW EVIDENCE, UNPROVEN CAUSE
+```
+
+M11.2 fixed Problem A only. Problems B and C are separate, unresolved
+findings for a future milestone (see below) - M11.2 must not be read as
+having solved "the Meta validation problem" as a whole.
+
+### Clean-Exit Crash (found M11.1, persists after M11.2's fix - unresolved)
+
+Both `arengine_openxr_frame_demo` (M9E, 200-frame target) and the
+1000-frame `arengine_xr_demo` (M10.5/M10.6) crash on Meta XR Simulator
+during clean session exit, after their real frame-loop work otherwise
+completes (`STATUS_ACCESS_VIOLATION`/`0xC0000005` on one run,
+`STATUS_FATAL_APP_EXIT`/`0x40000015` on another - not deterministic).
+`vkDestroyDevice` reports a variable number of leaked objects (a
+`VkSemaphore`, swapchain `VkImage`s, `VkDeviceMemory`, a `VkCommandPool`,
+ranging from 1 to 34 objects across runs) immediately before the crash,
+and one observed run additionally showed a genuine cross-thread race
+(`vkDestroyDevice` on one thread concurrent with
+`vkFreeMemory`/`vkDestroySemaphore` on another).
+
+**Ownership of these objects/threads is NOT yet established and must
+not be assumed.** `xrCreateVulkanDeviceKHR` gives the runtime visibility
+into the same device creation and lets it create device children
+internally, so the leaked/racing handles could belong to either side -
+concluding "the runtime's own compositor, not AREngine" from AREngine's
+own code being single-threaded is not valid evidence; it requires actual
+handle/lifetime tracking to confirm. Similarly, the absence of
+AREngine's "Diagnostics:"/"complete - shutting down" log lines in a
+crashed run's captured stdout is **not** strong evidence those lines
+never printed - C stdio buffering can lose already-written-but-unflushed
+output when a process is killed abruptly, especially under
+`Start-Process`-style redirection to a file. Whether AREngine's own
+destructors (which already call `vkDeviceWaitIdle` before manual cleanup
+- the standard Vulkan mechanism for ensuring the app's own submitted
+work has completed before device destruction, though not necessarily
+sufficient for work the runtime itself submitted independently) ever
+began running is genuinely unknown from the evidence gathered so far.
+
+The M11.2 fix eliminated the timeline-semaphore validation *error* but
+did not eliminate this crash. One plausible (not confirmed) explanation:
+properly enabling `timelineSemaphore` lets the runtime's compositor
+engage real timeline-semaphore-based synchronization internally,
+exposing a pre-existing thread-safety bug in that path that a
+silently-degraded fallback previously avoided. Meta's own v205 release
+notes reportedly describe Vulkan support in XR Simulator as limited and
+list several simulator crash/thread-safety fixes including teardown/
+stability work, making a simulator-side bug entirely plausible - but
+this must be proven with direct evidence, not assumed from precedent.
+Per M11.2's own explicit instruction, no teardown-order change was
+attempted to chase this.
+
+**M11.3 should instrument teardown with unbuffered/immediately-flushed
+logging (e.g. a distinct stream, or explicit flush after each line)
+around every individual destruction step** (fence, command pool,
+framebuffers, swapchains + their cached image views, action system,
+local space, session, graphics-binding device/instance, XR instance),
+so a crashed run's true last-completed step - and therefore whether
+AREngine's own destructors started, and which one was in progress - can
+be established directly, rather than inferred from potentially-lost
+buffered output.
+
+A related but distinct finding: SteamVR's `arengine_openxr_frame_demo`
+and `arengine_xr_demo` runs (200 and 1000 frames respectively) both now
+complete and exit cleanly (code 0, all frames attempted/synced, full
+diagnostics printed) but show new Vulkan validation errors during
+teardown - objects named `BlankEyeBuffer` and associated command
+buffers/fences reported as leaked or freed-while-in-use at
+`vkDestroyDevice`, which were not present in M9D's original "zero
+validation errors" baseline. Functionally nothing regressed (frame
+counts, session-state sequence, and exit codes are all unchanged), but
+this is new validation-layer noise. A shared root cause with the Meta
+crash (the runtime's own compositor engaging real timeline-semaphore
+sync now that the feature is genuinely enabled) is plausible but
+**unproven** - not investigated further in M11.2, per its own scope, and
+subject to the same ownership caveat as Problem B above.
+
+### Validation Results (M11.2)
+
+Pure-logic tests: 5 new checks in `tests/openxr_vulkan_tests.cpp`
+covering `SelectTimelineSemaphoreSupport` (Vulkan >= 1.2 core case;
+pre-1.2 with extension available; unsupported by the physical device;
+pre-1.2 without the extension available; no runtime-name dependency) -
+zero API calls, zero GPU/runtime required. All four
+`ARENGINE_ENABLE_OPENXR`×`ARENGINE_ENABLE_VULKAN` combinations configure,
+build `/W4 /WX` clean, and pass 100% of their CTest suites. Manual
+validation against both Meta XR Simulator and SteamVR as described
+above.
+
+- Files changed: `engine/xr/src/openxr/OpenXRVulkanRequirements.hpp`
+  (new `TimelineSemaphoreSelection`/`SelectTimelineSemaphoreSupport`);
+  `engine/xr/src/openxr/OpenXRVulkanGraphicsBinding.cpp` (capability
+  query + conditional `VkPhysicalDeviceFeatures2`/pNext device-creation
+  path); `tests/openxr_vulkan_tests.cpp` (5 new pure-logic tests). No
+  other `engine/` or `tests/` files changed; `engine/rendering/` (desktop
+  Vulkan) untouched.

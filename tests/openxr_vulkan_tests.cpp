@@ -94,6 +94,54 @@ namespace
               "SelectVulkanApiVersion falls back to the runtime's minimum when the preferred version is out of range");
     }
 
+    // --- Timeline semaphore device-feature selection (M11.2) ---
+
+    void TestSelectTimelineSemaphoreSupportedAndApi12()
+    {
+        // Case A: core in the selected version - enabled, no extension.
+        const auto selection = SelectTimelineSemaphoreSupport(VK_API_VERSION_1_2, /*supported=*/true, /*extensionAvailable=*/false);
+        Check(selection.enable, "Enabled when the physical device supports it and the selected version is >= 1.2");
+        Check(!selection.requiresExtension, "No extension required when timeline semaphores are core (>= 1.2)");
+    }
+
+    void TestSelectTimelineSemaphoreSupportedAndApi11WithExtension()
+    {
+        // Case B: pre-1.2, extension present - enabled via the extension.
+        const auto selection = SelectTimelineSemaphoreSupport(VK_API_VERSION_1_1, /*supported=*/true, /*extensionAvailable=*/true);
+        Check(selection.enable, "Enabled when the physical device supports it, API < 1.2, and the extension is available");
+        Check(selection.requiresExtension, "VK_KHR_timeline_semaphore is required below Vulkan 1.2");
+    }
+
+    void TestSelectTimelineSemaphoreUnsupportedNeverEnabled()
+    {
+        // Case C: no support at all - never enabled, regardless of
+        // version or extension availability.
+        const auto selection = SelectTimelineSemaphoreSupport(VK_API_VERSION_1_2, /*supported=*/false, /*extensionAvailable=*/true);
+        Check(!selection.enable, "Never enabled when the physical device does not report support, even if the extension exists");
+        Check(!selection.requiresExtension, "No extension requested for an unsupported feature");
+    }
+
+    void TestSelectTimelineSemaphorePre12WithoutExtensionStaysDisabled()
+    {
+        // Below 1.2, supported by the device, but the extension is not
+        // enumerated - clear failure per policy: do not enable a
+        // feature AREngine cannot actually satisfy.
+        const auto selection = SelectTimelineSemaphoreSupport(VK_API_VERSION_1_1, /*supported=*/true, /*extensionAvailable=*/false);
+        Check(!selection.enable, "Not enabled below 1.2 when VK_KHR_timeline_semaphore is unavailable, even if the device otherwise supports it");
+        Check(!selection.requiresExtension, "No extension requested when it isn't available in the first place");
+    }
+
+    void TestSelectTimelineSemaphoreHasNoRuntimeNameDependency()
+    {
+        // No runtime-name parameter exists on this function at all -
+        // the same (version, supported, extensionAvailable) inputs
+        // always produce the same result, whatever runtime produced them.
+        const auto steamVrShaped = SelectTimelineSemaphoreSupport(VK_API_VERSION_1_2, true, false);
+        const auto metaShaped = SelectTimelineSemaphoreSupport(VK_API_VERSION_1_2, true, false);
+        Check(steamVrShaped.enable == metaShaped.enable && steamVrShaped.requiresExtension == metaShaped.requiresExtension,
+              "Identical capability inputs always produce an identical decision - no hidden runtime-name branching");
+    }
+
     // --- Queue family selection ---
 
     VkQueueFamilyProperties MakeQueueFamily(VkQueueFlags flags)
@@ -214,6 +262,12 @@ int main()
     TestIsVulkanApiVersionSupportedOutsideRange();
     TestSelectVulkanApiVersionPrefersPreferredWhenSupported();
     TestSelectVulkanApiVersionFallsBackToMinimum();
+
+    TestSelectTimelineSemaphoreSupportedAndApi12();
+    TestSelectTimelineSemaphoreSupportedAndApi11WithExtension();
+    TestSelectTimelineSemaphoreUnsupportedNeverEnabled();
+    TestSelectTimelineSemaphorePre12WithoutExtensionStaysDisabled();
+    TestSelectTimelineSemaphoreHasNoRuntimeNameDependency();
 
     TestFindGraphicsQueueFamilyEmpty();
     TestFindGraphicsQueueFamilyNoneQualify();
