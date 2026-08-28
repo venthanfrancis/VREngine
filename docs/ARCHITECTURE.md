@@ -8477,3 +8477,207 @@ Meta XR Simulator crashes investigated in M11.2/M11.3) - a SteamVR
 restart is the most likely fix, not an AREngine or Smart App Control
 issue. Not investigated further here, per M11.3A's own scope (no
 AREngine architecture changes, no resuming M11.3 XR work).
+
+## M11.3 Resumed - Teardown Investigation Conclusion
+
+### Phase 0: SteamVR health check
+
+A full SteamVR restart (`vrstartup.exe`, official launcher) resolved the
+`XR_ERROR_RUNTIME_FAILURE` from M11.3A immediately - `arengine_openxr_vulkan_demo`
+succeeded cleanly afterward (`Graphics-binding data valid: true`), confirming
+it was stale SteamVR process state, not an AREngine or Vulkan issue.
+
+### Phases 1-2: Meta re-activation and instrumented reruns
+
+Meta XR Simulator reactivated via its official script; confirmed active,
+`arengine_openxr_demo` reports it, `arengine_openxr_vulkan_demo` succeeds,
+and the M11.2 timeline-semaphore fix still holds (zero validation errors,
+`will enable=true`). The three M11.3-instrumented demos were then run
+repeatedly against Meta:
+
+| Demo | Runs | Crashed | Exit codes seen | Reproducibility |
+|---|---|---|---|---|
+| `session_demo` | 8 | 1 | `0x80000003`-class (git-bash 127) | ~12% |
+| `frame_demo` | 5 | 4 | `0xC0000005` (x3), `0xC0000409` (x1, new) | 80% |
+| `xr_demo` (1000-frame) | 3 | 3 | `0x40000015` (all 3) | 100% |
+
+`0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`, a `__fastfail` exception -
+typically raised by heap-corruption detection or a `/GS` stack-cookie
+failure) is new evidence not seen in M11.1/M11.2 - stronger evidence of
+genuine memory corruption during teardown, not merely a benign handle
+leak. Reproducibility scales with demo activity/duration (session_demo,
+near-instant, rarely crashes; the 1000-frame integrated demo, 100%) -
+consistent with a genuine timing-dependent race, not a deterministic
+logic bug.
+
+### Phase 3: Exact teardown boundary - fully pinned down
+
+Across **every single crashed run, on every demo**, the last
+`[TEARDOWN]` marker before the crash is always the same:
+`"about to destroy: binding (debug messenger, then vkDestroyDevice, then
+vkDestroyInstance)"` - and this marker fires successfully in clean runs
+too, always immediately followed by `"about to destroy: instance"` when
+teardown completes. **The crash occurs exclusively inside
+`OpenXRVulkanGraphicsBinding::~OpenXRVulkanGraphicsBinding()`, at or
+immediately after `vkDestroyDevice`** (confirmed present in every
+crashed run's captured validation output, which only appears once that
+call has begun) **- never in AREngine's own OpenXR/Scene/Vulkan resource
+graph**, which completes in full, every single time, before `binding`'s
+destructor even begins (`xr_demo`'s 1000-frame run: `frames
+attempted=1000, synced=1000, rendered=999`, `vkDeviceWaitIdle` returns
+`VK_SUCCESS`, then all 17 of its own owned objects destroy successfully
+in order before the crash boundary is reached).
+
+### Phase 4: Handle ownership - direct, positive proof this time
+
+`VK_EXT_debug_utils` object names assigned to AREngine's own
+`commandPool`/`renderFence` (`AREngine.xr_demo.commandPool`, etc., M11.3's
+own instrumentation) **never appear in any leaked-object or validation
+message, in any crashed or clean run, on either runtime** - not absence-
+of-creation-call inference this time, direct evidence. The objects that
+*do* appear are runtime-tagged where the runtime chose to tag them
+(`"[XRSim] CommandPool (QueueFamily 0)"`, `"[XRSim][Client]...Swapchain
+Image"`, SteamVR's `"BlankEyeBuffer"`) or exceed AREngine's own known
+creation counts (`frame_demo` allocates exactly one `VkCommandBuffer`;
+SteamVR's own frame-demo/integrated-demo crash logs show three).
+
+### Phase 5: AREngine resource quiescence - proven, not assumed
+
+Confirmed directly from the teardown trace, not inferred: `vkDeviceWaitIdle`
+returns `VK_SUCCESS` in `xr_demo` before any destruction begins; every
+AREngine-owned `VkDevice` child (fence, fence, fence... down through the
+full 17-object graph documented in M11.3's original ownership table)
+reaches its own `[TEARDOWN]` marker and destroys without error; no
+`XrSwapchain` image acquisition/release mismatch was observed in any run
+(the loop's own acquire-render-release-within-one-tick structure, verified
+earlier, held in every run). No AREngine-owned child was found alive at
+the failure point in any run.
+
+### Phase 6: OpenXR session exit - validated against real spec-object
+hierarchy (repeated from the original Step 6, still holds): swapchains/
+spaces destroyed before session, session destroyed before device, device
+before instance - matches every crashed and clean run's own marker
+ordering exactly, with no exception.
+
+### Phase 7-8: hello_xr isolation test
+
+Built the official Khronos `OpenXR-SDK-Source` at tag `release-1.1.62`
+(commit `c610211f38f4e1e4ac811ced6135e144eedc7cf2`, 2026-07-31 - the
+exact same version AREngine's own loader targets), Vulkan graphics path
+(`-g Vulkan2`, i.e. `XR_KHR_vulkan_enable2` - the same extension AREngine
+uses), against Meta XR Simulator. **One natural-exit run** (hello_xr's
+own stdin-driven "press any key" wait returned immediately because stdin
+had no interactive console attached) completed a real, if brief, session:
+instance → system → session → two swapchains created (1680x1760,
+matching AREngine's own dimensions) → reference/action spaces destroyed
+→ `impl_xrDestroyInstance()` logged **BEGIN and END with no error** →
+process exited with no crash, no Windows Application Error event, and no
+crashpad report. **One 15-second forced-activity run** (stdin held open
+so the main loop kept running) also did not crash on its own - it was
+still healthy when force-killed after 15 real seconds, only terminating
+because I killed it (hello_xr's raw-console `_kbhit()`-based key
+detection could not be triggered non-interactively, so a longer
+*naturally-terminated* session comparable to AREngine's 1000-frame run
+could not be obtained).
+
+**This is Case-B-leaning evidence (hello_xr does not show the same
+crash) but is not fully conclusive** - the sessions actually observed
+were far shorter than the ~1000-frame runs that make AREngine's own
+crash close to 100% reproducible, so a longer natural hello_xr session
+might behave differently. This limitation is an automation constraint
+of hello_xr's own interactive design, not a new technical finding about
+Meta XR Simulator.
+
+### Phase 9: Meta crash logs
+
+Meta XR Simulator's own per-process logs (`%APPDATA%\MetaXR\MetaXrSimulator\logs\`)
+were searched across every log written during this investigation for
+crash/exception/fault indicators. Every log shows `"Started crashpad
+handler"` (routine startup, not a crash signal) but **no log contains an
+actual exception report, unhandled-exception record, or crashpad dump
+reference**. **No `.dmp` file was found in any Meta-related directory.**
+This means Meta's own simulator *process* never crashed - the crash
+happens inside AREngine's own client process (where Meta's Vulkan
+ICD/loader-provided code executes in-process during `vkDestroyDevice`/
+`vkDestroyInstance`, as is normal for any Vulkan driver). No AREngine-side
+minidump was configured, so **the exact crashing module, thread, and
+stack frames remain genuinely unknown** - reporting anything more
+specific here would claim symbols not actually available.
+
+### Phase 11: SteamVR comparison
+
+`arengine_openxr_vulkan_demo` confirmed healthy after Meta deactivation.
+Six runs (2x each of `session_demo`/`frame_demo`/`xr_demo`) against
+SteamVR: **100% clean exit, every teardown marker reached including
+`"about to destroy: instance"`, every time.** `session_demo`: zero leaked
+objects (consistent with its zero `vkCreate*` calls). `frame_demo`/
+`xr_demo`: a stable, reproducible **14 leaked objects every run**
+(3x `VkCommandBuffer`, 1x `VkSemaphore`, 4x `VkFence`, `VkDeviceMemory`
+including SteamVR's own named `BlankEyeBuffer`) - AREngine's own named
+`commandPool`/`renderFence` never appear among them. Functionality
+remains completely stable on SteamVR regardless of the timeline-semaphore
+change; only non-fatal validation noise, never a crash, at a rate of
+100% (not intermittent) but never fatal.
+
+### Phase 12: Root-cause classification
+
+Using the milestone's own definitions:
+
+- **AREngine bug: ruled out.** No AREngine-owned child survives to the
+  failure point in any run (direct, per-object marker evidence,
+  ~20 total runs across three demos and two runtimes). No resource is
+  still in flight (`vkDeviceWaitIdle` returns success where called; no
+  crash-correlation with its absence elsewhere - Phase 10, below).
+  Destruction order verified against real OpenXR object-hierarchy rules,
+  matches in every run. No acquired-swapchain-image mismatch found (loop
+  structure proof, unchanged from the original investigation). No
+  invalid OpenXR lifecycle usage found.
+- **Runtime bug: best-supported single classification.** AREngine's own
+  lifetime/spec obligations are proven correct in every observed run.
+  Unknown, runtime-created objects reliably remain/race at the exact
+  same boundary (inside `vkDestroyDevice`/`vkDestroyInstance`) on Meta
+  only, never on SteamVR running the identical AREngine code. hello_xr's
+  own available evidence leans toward not reproducing it, though not
+  fully conclusively (see Phase 7-8's caveat).
+- **Interop issue: not excluded, and nearly as well-supported.** The
+  crash's precise mechanical location - inside raw Vulkan API calls
+  where Meta's own ICD/loader-provided code executes in-process - and
+  the fact it never occurs on SteamVR running the exact same AREngine
+  call sequence, is also consistent with a specific, narrow interaction
+  between AREngine's particular call pattern and Meta's Vulkan
+  implementation that a more exhaustive hello_xr comparison (a full,
+  naturally-terminated, multi-hundred-frame session) would be needed to
+  fully rule in or out.
+- **Still unknown: the exact crashing module/thread/stack frames** -
+  genuinely not available without a debugger or AREngine-side minidump,
+  neither of which this investigation set up.
+
+**This investigation does not overstate certainty: "runtime bug" and
+"interop issue" both remain live, evidence-supported possibilities;
+"AREngine bug" is confidently ruled out given the exhaustive, repeated,
+consistent evidence that every AREngine-owned resource is correctly
+destroyed before the failure boundary is ever reached, on every run,
+across every demo, on both runtimes.**
+
+### Phase 10: `vkDeviceWaitIdle` inconsistency - resolved, not fixed
+
+The missing `vkDeviceWaitIdle` call in `openxr_frame_demo.cpp` (found in
+the original M11.3 investigation) does **not** correlate with crash
+occurrence: `xr_demo` calls it and still crashes (100% reproducible);
+`session_demo` doesn't call it, has zero AREngine Vulkan resources to
+wait on, and rarely crashes (~12%). Per M11.3's own explicit instruction
+not to fix this preemptively, and given the evidence now shows it isn't
+the cause, **no fix was applied**.
+
+### No fix implemented
+
+Per the milestone's own gate ("only implement a fix if the evidence
+directly proves it"): no AREngine-side bug was found to fix. No sleeps,
+runtime-name branches, Meta-specific workarounds, intentional leaks,
+validation suppression, or timeline-semaphore rollback were added.
+
+### Build/test status
+
+No AREngine source files were changed in this resumed investigation
+(diagnosis-only, using instrumentation already added in the original
+M11.3). No new build/CTest validation was required as a result.
