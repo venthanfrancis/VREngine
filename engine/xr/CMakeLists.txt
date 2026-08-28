@@ -105,6 +105,8 @@ if(ARENGINE_ENABLE_OPENXR)
             src/openxr/OpenXRActionSpace.cpp
             src/openxr/OpenXRSimpleControllerBindings.hpp
             src/openxr/OpenXRSimpleControllerBindings.cpp
+            src/openxr/OpenXRTouchControllerBindings.hpp
+            src/openxr/OpenXRTouchControllerBindings.cpp
             src/openxr/OpenXRActionStateConversion.hpp
             src/openxr/OpenXRActionSystem.hpp
             src/openxr/OpenXRActionSystem.cpp

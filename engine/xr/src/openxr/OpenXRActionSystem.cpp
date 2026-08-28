@@ -3,6 +3,7 @@
 #include "OpenXRActionStateConversion.hpp"
 #include "OpenXRResult.hpp"
 #include "OpenXRSimpleControllerBindings.hpp"
+#include "OpenXRTouchControllerBindings.hpp"
 
 namespace AREngine::XR::OpenXR
 {
@@ -21,7 +22,17 @@ namespace AREngine::XR::OpenXR
         // Bindings must be suggested before the action set is attached
         // (OpenXR spec) - attach must happen before any action space is
         // created (established best practice) or any state is queried.
+        // Two profiles suggested, never one replacing the other: an
+        // application may suggest bindings for multiple interaction
+        // profiles at once, and the runtime resolves whichever actually
+        // matches the connected/simulated device (M11.1B evidence:
+        // Meta XR Simulator reports exactly khr/simple_controller when
+        // that is the only profile suggested, and no runtime-name check
+        // is used here to decide which to suggest - both are always
+        // suggested, unconditionally).
         SuggestSimpleControllerBindings(instance, m_selectAction.Get(), m_aimPoseAction.Get());
+        SuggestTouchControllerBindings(
+            instance, m_selectAction.Get(), m_triggerAction.Get(), m_moveAction.Get(), m_aimPoseAction.Get());
         m_actionSet.Attach(instance, session);
 
         m_leftAimSpace = std::make_unique<OpenXRActionSpace>(instance, session, m_aimPoseAction.Get(), m_handPaths.left);
@@ -101,5 +112,36 @@ namespace AREngine::XR::OpenXR
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
         CheckXrResult(instance, xrLocateSpace(AimSpace(hand).Get(), baseSpace, time, &location), "xrLocateSpace (aim_pose)");
         return ConvertActionStatePose(true, location);
+    }
+
+    std::string OpenXRActionSystem::GetCurrentInteractionProfile(XrInstance instance, XrSession session, Hand hand) const
+    {
+        XrInteractionProfileState profileState{XR_TYPE_INTERACTION_PROFILE_STATE};
+        CheckXrResult(instance,
+            xrGetCurrentInteractionProfile(session, SubactionPath(hand), &profileState),
+            "xrGetCurrentInteractionProfile");
+
+        if (profileState.interactionProfile == XR_NULL_PATH)
+        {
+            return std::string{};
+        }
+
+        std::uint32_t bufferCountOutput = 0;
+        CheckXrResult(instance,
+            xrPathToString(instance, profileState.interactionProfile, 0, &bufferCountOutput, nullptr),
+            "xrPathToString (interaction profile, count query)");
+
+        std::string path(bufferCountOutput, '\0');
+        CheckXrResult(instance,
+            xrPathToString(instance, profileState.interactionProfile, bufferCountOutput, &bufferCountOutput, path.data()),
+            "xrPathToString (interaction profile, data query)");
+
+        // xrPathToString's bufferCountOutput includes the null
+        // terminator - trim it so callers get a clean std::string.
+        if (!path.empty() && path.back() == '\0')
+        {
+            path.pop_back();
+        }
+        return path;
     }
 }

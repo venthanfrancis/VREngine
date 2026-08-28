@@ -29,6 +29,7 @@
 
 #include <array>
 #include <memory>
+#include <string>
 
 namespace AREngine::XR::OpenXR
 {
@@ -82,6 +83,16 @@ namespace AREngine::XR::OpenXR
         // "Predicted Display Time For Poses (M10)".
         [[nodiscard]] Input::PoseActionState GetAimPoseState(
             XrInstance instance, XrSession session, XrSpace baseSpace, XrTime time, Hand hand);
+
+        // M11.1B diagnostic: queries xrGetCurrentInteractionProfile for
+        // the given hand's top-level user path and returns the runtime-
+        // reported interaction profile as a human-readable path string
+        // (e.g. "/interaction_profiles/khr/simple_controller"), or an
+        // empty string if the runtime reports XR_NULL_PATH (no profile
+        // bound yet for that hand). Never guessed/hard-coded - this
+        // reflects exactly what the runtime returns. See
+        // docs/ARCHITECTURE.md, "M11.1B Implementation Notes".
+        [[nodiscard]] std::string GetCurrentInteractionProfile(XrInstance instance, XrSession session, Hand hand) const;
 
     private:
         [[nodiscard]] XrPath SubactionPath(Hand hand) const { return hand == Hand::Left ? m_handPaths.left : m_handPaths.right; }

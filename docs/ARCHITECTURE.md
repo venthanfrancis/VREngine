@@ -8681,3 +8681,163 @@ validation suppression, or timeline-semaphore rollback were added.
 No AREngine source files were changed in this resumed investigation
 (diagnosis-only, using instrumentation already added in the original
 M11.3). No new build/CTest validation was required as a result.
+
+## M11.1B - Active Head + Controller Validation
+
+### Goal and scope
+
+Use Meta XR Simulator to validate AREngine's remaining live XR paths:
+changing head pose, the runtime's actual reported interaction profile,
+real boolean/float/vector2/pose controller actions, and their effect on
+the M10.6 visible interaction state. A clean Meta process exit was
+explicitly not a success criterion, per M11.3's own established finding
+that Meta's teardown crash is a separate, already-understood limitation.
+
+### Environment health check
+
+Meta reactivated via its official script; confirmed active
+(`arengine_openxr_demo` reports "Meta XR Simulator (version 205.0.0)"),
+`XR_KHR_vulkan_enable2` available, Vulkan device creation succeeds,
+`timelineSemaphore` remains enabled correctly, zero validation errors -
+the M11.2 fix still holds.
+
+### Actual interaction profile - determined, not guessed
+
+A new diagnostic, `OpenXRActionSystem::GetCurrentInteractionProfile`
+(wraps `xrGetCurrentInteractionProfile` + `xrPathToString`, returns the
+runtime's own reported path as a plain string), was added and called
+periodically (frame 1, then every 100 frames) from `xr_demo.cpp`.
+**Before any new binding code**, both hands reported `XR_NULL_PATH` at
+frame 1, then **`/interaction_profiles/khr/simple_controller`** from
+frame 100 onward - the exact profile AREngine already suggests bindings
+for. This is real, direct evidence (not inference) that the profile a
+runtime reports is a *consequence* of which profiles the application
+suggested bindings for, not an independent hardware fact: OpenXR's own
+binding resolution only ever selects among the profiles the application
+suggested, and `khr/simple_controller` was the only one suggested.
+`khr/simple_controller` has no trigger or thumbstick component at all
+(confirmed by reading `OpenXRSimpleControllerBindings.cpp` directly -
+only `select`/`aim_pose` are bound; `trigger`/`move` have no suggestion
+at all and were therefore structurally guaranteed to report
+`isActive=false` under any profile, regardless of what the simulator's
+own virtual controller hardware could do).
+
+### New binding: `oculus/touch_controller`, alongside `simple_controller`
+
+Per this evidence, a second binding set was added -
+`OpenXRTouchControllerBindings.hpp/.cpp` - suggesting
+`/interaction_profiles/oculus/touch_controller` (the standard, core-OpenXR,
+non-vendor-extension profile for Quest/Touch-style controllers, present
+since OpenXR 1.0) **alongside**, never replacing, `khr/simple_controller`
+(`OpenXRActionSystem`'s constructor now calls both suggestion functions
+unconditionally - no runtime-name check decides which to suggest; the
+runtime alone resolves which one actually matches the connected/simulated
+device). Component mapping, verified against the OpenXR 1.1 spec's
+interaction-profile table for this exact profile, not invented:
+
+| Action | Component (left) | Component (right) | Why |
+|---|---|---|---|
+| `select` (boolean) | `/input/x/click` | `/input/a/click` | No literal `select/click` exists on this profile (per the milestone's own explicit warning about Touch-style profiles) - the primary face button is used instead, kept distinct from `trigger` so both remain independently testable. |
+| `trigger` (float) | `/input/trigger/value` | `/input/trigger/value` | A genuine float-capable component - never a boolean click bound to the float action. |
+| `move` (Vector2f) | `/input/thumbstick` | `/input/thumbstick` | The **aggregate** 2D path - never the scalar `/x` or `/y` alone, which is not a valid Vector2f binding. |
+| `aim_pose` (pose) | `/input/aim/pose` | `/input/aim/pose` | Unchanged in shape from the `simple_controller` binding - never `grip/pose`. |
+
+The literal path strings live in a small pure-data struct
+(`TouchControllerBindingPaths`/`GetTouchControllerBindingPaths()`),
+separate from the real `xrStringToPath`/`xrSuggestInteractionProfileBindings`
+calls that consume them - directly unit-testable, unlike the real API
+calls themselves (same "real API call -> not unit tested" precedent as
+`SuggestSimpleControllerBindings`/`LoadOpenXRVulkanFunctions` elsewhere
+in this codebase).
+
+**Result after adding this**: both hands' reported interaction profile
+changed to **`/interaction_profiles/oculus/touch_controller`**, and -
+without driving any simulated input at all - **all four actions
+(`select`, `trigger`, `move`, `aim_pose`) transitioned from inactive to
+genuinely active on both hands**, with `aim_pose` reporting both
+`positionValid`/`orientationValid`, and the M10.6 pose marker becoming
+visible for the first time in any milestone this session. Values stayed
+at their idle/zero default (no press, zero trigger, zero thumbstick,
+static pose) - Meta's simulator provides a real, active, if currently
+idle, virtual controller once a profile it actually supports is
+suggested. This proves the full chain end to end with real (not
+fabricated) data: `xrGetCurrentInteractionProfile` → binding resolution
+→ `isActive=true` → generic `Input::*ActionState` → M10.6 visible state
+(pose marker) all respond to a genuine runtime-provided controller.
+
+### Live-driven input value changes: not achieved this session
+
+Extensive effort was spent attempting to drive real-time value changes
+(head translation/rotation via WASD+mouse, controller trigger/thumbstick/
+button presses) through Meta XR Simulator's own GUI, using Windows UI
+Automation (element enumeration, `InvokePattern`) and multiple Win32
+input-injection APIs (`SendKeys`, `keybd_event`, `SetForegroundWindow`
+combined with `AttachThreadInput` - verified via `GetForegroundWindow`
+to have genuinely succeeded). The "Input positioning" panel (live
+head/controller position/orientation readout) was found and confirmed
+read-only (no `ValuePattern`, not keyboard-focusable). Despite confirmed
+window focus and a direct click into the viewport, no position/orientation
+change was ever observed in the GUI's own readout after sending keyboard
+input. The "Tracking controls" section (labelled "No movement tracking
+active") does not expose an `InvokePattern` and did not visibly change
+state after a direct coordinate-based click. This mirrors the same
+category of limitation M11.3 hit with `hello_xr`'s interactive-only
+"press any key" exit path - an environment/tooling constraint (no
+visual screenshot capability for the native Windows desktop in this
+environment, and this GUI's own input-capture mechanism not responding
+to synthetic keyboard/mouse events at the OS level), not a new technical
+finding about Meta XR Simulator itself, and not a regression or defect
+in AREngine. Steps requiring a live-driven value **transition**
+(a real press/release cycle, a nonzero trigger/thumbstick reading, two
+distinct controller poses) could not be captured this session as a
+result - the achieved result is the full real-controller *activation*
+chain (above), not a moving value on top of it.
+
+### SteamVR regression
+
+`arengine_openxr_vulkan_demo`: clean, unaffected. `arengine_openxr_input_demo`
+(unmodified since M10): reports "suggested khr/simple_controller bindings"
+exactly as before, no action ever active - matches its own documented M10
+baseline exactly, no regression. `arengine_xr_demo` (rebuilt with the new
+touch_controller binding code): both hands report `XR_NULL_PATH`
+throughout all 1000 frames on SteamVR's null driver - **`khr/simple_controller`
+never resolves either, on SteamVR, exactly as before** - the new
+`oculus/touch_controller` binding did not change SteamVR's existing
+"no controller bound" behavior at all. The only Vulkan validation
+messages present are the same pre-existing SteamVR-internal noise
+already classified in M11.2/M11.3 (`VkExternalMemoryImageCreateInfo`/
+`initialLayout`, `VUID-vkCmdDraw-None-09600`, `VUID-vkDestroyDevice-device-05137`
+- SteamVR's own compositor objects, none of them AREngine's) - no new
+AREngine-attributable validation error appeared. Both processes exited
+cleanly (matching SteamVR's known-stable teardown, per M11.3).
+
+### Pure tests added
+
+Seven new tests in `tests/openxr_action_tests.cpp` (zero OpenXR API
+calls, zero runtime/GPU required): the profile path is exactly
+`/interaction_profiles/oculus/touch_controller`; select/trigger/move/
+aim_pose component paths match the table above exactly; `move` is
+explicitly *not* bound to a scalar `/thumbstick/x`; `aim_pose` is
+explicitly *not* bound to `grip/pose`; every left-hand path differs from
+its right-hand counterpart (subaction bookkeeping); the touch_controller
+and simple_controller profile paths are distinct (multiple suggested
+profiles can coexist). All existing `openxr_action_tests.cpp` checks
+(M10's boolean/float/vector2/pose conversion logic) remain unchanged and
+still pass.
+
+### Build/test status
+
+All four `ARENGINE_ENABLE_OPENXR`×`ARENGINE_ENABLE_VULKAN` combinations
+configure, build `/W4 /WX` clean, and pass 100% of their CTest suites
+(including the 7 new pure-logic tests, which run in the
+`OPENXR=ON`/`VULKAN=OFF` combination too, confirming no accidental
+Vulkan dependency was introduced).
+
+- Files changed: `engine/xr/src/openxr/OpenXRTouchControllerBindings.hpp/.cpp`
+  (new); `engine/xr/src/openxr/OpenXRActionSystem.hpp/.cpp` (new
+  `GetCurrentInteractionProfile` diagnostic, constructor now suggests
+  both binding sets); `engine/xr/CMakeLists.txt` (new source files);
+  `tests/xr_demo.cpp` (periodic interaction-profile logging); `tests/openxr_action_tests.cpp`
+  (7 new pure-logic tests). `OpenXRSimpleControllerBindings.hpp/.cpp`
+  untouched, per the milestone's own explicit instruction not to modify
+  or replace it.

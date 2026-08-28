@@ -649,6 +649,25 @@ int main()
         actionSystem.SyncActions(instance.Get(), session.Get());
         ++diag.framesSynced;
 
+        // M11.1B: report the runtime's ACTUAL reported interaction
+        // profile per hand - never guessed, never hard-coded to a
+        // specific runtime. Logged at frame 1 and then periodically
+        // (same cadence as the existing frame-count log), since the
+        // runtime may not bind a profile until later in the session
+        // lifecycle (e.g. once FOCUSED is reached) - reporting only
+        // once at frame 1 would risk a false "(none)" if it resolves
+        // later. An empty string means XR_NULL_PATH (no profile bound
+        // yet for that hand).
+        if (completedFrameCount == 0 || (completedFrameCount + 1) % 100 == 0)
+        {
+            const std::string leftProfile = actionSystem.GetCurrentInteractionProfile(instance.Get(), session.Get(), Hand::Left);
+            const std::string rightProfile = actionSystem.GetCurrentInteractionProfile(instance.Get(), session.Get(), Hand::Right);
+            AR_LOG_INFO(std::format("  [frame {}] [Left] interaction profile: {}", completedFrameCount + 1,
+                                     leftProfile.empty() ? "(none / XR_NULL_PATH)" : leftProfile));
+            AR_LOG_INFO(std::format("  [frame {}] [Right] interaction profile: {}", completedFrameCount + 1,
+                                     rightProfile.empty() ? "(none / XR_NULL_PATH)" : rightProfile));
+        }
+
         const XrTime predictedDisplayTime = frameDriver.GetLastPredictedDisplayTime();
         for (const Hand hand : {Hand::Left, Hand::Right})
         {

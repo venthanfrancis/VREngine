@@ -13,8 +13,10 @@
 // not depend on an XR runtime or headset being present.
 
 #include "openxr/OpenXRActionStateConversion.hpp"
+#include "openxr/OpenXRTouchControllerBindings.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -209,6 +211,101 @@ namespace
         const PoseActionState result = ConvertActionStatePose(/*actionIsActive=*/false, location);
         Check(!result.active, "pose: an inactive action stays inactive regardless of location validity");
     }
+
+    // --- M11.1B: oculus/touch_controller binding paths (pure data, no
+    // OpenXR API calls - see OpenXRTouchControllerBindings.hpp for why
+    // SuggestTouchControllerBindings() itself, which makes real
+    // xrStringToPath/xrSuggestInteractionProfileBindings calls, is not
+    // unit-tested here, matching this codebase's existing precedent). ---
+
+    bool PathEquals(const char* actual, const char* expected)
+    {
+        return std::strcmp(actual, expected) == 0;
+    }
+
+    void TestTouchControllerProfilePath()
+    {
+        const TouchControllerBindingPaths paths = GetTouchControllerBindingPaths();
+        Check(PathEquals(paths.profile, "/interaction_profiles/oculus/touch_controller"),
+              "touch_controller: profile path is exactly /interaction_profiles/oculus/touch_controller");
+    }
+
+    void TestTouchControllerSelectComponentPaths()
+    {
+        const TouchControllerBindingPaths paths = GetTouchControllerBindingPaths();
+        // No literal "select/click" exists on this profile - the
+        // primary face button is used instead (x/click left, a/click
+        // right), distinct from the trigger component.
+        Check(PathEquals(paths.leftSelect, "/user/hand/left/input/x/click"),
+              "touch_controller: left select maps to x/click");
+        Check(PathEquals(paths.rightSelect, "/user/hand/right/input/a/click"),
+              "touch_controller: right select maps to a/click");
+    }
+
+    void TestTouchControllerTriggerComponentPaths()
+    {
+        const TouchControllerBindingPaths paths = GetTouchControllerBindingPaths();
+        // A genuine float-capable component - never a boolean click
+        // bound to the float trigger action.
+        Check(PathEquals(paths.leftTrigger, "/user/hand/left/input/trigger/value"),
+              "touch_controller: left trigger maps to trigger/value");
+        Check(PathEquals(paths.rightTrigger, "/user/hand/right/input/trigger/value"),
+              "touch_controller: right trigger maps to trigger/value");
+    }
+
+    void TestTouchControllerVector2ComponentPaths()
+    {
+        const TouchControllerBindingPaths paths = GetTouchControllerBindingPaths();
+        // The AGGREGATE 2D thumbstick path - never a scalar .../x or
+        // .../y alone, which would not be a valid Vector2f binding.
+        Check(PathEquals(paths.leftMove, "/user/hand/left/input/thumbstick"),
+              "touch_controller: left move maps to the aggregate thumbstick path, not a scalar axis");
+        Check(PathEquals(paths.rightMove, "/user/hand/right/input/thumbstick"),
+              "touch_controller: right move maps to the aggregate thumbstick path, not a scalar axis");
+        Check(!PathEquals(paths.leftMove, "/user/hand/left/input/thumbstick/x"),
+              "touch_controller: left move is NOT bound to the scalar /x sub-path");
+    }
+
+    void TestTouchControllerAimPoseComponentPaths()
+    {
+        const TouchControllerBindingPaths paths = GetTouchControllerBindingPaths();
+        // aim/pose, matching the simple_controller binding's own
+        // choice - never grip/pose.
+        Check(PathEquals(paths.leftAimPose, "/user/hand/left/input/aim/pose"),
+              "touch_controller: left aim_pose maps to aim/pose");
+        Check(PathEquals(paths.rightAimPose, "/user/hand/right/input/aim/pose"),
+              "touch_controller: right aim_pose maps to aim/pose");
+        Check(!PathEquals(paths.leftAimPose, "/user/hand/left/input/grip/pose"),
+              "touch_controller: left aim_pose is NOT bound to grip/pose");
+    }
+
+    void TestTouchControllerLeftRightPathsAreDistinct()
+    {
+        const TouchControllerBindingPaths paths = GetTouchControllerBindingPaths();
+        // Left/right subaction bookkeeping: every left-hand path must
+        // differ from its right-hand counterpart (a hand-swap bug would
+        // silently pass every other check above).
+        Check(!PathEquals(paths.leftSelect, paths.rightSelect), "touch_controller: left/right select paths differ");
+        Check(!PathEquals(paths.leftTrigger, paths.rightTrigger), "touch_controller: left/right trigger paths differ");
+        Check(!PathEquals(paths.leftMove, paths.rightMove), "touch_controller: left/right move paths differ");
+        Check(!PathEquals(paths.leftAimPose, paths.rightAimPose), "touch_controller: left/right aim_pose paths differ");
+    }
+
+    void TestTouchControllerAndSimpleControllerProfilesCoexist()
+    {
+        // Multiple profile suggestions coexisting: touch_controller's
+        // own profile path must never collide with khr/simple_controller's
+        // (OpenXRSimpleControllerBindings.cpp) - both are suggested
+        // unconditionally, together, in OpenXRActionSystem's constructor,
+        // and the runtime resolves whichever actually matches the
+        // connected/simulated device. A literal string compare here
+        // (not a shared constant) deliberately mirrors what a future
+        // reader of either file would see independently.
+        const TouchControllerBindingPaths touchPaths = GetTouchControllerBindingPaths();
+        constexpr const char* kSimpleControllerProfile = "/interaction_profiles/khr/simple_controller";
+        Check(!PathEquals(touchPaths.profile, kSimpleControllerProfile),
+              "touch_controller and simple_controller profile paths are distinct - both can be suggested together");
+    }
 }
 
 int main()
@@ -230,9 +327,17 @@ int main()
     TestPoseInvalidPositionIsNotFabricated();
     TestPoseInactiveActionIsReportedInactive();
 
+    TestTouchControllerProfilePath();
+    TestTouchControllerSelectComponentPaths();
+    TestTouchControllerTriggerComponentPaths();
+    TestTouchControllerVector2ComponentPaths();
+    TestTouchControllerAimPoseComponentPaths();
+    TestTouchControllerLeftRightPathsAreDistinct();
+    TestTouchControllerAndSimpleControllerProfilesCoexist();
+
     if (g_failureCount == 0)
     {
-        std::printf("All OpenXR action-state-conversion (pure-logic) M10 checks passed\n");
+        std::printf("All OpenXR action-state-conversion (pure-logic) M10/M11.1B checks passed\n");
         return 0;
     }
     std::fprintf(stderr, "%d check(s) failed\n", g_failureCount);
