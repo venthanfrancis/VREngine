@@ -8402,3 +8402,78 @@ Per M11.3's own explicit instruction not to assign blame early: this is
 "runtime bug or interop issue," not "AREngine bug"** - but this remains
 unconfirmed without the live evidence Steps 8-11 would have produced,
 and must not be treated as a final determination.
+
+## M11.3A - Smart App Control Diagnosis (resolved by clean rebuild)
+
+### Root cause, proven not assumed
+
+Windows **Smart App Control** (`Microsoft-Windows-CodeIntegrity` provider,
+event IDs 3033/3077/3089/3118) was confirmed as the exact blocker via the
+Code Integrity event log's structured data - not inferred from the
+PowerShell error text alone. The critical field:
+`PreviousEnablementState=2` (Evaluation) → `EnablementSwitchType=1` (On/
+enforcement), timestamped mid-session on 2026-08-28, confirms Smart App
+Control **auto-transitioned from evaluation to enforcement during this
+investigation** - matching Microsoft's own documented behavior ("In most
+cases Smart App Control automatically turns on"). A second field,
+`DefenderMadeCloudCall=false`, shows the reputation lookup for the
+blocked binary never completed - consistent with the documented default
+("unknown, unsigned code" is blocked by default when no verdict is
+available), not an active "this file is malicious" determination.
+
+Comparing one working and one blocked binary (same build tree, same
+toolchain, same owner `KRIXI\venth`, both `NotSigned`, neither carrying
+a `Zone.Identifier`/Mark-of-the-Web stream) found **no structural
+difference** between them - the only variable was prior execution
+history before enforcement began (the working binary had already run
+successfully earlier in the session; the blocked one had never run
+before enforcement started).
+
+### The decisive experiment (M11.3A Step 7)
+
+A blocked binary (`arengine_openxr_session_demo.exe`) was deleted and
+cleanly relinked from source (confirmed via the linker's own "not found
+... performing full link" message, and a new SHA-256:
+`DCE58BEB...` vs. the old, blocked `060D7D47...`). Launched exactly once:
+**it ran** - no Application Control error, no Code Integrity event
+logged for the new hash. It reached real OpenXR/Vulkan calls and hit an
+unrelated, pre-existing issue (`xrGetVulkanGraphicsDevice2KHR failed:
+XR_ERROR_RUNTIME_FAILURE`, SteamVR itself refusing the request - most
+likely stale SteamVR state from this session's own extensive repeated
+OpenXR instance churn, not a security block, not an AREngine bug, and
+out of this milestone's scope). A full clean rebuild of the four
+previously-`Not Run` CTest binaries followed by `ctest --output-on-failure`
+produced **17/17 tests passed, zero blocks**. The other two M11.3
+instrumented demos (`frame_demo`, `xr_demo`, already rebuilt earlier in
+the session) were confirmed unblocked too, hitting the same SteamVR
+`XR_ERROR_RUNTIME_FAILURE`.
+
+**Conclusion: the blocker is resolved by clean rebuild - Smart App
+Control does not permanently block fresh, locally-compiled AREngine
+binaries once each new hash has been observed to run once.** No security
+setting was changed. Smart App Control remains enabled.
+
+### Reversibility (current Microsoft documentation, not old assumptions)
+
+The earlier M11.1-era claim that Smart App Control "cannot be turned
+back off without a clean Windows reinstall" is **outdated** as of this
+investigation. Microsoft's current support documentation
+(support.microsoft.com, Smart App Control FAQ) states: "Recent Windows
+updates allow Smart App Control to be re-enabled without requiring a
+clean installation" - this friction has been removed in a recent update,
+whether Smart App Control was turned off manually or automatically. The
+separate, still-current requirement is that Smart App Control can only
+be **initially enabled** on a clean install - that constraint is about
+first activation, not about toggling an already-active installation.
+
+### Remaining, unrelated blocker for resuming M11.3
+
+SteamVR's own OpenXR runtime is currently returning
+`XR_ERROR_RUNTIME_FAILURE` from `xrGetVulkanGraphicsDevice2KHR` across
+every demo tried, independent of the Smart App Control issue. This looks
+like stale SteamVR process/session state accumulated from this session's
+very heavy repeated OpenXR instance creation/destruction (including the
+Meta XR Simulator crashes investigated in M11.2/M11.3) - a SteamVR
+restart is the most likely fix, not an AREngine or Smart App Control
+issue. Not investigated further here, per M11.3A's own scope (no
+AREngine architecture changes, no resuming M11.3 XR work).
