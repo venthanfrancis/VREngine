@@ -8173,3 +8173,232 @@ above.
   path); `tests/openxr_vulkan_tests.cpp` (5 new pure-logic tests). No
   other `engine/` or `tests/` files changed; `engine/rendering/` (desktop
   Vulkan) untouched.
+
+## M11.3 - Teardown Investigation (blocked partway through by environment)
+
+### Goal and scope
+
+Investigate the Meta clean-exit crash left open by M11.2, without
+guessing: document the real ownership graph, instrument teardown with
+crash-survivable logging, classify every leaked/racing handle by actual
+creator (not by inference from validation-message text alone), and only
+then classify root cause as AREngine/runtime/interop/unknown. No
+teardown-order changes, no workarounds, no runtime-name branching.
+
+### Step 1: Ownership graph (`tests/xr_demo.cpp`, verified against each
+wrapper class's actual constructor/destructor source, not milestone
+prose)
+
+Declaration order in `main()` (destruction is exact reverse, per C++'s
+local-variable rule):
+
+| Object | Creates | Destroys via | Depends on |
+|---|---|---|---|
+| `instance` (`OpenXRInstance`) | `XrInstance` | `xrDestroyInstance` | nothing |
+| `binding` (`OpenXRVulkanGraphicsBinding`) | `VkInstance`, `VkPhysicalDevice` (borrowed from driver), `VkDevice`, `VkQueue` (borrowed from device) | debug messenger, then `vkDestroyDevice`, then `vkDestroyInstance` | `instance` |
+| `session` (`OpenXRSession`) | `XrSession` | `xrDestroySession` | `instance`, `binding` |
+| `localSpace` (`OpenXRReferenceSpace`) | `XrSpace` | `xrDestroySpace` | `instance`, `session` |
+| `actionSystem` (`OpenXRActionSystem`) | `XrActionSet`, 4x `XrAction`, 2x `XrSpace` (action spaces) | action spaces (`xrDestroySpace`) → actions (`xrDestroyAction`) → action set (`xrDestroyActionSet`), in class-member reverse order | `instance`, `session` |
+| `swapchains` (N x `OpenXRSwapchain`) | N x `XrSwapchain`; AREngine-owned `VkImageView`s over runtime-owned `VkImage`s | per swapchain: AREngine's `VkImageView`s (`vkDestroyImageView`) first, then `xrDestroySwapchain` | `instance`, `session`, `binding.device` |
+| `projectionLayer` (`OpenXRProjectionLayer`) | nothing owned (borrows swapchain handles) | trivial | `swapchains`, `localSpace` |
+| `renderPass` (`VulkanRenderPass`) | `VkRenderPass` | `vkDestroyRenderPass` | `binding.device` |
+| `descriptorSetLayout` (`VulkanDescriptorSetLayout`) | `VkDescriptorSetLayout` | `vkDestroyDescriptorSetLayout` | `binding.device` |
+| `pipeline` (`VulkanGraphicsPipeline`) | `VkPipeline`, `VkPipelineLayout` | `vkDestroyPipeline`, `vkDestroyPipelineLayout` | `binding.device`, `renderPass`, `descriptorSetLayout` |
+| `commandPool` (`VulkanCommandPool`) | `VkCommandPool` (implicitly owns `commandBuffer`) | `vkDestroyCommandPool` | `binding.device` |
+| `cubeMesh`/`floorMesh` (`VulkanMesh`) | 2x `VulkanBuffer` each (vertex+index → `VkBuffer`+`VkDeviceMemory`) | buffer before memory, per `VulkanBuffer`'s own destructor | `binding.device` |
+| `texture` (`VulkanImage`) | `VkImageView`, `VkImage`, `VkDeviceMemory` | view → image → memory | `binding.device` |
+| `sampler` (`VulkanSampler`) | `VkSampler` | `vkDestroySampler` | `binding.device` |
+| `descriptorPool` (`VulkanDescriptorPool`) | `VkDescriptorPool` (implicitly frees `descriptorSet`) | `vkDestroyDescriptorPool` | `binding.device` |
+| `viewTargets` (N x `OpenXRVulkanViewTarget`) | per view: depth `VulkanImage`, `VulkanFramebuffers` | framebuffers, then depth image (class-member reverse order) | `binding.device`, `renderPass`, `swapchains[i]` |
+| `sceneObjects` | nothing (non-owning mesh pointers) | trivial | nothing |
+| `commandBuffer` (raw `VkCommandBuffer`) | nothing separately | freed implicitly by `commandPool`'s own destruction | `commandPool` |
+| `renderFence` (raw `VkFence`) | `VkFence` | explicit `vkDestroyFence`, called manually BEFORE the RAII chain even starts (see below) | `binding.device` |
+| `frameDriver` (`XRFrameDriver`) | nothing owned (borrows `session`/`localSpace`) | trivial | `session`, `localSpace` |
+
+Explicit (non-RAII) shutdown sequence, in the code, before any automatic
+destructor runs: `vkDeviceWaitIdle(binding.device)` → `vkDestroyFence(renderFence)`
+→ `AR_LOG_INFO("...shutting down")` → `return 0` → automatic destructor
+chain begins (`frameDriver` → ... → `instance`, in the exact reverse
+order of the table above).
+
+**Cross-checked against real OpenXR object-hierarchy rules (Step 6),
+not old milestone prose**: `XrSwapchain`/`XrSpace` (session children)
+destroyed before `XrSession` - correct. `XrActionSet`/`XrAction` are
+actually `XrInstance` children, not `XrSession` children, per spec - so
+destroying them before `session` (as AREngine does) is conservative,
+not required, and not a violation either way. `XrSession` destroyed
+before the shared `VkDevice` (via `binding`'s destructor) - correct,
+matches `XR_KHR_vulkan_enable2`'s implied lifetime (the runtime's
+compositor may still reference the device through the session).
+`VkDevice` destroyed before `VkInstance`, `XrInstance` destroyed last of
+all - correct. **No destruction-order violation found anywhere in this
+graph.**
+
+`openxr_session_demo.cpp` and `openxr_frame_demo.cpp` have their own,
+much smaller graphs (`instance`→`binding`→`session`→reference
+spaces/swapchains, no rendering resources beyond frame_demo's own single
+`VkCommandPool`+`VkFence`) - see the source for the exact tables; not
+repeated here.
+
+### Step 3: `vkDeviceWaitIdle` usage - a real inconsistency found
+
+- `arengine_xr_demo` (`tests/xr_demo.cpp`): calls `vkDeviceWaitIdle`
+  immediately before its own explicit `vkDestroyFence`, with a comment
+  already noting the runtime's compositor may have independent in-flight
+  work on the shared device.
+- `arengine_openxr_frame_demo` (`tests/openxr_frame_demo.cpp`): creates
+  its own `VkCommandPool`+`VkFence` but **never calls `vkDeviceWaitIdle`**
+  before destroying them.
+- `arengine_openxr_session_demo`: creates zero Vulkan resources of its
+  own (see Step 5), so there is nothing of AREngine's own to wait on -
+  not calling it here is not itself a bug, but it also provides no
+  guarantee about the runtime's own independent work.
+
+This inconsistency is real and now documented, but **not acted on** -
+`xr_demo.cpp` already calls `vkDeviceWaitIdle` and still crashes, so
+adding it to `frame_demo.cpp` on a guess would not be evidence-driven per
+M11.3's own explicit instruction. Left as a candidate fix pending live
+confirmation (blocked - see below).
+
+### Steps 4/5: Handle ownership classification (from source, cross-checked
+against the M11.2 crash-log evidence already on record)
+
+Definitive, source-grounded findings - not inferred from validation
+message text alone:
+
+- **`grep` for `vkCreateSemaphore` across the entire `engine/` tree and
+  every `tests/*.cpp` XR demo returns zero matches.** AREngine creates
+  no `VkSemaphore` anywhere in this codebase. Therefore every
+  `VkSemaphore` reported "leaked" in every M11.2 crash log (Meta and
+  SteamVR alike) is **conclusively not AREngine's** - including the one
+  most directly tied to Problem A/the timeline semaphore itself.
+- **`grep` for `vkCreatePipelineCache`/`VkPipelineCache` across the same
+  scope also returns zero matches.** The `VkPipelineCache` reported
+  leaked in M11.2's Meta session-demo run is therefore also conclusively
+  not AREngine's.
+- **`openxr_session_demo.cpp` makes zero `vkCreate*` calls of any kind**
+  (confirmed by `grep -c "vkCreate" tests/openxr_session_demo.cpp` → 0).
+  The `VkCommandPool` residual reported leaked in every M11.1/M11.2 run
+  of this demo is therefore **conclusively not AREngine's** - this
+  directly answers M11.3's own flagged question about that specific
+  residual.
+- **`openxr_frame_demo.cpp` allocates exactly one `VkCommandBuffer` and
+  creates exactly one `VkFence`, zero `VkSemaphore`s** (confirmed by
+  `grep -n "vkAllocateCommandBuffers\|vkCreateFence\|vkCreateSemaphore"`).
+  M11.2's SteamVR frame-demo crash log showed **three** distinct
+  `VkCommandBuffer` handles and **four** distinct `VkFence` handles
+  leaked - both counts exceed what this demo could possibly have created
+  itself, so the excess (at minimum 2 command buffers, 3 fences) is
+  conclusively runtime-owned.
+- **Swapchain `VkImage`s**: every M11.2 crash log's leaked `VkImage`
+  entries carry the runtime's own debug name, e.g.
+  `[XRSim][Client][1680x1760] Image (Swapchain Image 2/3)` - matching
+  `OpenXRSwapchain.hpp`'s own documented, source-verified ownership
+  split ("Does NOT own the VkImages returned by
+  xrEnumerateSwapchainImages - these belong to the OpenXR runtime's
+  compositor"). AREngine never calls `vkCreateImage` for these; they
+  come from `xrEnumerateSwapchainImages` and are the exact resource
+  `OpenXRSwapchain`'s own class comment already documents as
+  runtime-owned. Conclusively not AREngine's.
+- **`VkDeviceMemory` entries** in the same crash logs are most plausibly
+  the backing memory for those same runtime-owned swapchain images (or
+  other runtime-internal allocations, e.g. SteamVR's own `BlankEyeBuffer`)
+  - AREngine never allocates memory for a swapchain image (same
+  ownership-split reasoning). Not conclusively provable purely from
+  `grep` the way the object-count arguments above are, but consistent
+  with every other finding.
+
+**Net result: every object type observed as leaked or racing in every
+M11.1/M11.2 crash log, across both runtimes and all three demos, is
+either something AREngine's source never creates at all, or exceeds the
+count AREngine could have created - none of the leaked/racing handles
+gathered so far are provably AREngine's own.** This is strong,
+source-grounded evidence pointing away from an AREngine ownership/lifetime
+bug and toward the runtime side - but it does not yet identify the exact
+crashing call/thread, which requires the live re-instrumented runs below
+that the environment currently blocks.
+
+### Step 2: Teardown instrumentation (implemented, not yet exercised live)
+
+Added to `tests/xr_demo.cpp`, `tests/openxr_frame_demo.cpp`, and
+`tests/openxr_session_demo.cpp`: a small `TeardownMarker` RAII sentinel
+(diagnostic-only, temporary) placed immediately after each real object's
+declaration - since C++ destroys local objects in exact reverse
+declaration order, each sentinel's own destructor fires immediately
+before the real object it follows is destroyed, giving a precise
+"reached this point in teardown" trace with zero changes to any engine
+class's own destructor. Writes to `std::cerr` (unit-buffered per the
+C++ standard, plus an explicit `.flush()`) rather than `AR_LOG_INFO`'s
+`std::cout`, specifically because `std::cout` redirected to a file is
+typically fully block-buffered and can silently lose already-produced
+output when a process is killed by an unhandled exception - exactly the
+ambiguity that made M11.2's crash evidence inconclusive about whether
+AREngine's own destructors ever started running. Also added: `VK_EXT_debug_utils`
+object naming (`NameVulkanObject`, no-ops safely if unavailable) on
+AREngine's own `commandPool`/`renderFence` in `xr_demo.cpp` and
+`frame_demo.cpp`, so future validation output can name-match these
+specific objects directly rather than relying on count-based inference.
+
+### Blocker: Windows Smart App Control (Steps 8-11 not run)
+
+While preparing to re-run the instrumented demos against Meta XR
+Simulator, **every executable in the build directory - including
+binaries built and successfully run earlier in this same session -
+became blocked from launching**, with PowerShell reporting "An
+Application Control policy has blocked this file." Read-only inspection
+of the `Microsoft-Windows-CodeIntegrity/Operational` event log confirmed
+the exact cause: Windows **Smart App Control** (`VerifiedAndReputablePolicyState: 1`,
+i.e. enforcing) began blocking unsigned AREngine build binaries at
+13:29:48 on the day of this investigation, logging "Code Integrity
+determined that a process (bash.exe) attempted to load
+arengine_openxr_demo.exe that did not meet the Enterprise signing level
+requirements or violated code integrity policy." This is a machine-wide
+policy change, not something caused by M11.3's own code changes (it
+blocks binaries that ran successfully hours earlier in the same session)
+and not something this investigation attempts to work around - modifying
+security policy is out of scope. Per Microsoft's own documentation, Smart
+App Control cannot be turned back off once switched from "Evaluation" to
+"On" without a clean Windows reinstall, so this is a real, potentially
+long-lived environment constraint, not a transient glitch.
+
+**As a result, Steps 8 (repeat Meta test with instrumentation), 9**
+**(Khronos hello_xr isolation test), 10 (crash-reproduction matrix across**
+**demos), and 11 (timeline-feature A/B diagnostic) could not be**
+**performed this milestone.** The instrumentation and `VK_EXT_debug_utils`
+naming described above are implemented and built successfully, but have
+not yet produced live evidence.
+
+### Step 7: Session exit sequence (verified by code structure)
+
+`tests/xr_demo.cpp`'s frame loop calls `PrepareFrame()` at the top of
+every iteration and checks for `FrameStatus::Stop` **before** calling
+`BeginFrame()` or doing any rendering that tick - so a `Stop` status can
+only ever be observed at the start of a fresh iteration, never partway
+through an acquire/render/release sequence. Every tick that renders
+acquires, waits, and releases **every** swapchain image within that same
+tick, before `EndFrame()` runs. By construction, this means no
+`XrSwapchain` image can be left acquired when the loop exits - proven by
+code structure, not yet independently confirmed by a live instrumented
+run (blocked, see above). `openxr_frame_demo.cpp` follows the identical
+acquire-render-release-within-one-tick pattern.
+
+### Step 12: Root cause classification (preliminary - not final)
+
+Per M11.3's own explicit instruction not to assign blame early: this is
+**not** a final classification. Available evidence:
+
+- No destruction-order violation found in AREngine's own code (Step 6).
+- Every leaked/racing handle observed so far is either something
+  AREngine's source never creates, or exceeds the count AREngine could
+  have created (Steps 4/5) - none are provably AREngine's.
+- A real inconsistency exists (`frame_demo.cpp` never calls
+  `vkDeviceWaitIdle`), but `xr_demo.cpp` already calls it and still
+  crashes, so this alone cannot be the root cause.
+- The exact crashing call and thread remain unknown - this requires the
+  live re-instrumented runs and, ideally, the official Khronos `hello_xr`
+  isolation test that Steps 8-9 would have provided.
+
+**Best-supported classification given available evidence: leans toward
+"runtime bug or interop issue," not "AREngine bug"** - but this remains
+unconfirmed without the live evidence Steps 8-11 would have produced,
+and must not be treated as a final determination.

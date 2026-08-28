@@ -76,6 +76,7 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -84,6 +85,41 @@
 
 namespace
 {
+    // M11.3 diagnostic-only teardown tracer - see tests/xr_demo.cpp's
+    // own copy for the full reasoning (std::cerr, unit-buffered plus
+    // explicit flush, survives a crash that would lose std::cout's
+    // buffered content). Temporary, removed once the Meta clean-exit
+    // crash is root-caused.
+    struct TeardownMarker
+    {
+        const char* label;
+        explicit TeardownMarker(const char* l) : label(l) {}
+        ~TeardownMarker()
+        {
+            std::cerr << "[TEARDOWN] about to destroy: " << label << std::endl;
+            std::cerr.flush();
+        }
+    };
+
+    // M11.3 diagnostic-only: names AREngine-created objects via
+    // VK_EXT_debug_utils - see tests/xr_demo.cpp's own copy for the full
+    // reasoning. Never used on runtime/OpenXR-owned handles.
+    void NameVulkanObject(VkInstance instance, VkDevice device, VkObjectType type, std::uint64_t handle, const char* name)
+    {
+        auto setName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
+            vkGetInstanceProcAddr(instance, "vkSetDebugUtilsObjectNameEXT"));
+        if (setName == nullptr)
+        {
+            return;
+        }
+        VkDebugUtilsObjectNameInfoEXT nameInfo{};
+        nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+        nameInfo.objectType = type;
+        nameInfo.objectHandle = handle;
+        nameInfo.pObjectName = name;
+        setName(device, &nameInfo);
+    }
+
     // Small, self-contained CheckVkResult-equivalent - deliberately
     // duplicated rather than reused across modules, same discipline
     // OpenXRVulkanGraphicsBinding.cpp already established for this
@@ -214,6 +250,7 @@ int main()
 
     const std::array<const char*, 1> requestedExtensions{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
     OpenXRInstance instance(requestedExtensions);
+    const TeardownMarker teardownInstance("instance (xrDestroyInstance)");
     if (!instance.IsValid())
     {
         if (instance.CreationResult() == XR_ERROR_RUNTIME_UNAVAILABLE)
@@ -295,9 +332,11 @@ int main()
     // --- M9C graphics binding + M9D session (unchanged) ---
     AR_LOG_INFO("Creating OpenXR-compatible Vulkan instance/device via XR_KHR_vulkan_enable2...");
     OpenXRVulkanGraphicsBinding binding(instance.Get(), systemId);
+    const TeardownMarker teardownBinding("binding (debug messenger, then vkDestroyDevice, then vkDestroyInstance)");
     AR_LOG_INFO(std::format("Vulkan API version selected: {}", FormatVkApiVersion(binding.GetSelectedVulkanApiVersion())));
 
     OpenXRSession session(instance.Get(), systemId, binding.GetBindingData());
+    const TeardownMarker teardownSession("session (xrDestroySession)");
     AR_LOG_INFO("XrSession created successfully");
 
     // --- M9F: LOCAL reference space (M9D's class, unused since M9E.5 -
@@ -308,6 +347,7 @@ int main()
     // future spatial anchors remain separate concerns. See
     // docs/ARCHITECTURE.md, "LOCAL Reference-Space Use (M9F)". ---
     OpenXRReferenceSpace localSpace(instance.Get(), session.Get(), XR_REFERENCE_SPACE_TYPE_LOCAL);
+    const TeardownMarker teardownLocalSpace("localSpace (xrDestroySpace, LOCAL)");
     AR_LOG_INFO("Created LOCAL reference space");
 
     // --- M9E: swapchain format selection ---
@@ -343,6 +383,7 @@ int main()
         AR_LOG_INFO(std::format("Created swapchain for view {}: {}x{}, {} image(s)",
                                  i, swapchains.back()->GetWidth(), swapchains.back()->GetHeight(), swapchains.back()->GetImages().size()));
     }
+    const TeardownMarker teardownSwapchains("swapchains (per-view: AREngine VkImageViews, then xrDestroySwapchain)");
 
     // --- M9F: per-view composition sub-image metadata, built directly
     // from each real OpenXRSwapchain's own width/height (never M9D's
@@ -373,6 +414,7 @@ int main()
                                  i, i, subImage.imageRect.extent.width, subImage.imageRect.extent.height));
     }
     OpenXRProjectionLayer projectionLayer(projectionSubImages, localSpace.Get());
+    const TeardownMarker teardownProjectionLayer("projectionLayer (trivial, no owned handle)");
 
     // --- Minimal Vulkan resources for the per-eye clear: one command
     // pool, one reusable command buffer, one fence. Destroyed explicitly
@@ -388,6 +430,8 @@ int main()
     poolInfo.queueFamilyIndex = bindingData.queueFamilyIndex;
     VkCommandPool commandPool = VK_NULL_HANDLE;
     CheckVkResultHere(vkCreateCommandPool(bindingData.device, &poolInfo, nullptr, &commandPool), "vkCreateCommandPool");
+    NameVulkanObject(bindingData.instance, bindingData.device, VK_OBJECT_TYPE_COMMAND_POOL,
+        reinterpret_cast<std::uint64_t>(commandPool), "AREngine.frame_demo.commandPool");
 
     VkCommandBufferAllocateInfo cbAllocInfo{};
     cbAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -405,11 +449,14 @@ int main()
     // frame" wait against a fence nothing has signaled yet.
     VkFence renderFence = VK_NULL_HANDLE;
     CheckVkResultHere(vkCreateFence(bindingData.device, &fenceInfo, nullptr, &renderFence), "vkCreateFence");
+    NameVulkanObject(bindingData.instance, bindingData.device, VK_OBJECT_TYPE_FENCE,
+        reinterpret_cast<std::uint64_t>(renderFence), "AREngine.frame_demo.renderFence");
 
     // --- Frame loop, driven through XRFrameDriver (M9E.5) ---
     AR_LOG_INFO(std::format("Beginning OpenXR frame loop - target {} completed frames before requesting exit...", kTargetFrameCount));
 
     XRFrameDriver frameDriver(instance.Get(), session, localSpace, *primaryViewConfigType, *selectedBlendMode);
+    const TeardownMarker teardownFrameDriver("frameDriver (trivial, no owned handle)");
 
     std::uint32_t completedFrameCount = 0;
     bool exitRequested = false;
@@ -619,10 +666,29 @@ int main()
     // creation comment above), in dependency order, BEFORE returning -
     // this must happen before `binding`'s destructor destroys the
     // VkDevice they belong to.
+    // M11.3 diagnostic note: unlike tests/xr_demo.cpp, this demo does
+    // NOT call vkDeviceWaitIdle before the explicit destroys below - a
+    // real inconsistency found during the M11.3 teardown investigation
+    // (docs/ARCHITECTURE.md). Not changed here: M11.3's own instruction
+    // is to instrument and observe first, not to reorder/add waits on a
+    // guess. The instrumentation below records exactly whether this
+    // omission correlates with where a crash occurs.
+    std::cerr << "[TEARDOWN] begin explicit shutdown sequence (no vkDeviceWaitIdle called - see note above)" << std::endl;
+    std::cerr.flush();
+    std::cerr << "[TEARDOWN] vkDestroyFence(renderFence) begin" << std::endl;
+    std::cerr.flush();
     vkDestroyFence(bindingData.device, renderFence, nullptr);
+    std::cerr << "[TEARDOWN] vkDestroyFence(renderFence) complete" << std::endl;
+    std::cerr.flush();
+    std::cerr << "[TEARDOWN] vkDestroyCommandPool(commandPool) begin" << std::endl;
+    std::cerr.flush();
     vkDestroyCommandPool(bindingData.device, commandPool, nullptr); // also frees commandBuffer
+    std::cerr << "[TEARDOWN] vkDestroyCommandPool(commandPool) complete" << std::endl;
+    std::cerr.flush();
 
     AR_LOG_INFO("OpenXR frame demo complete - shutting down");
+    std::cerr << "[TEARDOWN] entering automatic (RAII) destructor chain now" << std::endl;
+    std::cerr.flush();
     return 0;
 
     // Destruction, in order (see each declaration's comment above):

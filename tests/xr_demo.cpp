@@ -94,12 +94,63 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <vector>
 
 namespace
 {
+    // M11.3 diagnostic-only teardown tracer - temporary, to be removed
+    // once the Meta clean-exit crash (docs/ARCHITECTURE.md, "Clean-Exit
+    // Crash") is root-caused. Writes to std::cerr (unit-buffered per the
+    // C++ standard - each `<<` flushes automatically - plus an explicit
+    // .flush() here for certainty) rather than AR_LOG_INFO's std::cout,
+    // which can lose buffered-but-unflushed output when the process is
+    // killed by an unhandled exception; this is exactly the ambiguity
+    // M11.2's crash evidence could not rule out. One instance placed
+    // immediately after each real object's declaration - C++ destroys
+    // local objects in exact reverse declaration order, so this
+    // sentinel's destructor fires immediately BEFORE the real object's
+    // own destructor runs, giving a precise "reached this point in
+    // teardown" trace without touching any engine class's own
+    // destructor.
+    struct TeardownMarker
+    {
+        const char* label;
+        explicit TeardownMarker(const char* l) : label(l) {}
+        ~TeardownMarker()
+        {
+            std::cerr << "[TEARDOWN] about to destroy: " << label << std::endl;
+            std::cerr.flush();
+        }
+    };
+
+    // M11.3 diagnostic-only: names AREngine-created objects via
+    // VK_EXT_debug_utils (already enabled on this instance whenever
+    // validation is available - see OpenXRVulkanGraphicsBinding.cpp) so
+    // any object a validation message reports can be matched directly
+    // against AREngine's own known handles, rather than inferred. Silently
+    // no-ops if the function isn't available (release builds, or
+    // validation unavailable) - never fatal, this is diagnostics only.
+    // Never used on runtime/OpenXR-owned handles (e.g. swapchain
+    // VkImages) - only on objects this demo itself creates.
+    void NameVulkanObject(VkInstance instance, VkDevice device, VkObjectType type, std::uint64_t handle, const char* name)
+    {
+        auto setName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
+            vkGetInstanceProcAddr(instance, "vkSetDebugUtilsObjectNameEXT"));
+        if (setName == nullptr)
+        {
+            return;
+        }
+        VkDebugUtilsObjectNameInfoEXT nameInfo{};
+        nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+        nameInfo.objectType = type;
+        nameInfo.objectHandle = handle;
+        nameInfo.pObjectName = name;
+        setName(device, &nameInfo);
+    }
+
     void CheckVkResultHere(VkResult result, const char* operation)
     {
         if (result != VK_SUCCESS)
@@ -300,6 +351,7 @@ int main()
 
     const std::array<const char*, 1> requestedExtensions{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
     OpenXRInstance instance(requestedExtensions);
+    const TeardownMarker teardownInstance("instance (xrDestroyInstance)");
     if (!instance.IsValid())
     {
         if (instance.CreationResult() == XR_ERROR_RUNTIME_UNAVAILABLE)
@@ -364,18 +416,22 @@ int main()
 
     AR_LOG_INFO("Creating OpenXR-compatible Vulkan instance/device via XR_KHR_vulkan_enable2...");
     OpenXRVulkanGraphicsBinding binding(instance.Get(), systemId);
+    const TeardownMarker teardownBinding("binding (debug messenger, then vkDestroyDevice, then vkDestroyInstance)");
     const VulkanGraphicsBindingData& bindingData = binding.GetBindingData();
     AR_LOG_INFO(std::format("Vulkan API version selected: {}", FormatVkApiVersion(binding.GetSelectedVulkanApiVersion())));
 
     OpenXRSession session(instance.Get(), systemId, bindingData);
+    const TeardownMarker teardownSession("session (xrDestroySession)");
     AR_LOG_INFO("XrSession created successfully");
 
     OpenXRReferenceSpace localSpace(instance.Get(), session.Get(), XR_REFERENCE_SPACE_TYPE_LOCAL);
+    const TeardownMarker teardownLocalSpace("localSpace (xrDestroySpace, LOCAL)");
     AR_LOG_INFO("Created LOCAL reference space");
 
     // --- M10: action set + actions + bindings + attach + action spaces,
     // reused completely unchanged. ---
     OpenXRActionSystem actionSystem(instance.Get(), session.Get());
+    const TeardownMarker teardownActionSystem("actionSystem (action spaces, actions, action set)");
     AR_LOG_INFO("Created 'gameplay' action set, suggested khr/simple_controller bindings, attached, created action spaces");
 
     // --- M9E: swapchain format + one XrSwapchain per view. ---
@@ -399,6 +455,7 @@ int main()
         AR_LOG_INFO(std::format("Created swapchain: {}x{}, {} image(s)/view(s)",
                                  swapchains.back()->GetWidth(), swapchains.back()->GetHeight(), swapchains.back()->GetImages().size()));
     }
+    const TeardownMarker teardownSwapchains("swapchains (per-view: AREngine VkImageViews, then xrDestroySwapchain)");
 
     std::vector<XrSwapchainSubImage> projectionSubImages;
     projectionSubImages.reserve(swapchains.size());
@@ -412,24 +469,33 @@ int main()
         projectionSubImages.push_back(subImage);
     }
     OpenXRProjectionLayer projectionLayer(projectionSubImages, localSpace.Get());
+    const TeardownMarker teardownProjectionLayer("projectionLayer (trivial, no owned handle)");
 
     // --- M9G/M9H: shared render pass/pipeline/descriptor-set-layout
     // (format-dependent only, safe to share across every view). ---
     const VkFormat depthFormat = FindSupportedDepthFormat(bindingData.physicalDevice);
     VulkanRenderPass renderPass(bindingData.device, static_cast<VkFormat>(*selectedFormat), depthFormat,
                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const TeardownMarker teardownRenderPass("renderPass (vkDestroyRenderPass)");
     VulkanDescriptorSetLayout descriptorSetLayout(bindingData.device);
+    const TeardownMarker teardownDescriptorSetLayout("descriptorSetLayout (vkDestroyDescriptorSetLayout)");
     VulkanGraphicsPipeline pipeline(bindingData.device, renderPass.Get(), descriptorSetLayout.Get());
+    const TeardownMarker teardownPipeline("pipeline (vkDestroyPipeline, vkDestroyPipelineLayout)");
 
     VulkanCommandPool commandPool(bindingData.device, bindingData.queueFamilyIndex);
+    const TeardownMarker teardownCommandPool("commandPool (vkDestroyCommandPool, frees commandBuffer implicitly)");
+    NameVulkanObject(bindingData.instance, bindingData.device, VK_OBJECT_TYPE_COMMAND_POOL,
+        reinterpret_cast<std::uint64_t>(commandPool.Get()), "AREngine.xr_demo.commandPool");
 
     // --- M10.5: TWO persistent meshes - the cube (M8H) and a quad
     // (M8D/ProceduralMesh) used as the floor. Both uploaded exactly
     // once, before the frame loop - never per-frame, never per-object. ---
     auto cubeMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
                                       Rendering::CreateCubeMesh());
+    const TeardownMarker teardownCubeMesh("cubeMesh (vertex+index VulkanBuffer)");
     auto floorMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
                                        Rendering::CreateQuadMesh());
+    const TeardownMarker teardownFloorMesh("floorMesh (vertex+index VulkanBuffer)");
     AR_LOG_INFO("Uploaded 2 persistent meshes (cube, floor quad) - never re-uploaded per frame");
 
     constexpr std::uint32_t kTextureWidth = 64;
@@ -439,9 +505,12 @@ int main()
     auto texture = CreateTextureFromPixels(
         bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
         kTextureWidth, kTextureHeight, checkerboardPixels.data());
+    const TeardownMarker teardownTexture("texture (VkImageView, VkImage, VkDeviceMemory)");
     VulkanSampler sampler(bindingData.device);
+    const TeardownMarker teardownSampler("sampler (vkDestroySampler)");
 
     VulkanDescriptorPool descriptorPool(bindingData.device);
+    const TeardownMarker teardownDescriptorPool("descriptorPool (vkDestroyDescriptorPool, frees descriptorSet implicitly)");
     VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
     WriteCombinedImageSamplerDescriptor(bindingData.device, descriptorSet, texture->GetView(), sampler.Get());
 
@@ -456,6 +525,7 @@ int main()
         viewTargets.push_back(std::make_unique<OpenXRVulkanViewTarget>(
             bindingData.physicalDevice, bindingData.device, renderPass.Get(), *swapchain, depthFormat));
     }
+    const TeardownMarker teardownViewTargets("viewTargets (per-view: depth VulkanImage, then VulkanFramebuffers)");
     AR_LOG_INFO(std::format("Created {} per-view render target(s), built once", viewTargets.size()));
 
     // --- M10.5 scene content: floor + 3 small cubes + 1 larger
@@ -534,11 +604,14 @@ int main()
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence renderFence = VK_NULL_HANDLE;
     CheckVkResultHere(vkCreateFence(bindingData.device, &fenceInfo, nullptr, &renderFence), "vkCreateFence");
+    NameVulkanObject(bindingData.instance, bindingData.device, VK_OBJECT_TYPE_FENCE,
+        reinterpret_cast<std::uint64_t>(renderFence), "AREngine.xr_demo.renderFence");
 
     // --- Frame loop, driven through XRFrameDriver. ---
     AR_LOG_INFO(std::format("Beginning integrated XR loop - target {} completed frames before requesting exit...", kTargetFrameCount));
 
     XRFrameDriver frameDriver(instance.Get(), session, localSpace, *primaryViewConfigType, *selectedBlendMode);
+    const TeardownMarker teardownFrameDriver("frameDriver (trivial, no owned handle)");
 
     std::uint32_t completedFrameCount = 0;
     bool exitRequested = false;
@@ -815,12 +888,25 @@ int main()
     // fence was waited on after every render), but the shared VkDevice
     // may still have SteamVR's own in-flight compositor work on it -
     // same category already documented as SteamVR-internal since M9E.
-    CheckVkResultHere(vkDeviceWaitIdle(bindingData.device), "vkDeviceWaitIdle");
+    std::cerr << "[TEARDOWN] begin explicit shutdown sequence" << std::endl;
+    std::cerr.flush();
+    std::cerr << "[TEARDOWN] vkDeviceWaitIdle begin" << std::endl;
+    std::cerr.flush();
+    const VkResult waitIdleResult = vkDeviceWaitIdle(bindingData.device);
+    std::cerr << "[TEARDOWN] vkDeviceWaitIdle returned " << static_cast<int>(waitIdleResult) << std::endl;
+    std::cerr.flush();
+    CheckVkResultHere(waitIdleResult, "vkDeviceWaitIdle");
 
+    std::cerr << "[TEARDOWN] vkDestroyFence(renderFence) begin" << std::endl;
+    std::cerr.flush();
     vkDestroyFence(bindingData.device, renderFence, nullptr);
+    std::cerr << "[TEARDOWN] vkDestroyFence(renderFence) complete" << std::endl;
+    std::cerr.flush();
     // commandBuffer is freed implicitly when commandPool is destroyed.
 
     AR_LOG_INFO("Integrated XR demo complete - shutting down");
+    std::cerr << "[TEARDOWN] entering automatic (RAII) destructor chain now" << std::endl;
+    std::cerr.flush();
     return 0;
 
     // Destruction, in exact reverse declaration order: frameDriver

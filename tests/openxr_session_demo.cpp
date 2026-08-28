@@ -39,12 +39,29 @@
 #include <array>
 #include <chrono>
 #include <format>
+#include <iostream>
 #include <memory>
 #include <thread>
 #include <vector>
 
 namespace
 {
+    // M11.3 diagnostic-only teardown tracer - see tests/xr_demo.cpp's
+    // own copy for the full reasoning (std::cerr, unit-buffered plus
+    // explicit flush, survives a crash that would lose std::cout's
+    // buffered content). Temporary, removed once the Meta clean-exit
+    // crash is root-caused.
+    struct TeardownMarker
+    {
+        const char* label;
+        explicit TeardownMarker(const char* l) : label(l) {}
+        ~TeardownMarker()
+        {
+            std::cerr << "[TEARDOWN] about to destroy: " << label << std::endl;
+            std::cerr.flush();
+        }
+    };
+
     // Demo-only formatting for reference space types, not part of the
     // reusable OpenXRReferenceSpace library surface - see M9C's
     // VkPhysicalDeviceTypeToString for the same "small integration
@@ -98,6 +115,7 @@ int main()
     // then session, then Vulkan graphics binding, then instance, last.
     const std::array<const char*, 1> requestedExtensions{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
     OpenXRInstance instance(requestedExtensions);
+    const TeardownMarker teardownInstance("instance (xrDestroyInstance)");
     if (!instance.IsValid())
     {
         if (instance.CreationResult() == XR_ERROR_RUNTIME_UNAVAILABLE)
@@ -179,10 +197,12 @@ int main()
     // M9C - no second Vulkan device is created for M9D). ---
     AR_LOG_INFO("Creating OpenXR-compatible Vulkan instance/device via XR_KHR_vulkan_enable2...");
     OpenXRVulkanGraphicsBinding binding(instance.Get(), systemId);
+    const TeardownMarker teardownBinding("binding (debug messenger, then vkDestroyDevice, then vkDestroyInstance)");
     AR_LOG_INFO(std::format("Vulkan API version selected: {}", FormatVkApiVersion(binding.GetSelectedVulkanApiVersion())));
 
     // --- M9D: XrSession, created from the M9C graphics binding. ---
     OpenXRSession session(instance.Get(), systemId, binding.GetBindingData());
+    const TeardownMarker teardownSession("session (xrDestroySession)");
     AR_LOG_INFO("XrSession created successfully");
 
     // --- Reference spaces: enumerate supported types, then create
@@ -206,6 +226,7 @@ int main()
         referenceSpaces.push_back(std::make_unique<OpenXRReferenceSpace>(instance.Get(), session.Get(), type));
         AR_LOG_INFO(std::format("Created {} reference space", ReferenceSpaceTypeToString(type)));
     }
+    const TeardownMarker teardownReferenceSpaces("referenceSpaces (each xrDestroySpace)");
     if (!IsReferenceSpaceTypeSupported(supportedSpaceTypes, XR_REFERENCE_SPACE_TYPE_STAGE))
     {
         AR_LOG_INFO("STAGE reference space is not supported by this runtime - not created (AREngine does not require it)");
@@ -321,6 +342,8 @@ int main()
     }
 
     AR_LOG_INFO("OpenXR session demo complete - shutting down");
+    std::cerr << "[TEARDOWN] entering automatic (RAII) destructor chain now" << std::endl;
+    std::cerr.flush();
     return 0;
 
     // Destruction, in order (see the comment above `instance`'s
