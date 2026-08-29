@@ -8841,3 +8841,122 @@ Vulkan dependency was introduced).
   (7 new pure-logic tests). `OpenXRSimpleControllerBindings.hpp/.cpp`
   untouched, per the milestone's own explicit instruction not to modify
   or replace it.
+
+## M11.1C - Meta XR Operator Input-Driving Validation
+
+### Goal and scope
+
+Close the remaining M11.1B live-input gap using Meta XR Operator - an
+experimental OpenXR API layer that lets an MCP-compatible AI agent
+observe and drive a running native OpenXR application - as development/
+test tooling only, never an AREngine runtime dependency.
+
+### Phase 0: current official documentation, verified
+
+Confirmed against live pages, not old/cached knowledge:
+[Meta XR Operator Standalone](https://developers.meta.com/horizon/downloads/package/meta-xr-operator-standalone/),
+[Connecting AI agents](https://developers.meta.com/horizon/documentation/unity/meta-xr-operator/connecting-ai-agents/).
+Version **205.1** (first release, updated 28 Jul 2026). Standalone
+(non-Unity) native/Unreal use is explicitly documented and supported -
+Unity is **not** required. The standalone package's own bundled
+`README.md` (read directly, not just the web summary) confirms the exact
+setup: `XR_API_LAYER_PATH` (folder containing the layer DLL + JSON
+manifest) and `XR_ENABLE_API_LAYERS=XR_APILAYER_METAX_operator`
+(matching the manifest's own `name` field, verified byte-for-byte
+against the actual `XrApiLayer_METAX_operator.json` in the package - not
+copied blindly from the prompt or docs); the MCP proxy binary
+(`meta-xr-operator-mcp-proxy.exe`) registers with `claude mcp add`; the
+layer starts an MCP server on `localhost:8720` inside the target app's
+own process the moment the app launches with those environment
+variables set.
+
+### Phase 1: existing installation inspected first
+
+`C:\Program Files\MetaXRSimulator\v205.0\` was searched exhaustively for
+any bundled Operator/MCP/API-layer files - **none found**. The Operator
+is a genuinely separate package from the Simulator itself, despite
+working together at the OpenXR layer.
+
+### Download and installation
+
+Downloaded via the official page after accepting its license modal -
+`meta-xr-operator-standalone-public.zip`, 17,289,957 bytes (~16.5 MiB).
+The in-app Browser pane's own download stalled indefinitely at the
+`.tmp` stage (the file transferred fully but never finalized - almost
+certainly a browser download-safety confirmation dialog this environment
+has no visual/screenshot capability to resolve, the same class of
+limitation already documented for the native Windows desktop in M11.1B).
+Retried successfully through the separate "Claude in Chrome" browser
+surface, which does support screenshots. Extracted to
+`C:\Users\venth\MetaXROperator\v205.1\` (a location outside both the
+AREngine repository and `Program Files` - no admin rights were needed or
+used). Contents match the README exactly: `windows/`, `macos/`,
+`android/` platform folders (DLL/dylib/so + JSON manifest, side by side,
+required by the manifest's own relative `library_path`), plus a
+platform-independent `openxr/` folder with the `XR_META_agentic_external_tool`
+extension header/spec (for apps that want to register their own custom
+tools - not used here).
+
+### Phase 2: baseline (before the API layer)
+
+Meta reactivated via its official script. `arengine_openxr_demo`/
+`arengine_openxr_vulkan_demo`/`arengine_xr_demo` all confirm the exact
+M11.1B baseline, re-verified: runtime = Meta XR Simulator 205.0.0,
+Vulkan/`timelineSemaphore` healthy, profile resolves to
+`/interaction_profiles/oculus/touch_controller` by frame 100, and
+`select`/`trigger`/`move`/`aim_pose` all transition to
+`active=true` on both hands with idle/default values (`aim_pose` also
+`positionValid`/`orientationValid`) - matching the milestone's own
+documented expected baseline exactly.
+
+### Phase 3: API layer enabled - fully validated, zero side effects
+
+`XR_API_LAYER_PATH`/`XR_ENABLE_API_LAYERS` set for the launching
+PowerShell session (never AREngine's own code or the global OpenXR
+runtime registration - Meta XR Simulator remained the active runtime
+throughout; the Operator sits as an API layer above it, exactly as
+designed). `arengine_openxr_demo` now reports `Available OpenXR API
+layers: 1 - XR_APILAYER_METAX_operator (spec 1.1.0, layer version 1)`
+and the runtime name is unchanged (`Meta XR Simulator (version
+205.0.0)`). The Operator's own log (`[MetaXROperator]` prefix) confirms:
+`Agentic XR API layer negotiation started` → `initialized` → `MCP
+Server started successfully on port 8720 (IPv4 and IPv6)` → tools
+registered, **including exactly** `openxr_get_head_pose`,
+`openxr_get_controller_pose`, `openxr_get_active_interaction_profile`
+(plus several generic `math_*` utility tools). `arengine_openxr_vulkan_demo`
+with the layer enabled: `timelineSemaphore` configuration, selected
+Vulkan version (1.2.0), and graphics-binding validity are all **byte-
+for-byte identical** to the no-layer baseline, with **zero** validation
+errors. The API layer is confirmed behavior-neutral for AREngine's own
+OpenXR/Vulkan bring-up path.
+
+### Phase 4: MCP agent connection - blocked by a real environment constraint
+
+The `claude` CLI binary needed for `claude mcp add` is **not reachable
+from this session's own sandboxed Bash/PowerShell tool environment** -
+searched exhaustively (`Get-Command`, `where.exe`, common install
+directories under `Program Files`/`AppData`) with zero matches, even
+though this session's own `~/.claude.json`/`~/.claude/` config
+directory **is** visible on disk. This is a genuine tooling/environment
+boundary (this session runs inside a harness that does not expose the
+`claude` executable to its own tool sandbox), not a Meta XR Operator
+issue, not an AREngine issue, and not something to work around by
+hand-editing live session configuration - registering the MCP server
+requires running `claude mcp add meta-xr-operator "C:\Users\venth\MetaXROperator\v205.1\windows\meta-xr-operator-mcp-proxy.exe"`
+from a real terminal outside this session. **This blocked Phases 5-10**
+(all of which require an actual connected agent driving head/controller
+state) - none were attempted, since Phase 3 already confirmed everything
+up to the connection step works correctly.
+
+### SteamVR regression
+
+Minimal check per the milestone's own instruction (no AREngine source
+changed this session): Meta deactivated via its official script, SteamVR
+confirmed restored (`ActiveRuntime` verified), `arengine_openxr_vulkan_demo`
+clean.
+
+### Engine changes
+
+**Zero** - no AREngine source files were touched in M11.1C. All work was
+external tooling installation, environment-variable configuration, and
+validation of existing AREngine binaries against the new API layer.
