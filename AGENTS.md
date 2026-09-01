@@ -865,6 +865,13 @@ values - or M8I+ (Scene integration, still pending within M8) — see
     analog/thumbstick reading, or a changed pose. Activation alone
     (rule 15) is not sufficient evidence, however genuine it is on its
     own terms.
+17. **If a third-party XR runtime DLL is blocked by Windows Smart App
+    Control, diagnose signature/reputation and Code Integrity events
+    first.**
+18. **Do not weaken Smart App Control, Defender, or Code Integrity to
+    make an XR development runtime load.**
+19. **Treat vendor runtime signing/reputation failures as
+    environment/toolchain issues, not AREngine defects.**
 
 ## Build
 

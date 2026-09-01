@@ -8960,3 +8960,207 @@ clean.
 **Zero** - no AREngine source files were touched in M11.1C. All work was
 external tooling installation, environment-variable configuration, and
 validation of existing AREngine binaries against the new API layer.
+
+## M11.1D - Live Input Validation Attempt (blocked before OpenXR init)
+
+### Goal
+
+With M11.1C's tooling fully working (Claude Code authenticated, Meta XR
+Operator registered and connectable), attempt the full live-driven input
+validation M11.1B/M11.1C left open: driven head translation/rotation,
+select press/hold/release, trigger 0->0.5->1.0, thumbstick vectors, two
+distinct controller poses - each proven to reach AREngine's own queried
+`Input::*ActionState` and the M10.6 highlight/scale/moveOffset/pose-marker
+effects, not just an Operator-side belief.
+
+### What happened instead
+
+The global OpenXR `ActiveRuntime` had drifted back to SteamVR since the
+last session (expected drift - M11.1C's own SteamVR-regression step
+explicitly deactivates Meta at the end of every session). Reactivated via
+Meta's official `activate_simulator.ps1`, verified directly against the
+registry rather than trusted from the script's own output (same
+discipline as every earlier UAC-involving step in this project).
+
+With Meta XR Simulator confirmed active, `arengine_xr_demo` exited
+immediately at its very first check: `XR_KHR_vulkan_enable2 unavailable`,
+before creating any OpenXR instance. Isolated one variable at a time: the
+same failure occurred with the Meta XR Operator API layer completely
+disabled, and after starting Meta's own `MetaXRSimulator.exe` companion
+app and waiting - ruling out AREngine, the Operator layer, and "the
+companion app isn't running" as causes.
+
+`XR_LOADER_DEBUG=all` revealed the loader's own error directly:
+`Failed to open dynamic library ...\SIMULATOR.dll with error 4551: 0x11c7
+- An Application Control policy has blocked this file.` The Code
+Integrity operational log (event IDs 3033/3077/3089/3118, structured
+fields read directly via `([xml]$event.ToXml())` - the same method
+M11.3A established, since the rendered `Message` text for these specific
+IDs doesn't resolve without a message-table DLL this system doesn't have)
+confirmed Smart App Control (`VerifiedAndReputablePolicyState=1`, policy
+`VerifiedAndReputableDesktop`) blocked `SIMULATOR.dll` because it is
+unsigned (`PublisherName=Unknown`, `TotalSignatureCount=0`) and its
+previously-cached trust entry had expired (`CachedDefenderTrust=122168`,
+`CachedDefenderTrustExpiryTime=0`), with the fresh cloud reputation call
+needed to re-authorize it not completing this session
+(`DefenderCloudCallRequested=true`, `DefenderMadeCloudCall=false`).
+
+No session, Vulkan device, rendering loop, or Operator backend was ever
+created. M11.1D was reported PARTIAL/BLOCKED rather than attempted
+further, per the explicit constraint not to modify AREngine or Windows
+security settings to route around an external blocker.
+
+## M11.1D-B - Smart App Control / Meta Runtime Load Diagnosis
+
+### Goal
+
+Before accepting "Smart App Control blocked an unsigned DLL" as the final
+answer, rule out the alternative hypothesis raised explicitly: that this
+was a transient network/Defender-health problem rather than a genuine,
+persistent trust decision - using only read-only, Microsoft-supported
+diagnostic interfaces, changing zero security settings.
+
+### Environment inventory
+
+System clock/timezone plausible (Eastern time, correct date) though
+Windows Time's own sync status reports `Source: Local CMOS Clock` /
+`Last Successful Sync Time: unspecified` - NTP sync has apparently never
+completed on this machine, noted as a minor caveat though it did not
+appear to affect TLS validation (see below). Windows 11 Home, build
+26200.9168 (the `ProductName` registry value still cosmetically reads
+"Windows 10 Home" - a long-standing Microsoft naming quirk unrelated to
+the actual build). Network profile: Wi-Fi, `Public` category, IPv4
+Internet-connected, not metered. No VPN adapters, no proxy configured
+(`netsh winhttp show proxy` -> direct access). One pending-reboot
+indicator present (`PendingFileRenameOperations` only - a routine,
+frequently-benign leftover from ordinary installs, not the stronger
+Windows-Update/CBS indicators) - noted, not treated as causal.
+
+### Defender/Smart App Control health
+
+`Get-MpComputerStatus`: `AMServiceEnabled`/`AntivirusEnabled`/
+`RealTimeProtectionEnabled`/`NISEnabled` all `True`, `IsTamperProtected`
+`True`, `AMRunningMode=Normal` (no third-party AV has demoted Defender to
+passive/hybrid), signatures `1.457.399.0` updated the same calendar day
+(~14h before this test) - not stale. `Get-MpPreference`:
+`MAPSReporting=2` (Advanced/cloud-delivered protection on),
+`CloudBlockLevel=0` (default), `DisableRealtimeMonitoring=False`. Windows
+Security Center (`root\SecurityCenter2`) confirms Windows Defender as the
+sole registered AV product. `WinDefend`/`SecurityHealthService`/`wscsvc`
+all Running. No relevant Defender Warning/Error events logged around the
+block. Smart App Control state unchanged throughout
+(`VerifiedAndReputablePolicyState=1`).
+
+### Connectivity validation (the actual hypothesis test)
+
+The officially-supported Defender command-line MAPS/cloud connectivity
+test, `MpCmdRun.exe -ValidateMapsConnection`, requires elevation to
+complete (a first non-elevated attempt failed with Access Denied,
+`0x80070005` - an expected privilege requirement of that specific
+command, not a security-setting issue); run elevated via a temporary
+`.ps1` helper script (avoids the fragile nested-quoting that made a first
+`Start-Process -Verb RunAs` inline-argument attempt silently no-op - the
+same "approved but did nothing" class of failure mode this project has
+hit before with UAC prompts). Result: **`ValidateMapsConnection
+successfully established a connection to MAPS`, exit code 0.**
+`MpIsConnectedToInternet()` also reported `true`.
+
+DNS + TCP-443 reachability confirmed for all five Microsoft
+reputation/SmartScreen endpoint families relevant to this Defender/SAC
+build (`wdcp.microsoft.com`, `wdcpalt.microsoft.com`,
+`smartscreen.microsoft.com`, `checkappexec.microsoft.com`,
+`urs.microsoft.com`). A full TLS 1.3 handshake to
+`smartscreen.microsoft.com` (via `System.Net.Security.SslStream`
+directly, not just a TCP port check) returned a genuine, currently-valid
+Microsoft certificate (`CN=smartscreen.microsoft.com,
+O=Microsoft Corporation`, issued by Microsoft's own CA, validity window
+covering "now") - ruling out TLS interception/a MITM proxy as a
+contributing factor.
+
+### The decisive result
+
+A single permitted retry (`XR_LOADER_DEBUG=all`, not repeated further)
+reproduced the identical failure: error 4551/0x11c7, Code Integrity
+`Status=0xc0e90002` under `VerifiedAndReputableDesktop`. Critically,
+**`DefenderMadeCloudCall` was still `false`** on this retry, despite
+`DefenderCloudCallRequested=true` and every independent connectivity
+check above passing. This is the finding that rules out "transient
+network/Defender-health issue" as the explanation: general MAPS/cloud
+connectivity is proven healthy through multiple independent official
+channels, yet the specific in-process, Code-Integrity-triggered
+reputation lookup for this one unsigned file does not complete either
+time it was attempted.
+
+### File integrity and vendor comparison
+
+`SIMULATOR.dll` re-verified: `C:\Program Files\MetaXRSimulator\v205.0\
+SIMULATOR.dll`, 19,867,648 bytes, written 2026-07-21 08:56:34, SHA-256
+`DFD5729271379DE31AC52972DEE1DC4F88322295E41EACAF8FF2654E758DEFC4` -
+identical to the hash captured in the original Code Integrity block
+event, confirming it is the genuine, unmodified official file (not
+tampered, not a stray copy). `Get-AuthenticodeSignature`: **`Status:
+NotSigned`** - confirmed via Microsoft's own cmdlet, not just inferred
+from the Code Integrity event's `PublisherName=Unknown`.
+
+Checked whether Meta ships a newer, signed build: `developers.meta.com`'s
+dedicated Windows native/OpenXR package page (distinct from the
+Unity-SDK-oriented "Meta XR Simulator" package, which uses an unrelated
+`81.x` version scheme and is a different distribution) confirms **v205.0,
+released 2026-07-23, is the current latest version** - no newer build
+exists to upgrade to, and its release notes mention Operator support and
+bug fixes but contain no mention of code signing, digital signatures,
+Smart App Control, or SmartScreen.
+
+For direct comparison, the sibling Meta XR Operator API layer DLL from
+the very same v205.x release family
+(`XrApiLayer_METAX_operator.dll`) was checked the same way:
+`Get-AuthenticodeSignature` reports **`Status: Valid`**, signed by
+`CN="Meta Platforms, Inc."`. This proves Meta already has the
+infrastructure and practice to Authenticode-sign native Windows binaries
+in this exact product family - `SIMULATOR.dll` being unsigned is a gap
+specific to that one binary, not a technical constraint of the product
+line.
+
+### Root cause (proven, not inferred)
+
+Smart App Control's `VerifiedAndReputableDesktop` policy requires a
+valid trusted signature or an established cloud reputation verdict
+before loading an unknown binary. `SIMULATOR.dll` has neither: it is
+genuinely unsigned, and the per-file reputation cloud call needed to
+grant it a verdict does not complete, independent of proven-healthy
+general Defender/MAPS connectivity. This is external to AREngine and to
+Meta XR Operator entirely - the identical failure occurs with the
+Operator layer disabled.
+
+### Escalation path identified (not executed)
+
+1. Meta signing `SIMULATOR.dll` is the durable fix - they already sign
+   the sibling Operator DLL in the same release.
+2. Microsoft's official file-submission/reputation portal
+   (`microsoft.com/en-us/wdsi/filesubmission`) is the correct supported
+   route for a reputation/trust determination - not used; submitting a
+   file requires explicit user authorization, and is properly a
+   publisher (Meta) action.
+3. No safe per-file Smart App Control exception exists, and none was
+   used - no exclusion, unblock, disable, or signing bypass was
+   attempted at any point in M11.1D or M11.1D-B.
+
+### Engine/security changes
+
+**Zero.** No AREngine source, build, config, roadmap, or doc file was
+touched during the investigation itself. No Smart App Control, Defender,
+cloud-protection, SmartScreen, firewall, or Code Integrity setting was
+changed. The only state changes were: reactivating Meta XR Simulator as
+the global `ActiveRuntime` (Meta's own official script, required just to
+point the OS at the intended runtime), starting/stopping Meta's own
+`MetaXRSimulator.exe` companion process, and running the official,
+read-only `MpCmdRun.exe -ValidateMapsConnection` diagnostic (elevated,
+which that specific command itself requires).
+
+### Status
+
+M11.1 live-driven input validation (translated/rotated head pose, driven
+select/trigger/thumbstick, moved controller pose, and the corresponding
+M10.6 visual effects) remains externally blocked by the current Meta XR
+Simulator v205.0 package under Smart App Control, not by any AREngine
+defect. See `docs/ROADMAP.md` for the M11 status this leaves in place.
