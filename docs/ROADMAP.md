@@ -60,6 +60,45 @@ all come after that chain is proven.
 | M19 | Android/Linux `Platform` backend | Later | When actually needed |
 | M20 | Custom AR hardware bring-up | Long-term | The project's ultimate goal |
 
+### M11 closeout
+
+```
+M11 — XR development validation: COMPLETE WITH EXTERNAL LIMITATION
+
+Engine work: COMPLETE
+Environment validation: COMPLETE
+Live driven input: PARTIALLY VERIFIED / EXTERNALLY BLOCKED
+
+Proven:
+- continuous XR rendering
+- FOCUSED session state
+- asymmetric runtime-driven XR views
+- OpenXR/Vulkan device path
+- XR frame lifecycle
+- OpenXR actions
+- simple-controller profile support
+- Touch-controller profile support
+- real action activation
+- valid controller pose state
+- generic ActionState conversion
+- input-to-engine-state plumbing
+- XR/Vulkan ownership and teardown correctness on AREngine side
+- SteamVR regression path
+- Meta XR Operator API-layer compatibility
+
+Not yet proven:
+- actively moved simulated head pose
+- real select press/release from simulator
+- nonzero trigger value
+- nonzero thumbstick value
+- actively moved controller pose
+
+External limitation:
+Meta XR Simulator v205 SIMULATOR.dll is unsigned and is blocked by Windows
+Smart App Control on this development machine. No AREngine workaround is
+appropriate.
+```
+
 ## Rules while working through the roadmap
 
 - No third-party dependencies until a milestone explicitly calls for one.
