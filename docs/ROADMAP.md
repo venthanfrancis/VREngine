@@ -54,6 +54,7 @@ all come after that chain is proven.
 | — M11.1B | **Active head/controller validation: PARTIAL.** Completed: Meta runtime health validated; actual interaction profile discovered; `oculus/touch_controller` binding support added; `simple_controller` preserved; select/trigger/move/aim_pose all become active on both hands; generic `ActionState` conversion works with the real profile; pose action becomes active + position/orientation valid; M10.6 pose marker becomes visible from real runtime state; sustained rendering + active input coexist; SteamVR regression clean; full build matrix and CTest green. Still open: driven select press/release; nonzero trigger values; nonzero thumbstick values; controller pose movement; simulated head movement; visible highlight/scale/move changes from driven input. | **Partial** | Blocker: Meta XR Simulator GUI input could not be reliably driven through the current automation environment. See `docs/ARCHITECTURE.md`, "M11.1B - Active Head + Controller Validation". M11.1 not yet marked complete. |
 | — M11.1C | **Meta XR Operator setup: PARTIAL.** Completed: Meta XR Operator v205.1 standalone/native package validated; Unity not required; OpenXR API layer loads successfully; AREngine still uses Meta XR Simulator normally; Vulkan/OpenXR path remains healthy; zero new pre-teardown OpenXR/Vulkan errors; no AREngine source dependency on Meta XR Operator. Pending: MCP agent connection; programmatic head movement; driven select press/release; nonzero trigger input; nonzero thumbstick input; moving controller pose; visible M10.6 interaction from driven values. | **Partial** | Blocker: Meta XR Operator MCP proxy must be registered from the user's normal terminal where the Claude CLI is available. See `docs/ARCHITECTURE.md`, "M11.1C - Meta XR Operator Input-Driving Validation". M11.1 not yet marked complete. |
 | — M11.1D-B | **Smart App Control / Meta runtime load diagnosis: COMPLETE.** Conclusion: Windows/Defender/network health verified; Smart App Control enforcement confirmed healthy and unchanged; Meta XR Simulator v205 `SIMULATOR.dll` is an authentic official file but is not Authenticode-signed; Smart App Control blocks the DLL under `VerifiedAndReputableDesktop` before the OpenXR runtime can load; no AREngine defect is involved; no supported per-file Smart App Control exception exists. Durable fixes: (1) Meta ships a validly signed simulator runtime, or (2) Microsoft establishes reputation/trust for the file through the supported submission process. | **Complete** | M11.1 live-driven validation remains externally blocked by the current Meta runtime package under Smart App Control. See `docs/ARCHITECTURE.md`, "M11.1D - Live Input Validation Attempt" and "M11.1D-B - Smart App Control / Meta Runtime Load Diagnosis". |
+| M12 | **Renderable Scene Integration Foundation: COMPLETE.** `Scene -> Renderable + world transform -> ExtractRenderables() -> generic render planning -> desktop or XR views`, with no Scene->Rendering/Vulkan/OpenXR dependency. See the M12 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M12 - Renderable Scene Integration Foundation". |
 | M16 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M17 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M18 | `Editor` skeleton | Deprioritized | After the core chain is proven |
@@ -97,6 +98,33 @@ External limitation:
 Meta XR Simulator v205 SIMULATOR.dll is unsigned and is blocked by Windows
 Smart App Control on this development machine. No AREngine workaround is
 appropriate.
+```
+
+### M12 closeout
+
+```
+M12 — Renderable Scene Integration Foundation: COMPLETE
+
+Completed:
+- backend-neutral Renderable state integrated with Scene entities
+- Renderable lifetime follows Entity lifetime
+- scene hierarchy contributes real rendered world transforms
+- ExtractRenderables() produces backend-neutral frame render data
+- mesh reuse through opaque MeshId
+- per-instance tint and visibility
+- one extraction supports desktop, stereo XR, and arbitrary view counts
+- desktop scene-render demo added
+- integrated XR demo migrated to the same scene/extraction path
+- Scene remains Core-only
+- Rendering remains OpenXR-independent
+- no global render/resource registry introduced
+- full build matrix and CTest green
+
+Deferred:
+- material/texture selection
+- asset-backed GPU resources
+- culling/batching/render queues
+- transform/extraction caching
 ```
 
 ## Rules while working through the roadmap

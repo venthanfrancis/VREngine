@@ -1,6 +1,7 @@
 // Automated tests for AREngine::Scene: entity identity, Transform,
 // parent/child hierarchy, and world-matrix composition (M5), plus
-// Transform's forward/right/up accessors and Camera (M8G). No human
+// Transform's forward/right/up accessors and Camera (M8G), plus the
+// Renderable component and Scene::ExtractRenderables (M12). No human
 // interaction, no window, no Rendering involved at all — proving Scene
 // and Rendering stay fully decoupled.
 
@@ -365,6 +366,147 @@ namespace
         scene.DestroyEntity(destroyed);
         Check(scene.SetParent(destroyed, valid) == false, "SetParent rejects a stale (destroyed) id");
     }
+
+    // --- M12: Renderable + ExtractRenderables ---
+
+    void TestSetAndGetRenderable()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        Check(!scene.HasRenderable(entity), "A freshly created entity has no renderable by default");
+        Check(scene.GetRenderable(entity) == nullptr,
+              "GetRenderable returns nullptr for a valid entity with no renderable set - not the same as an invalid entity");
+
+        const Renderable renderable{MeshId{1}, Vec4(1.0f, 0.5f, 0.0f, 1.0f), true};
+        scene.SetRenderable(entity, renderable);
+
+        Check(scene.HasRenderable(entity), "HasRenderable is true after SetRenderable");
+        const Renderable* stored = scene.GetRenderable(entity);
+        Check(stored != nullptr, "GetRenderable returns non-null after SetRenderable");
+        Check(stored->mesh == MeshId{1}, "Stored renderable's MeshId round-trips");
+        Check(stored->tint == Vec4(1.0f, 0.5f, 0.0f, 1.0f), "Stored renderable's tint round-trips");
+
+        scene.RemoveRenderable(entity);
+        Check(!scene.HasRenderable(entity), "HasRenderable is false after RemoveRenderable");
+        Check(scene.GetRenderable(entity) == nullptr, "GetRenderable returns nullptr after RemoveRenderable");
+    }
+
+    void TestRemoveRenderableNoOpsOnInvalidEntity()
+    {
+        Scene scene;
+        scene.RemoveRenderable(EntityId{9999}); // never created
+        scene.RemoveRenderable(EntityId{});      // default-constructed sentinel
+        Check(true, "RemoveRenderable does not crash on an invalid/unknown EntityId (mirrors ClearParent)");
+    }
+
+    void TestExtractRenderablesIncludesOnlyRenderableEntities()
+    {
+        Scene scene;
+        const EntityId withRenderable = scene.CreateEntity("WithRenderable");
+        const EntityId withoutRenderable = scene.CreateEntity("WithoutRenderable");
+        (void)withoutRenderable; // created only to prove ExtractRenderables ignores it - id itself unused
+        scene.SetRenderable(withRenderable, Renderable{MeshId{7}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+
+        const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
+        Check(instances.size() == 1, "ExtractRenderables returns exactly one instance when only one entity has a renderable");
+        Check(instances[0].entity == withRenderable, "The extracted instance references the correct entity");
+    }
+
+    void TestExtractRenderablesWorldTransformMatchesGetWorldMatrix()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        scene.GetTransform(entity).position = Vec3(4.0f, 5.0f, 6.0f);
+        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+
+        const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
+        Check(instances.size() == 1, "One renderable extracted");
+        Check(instances[0].worldTransform == scene.GetWorldMatrix(entity),
+              "Extracted worldTransform matches Scene::GetWorldMatrix for the same entity");
+    }
+
+    void TestExtractRenderablesSkipsInvisible()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), /*visible=*/false});
+
+        Check(scene.ExtractRenderables().empty(), "ExtractRenderables skips an entity whose Renderable::visible is false");
+    }
+
+    void TestExtractRenderablesSkipsDestroyedEntity()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        Check(scene.ExtractRenderables().size() == 1, "Renderable extracted before destruction");
+
+        scene.DestroyEntity(entity);
+        Check(scene.ExtractRenderables().empty(), "A destroyed entity's renderable no longer appears in extraction");
+    }
+
+    void TestExtractRenderablesSkipsRecursivelyDestroyedDescendants()
+    {
+        Scene scene;
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+        scene.SetParent(child, parent);
+        scene.SetRenderable(parent, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(child, Renderable{MeshId{2}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        Check(scene.ExtractRenderables().size() == 2, "Both parent and child renderables extracted before destruction");
+
+        scene.DestroyEntity(parent);
+        Check(scene.ExtractRenderables().empty(),
+              "Destroying a parent recursively removes the child's renderable from extraction too - no dangling mapping");
+    }
+
+    void TestExtractRenderablesChildWorldTransformIncludesParent()
+    {
+        Scene scene;
+        const EntityId parent = scene.CreateEntity("Parent");
+        const EntityId child = scene.CreateEntity("Child");
+        scene.GetTransform(parent).position = Vec3(10.0f, 0.0f, 0.0f);
+        scene.GetTransform(child).position = Vec3(0.0f, 5.0f, 0.0f);
+        scene.SetParent(child, parent);
+        scene.SetRenderable(child, Renderable{MeshId{3}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+
+        const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
+        Check(instances.size() == 1, "Only the child (which has a renderable) is extracted");
+        const Vec3 worldOrigin = TransformPoint(instances[0].worldTransform, Vec3(0.0f, 0.0f, 0.0f));
+        Check(worldOrigin == Vec3(10.0f, 5.0f, 0.0f),
+              "Extracted child world transform == parentWorld * childLocal, matching Scene::GetWorldMatrix");
+    }
+
+    void TestExtractRenderablesSameMeshIdMultipleInstances()
+    {
+        Scene scene;
+        const EntityId a = scene.CreateEntity("A");
+        const EntityId b = scene.CreateEntity("B");
+        const MeshId sharedMesh{42};
+        scene.SetRenderable(a, Renderable{sharedMesh, Vec4(1.0f, 0.0f, 0.0f, 1.0f), true});
+        scene.SetRenderable(b, Renderable{sharedMesh, Vec4(0.0f, 1.0f, 0.0f, 1.0f), true});
+
+        const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
+        Check(instances.size() == 2, "Two entities sharing the same MeshId both extract independently");
+        Check(instances[0].mesh == sharedMesh && instances[1].mesh == sharedMesh,
+              "Both extracted instances reference the same shared MeshId - one mesh, multiple instances");
+    }
+
+    void TestExtractRenderablesReflectsTransformUpdateOnNextCall()
+    {
+        Scene scene;
+        const EntityId entity = scene.CreateEntity();
+        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+
+        scene.GetTransform(entity).position = Vec3(1.0f, 0.0f, 0.0f);
+        const Vec3 worldA = TransformPoint(scene.ExtractRenderables()[0].worldTransform, Vec3(0.0f, 0.0f, 0.0f));
+        Check(worldA == Vec3(1.0f, 0.0f, 0.0f), "First extraction reflects the entity's transform at that time");
+
+        scene.GetTransform(entity).position = Vec3(2.0f, 0.0f, 0.0f);
+        const Vec3 worldB = TransformPoint(scene.ExtractRenderables()[0].worldTransform, Vec3(0.0f, 0.0f, 0.0f));
+        Check(worldB == Vec3(2.0f, 0.0f, 0.0f),
+              "A second extraction after moving the entity reflects the new transform - no stale caching");
+    }
 }
 
 int main()
@@ -390,6 +532,17 @@ int main()
     TestCycleRejected();
     TestDestroyParentDestroysDescendants();
     TestInvalidEntityAccessIsPredictable();
+
+    TestSetAndGetRenderable();
+    TestRemoveRenderableNoOpsOnInvalidEntity();
+    TestExtractRenderablesIncludesOnlyRenderableEntities();
+    TestExtractRenderablesWorldTransformMatchesGetWorldMatrix();
+    TestExtractRenderablesSkipsInvisible();
+    TestExtractRenderablesSkipsDestroyedEntity();
+    TestExtractRenderablesSkipsRecursivelyDestroyedDescendants();
+    TestExtractRenderablesChildWorldTransformIncludesParent();
+    TestExtractRenderablesSameMeshIdMultipleInstances();
+    TestExtractRenderablesReflectsTransformUpdateOnNextCall();
 
     if (g_failureCount == 0)
     {

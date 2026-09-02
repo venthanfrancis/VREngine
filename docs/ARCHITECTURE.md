@@ -9164,3 +9164,250 @@ select/trigger/thumbstick, moved controller pose, and the corresponding
 M10.6 visual effects) remains externally blocked by the current Meta XR
 Simulator v205.0 package under Smart App Control, not by any AREngine
 defect. See `docs/ROADMAP.md` for the M11 status this leaves in place.
+
+## M12 - Renderable Scene Integration Foundation
+
+### Goal
+
+Move AREngine from demo-owned object rendering (every multi-object demo
+since M8H hand-rolled its own flat `{Transform, mesh pointer, tint}`
+list) to the first clean, engine-owned scene-to-render path: `Scene ->
+Renderable + world transform -> ExtractRenderables() -> generic render
+planning -> desktop or XR views` - without turning `Scene` into a
+renderer or `Rendering` into something that knows about `Scene`,
+`Vulkan`, or `OpenXR`.
+
+### Audit findings
+
+`Scene` (`Core`-only) and `Rendering` (`Core`-only + private Vulkan)
+never met. `Scene::Scene` integration was evaluated twice before this
+milestone (M10.5, reconfirmed M10.6) and explicitly deferred, not
+rejected, for exactly two reasons: the M10.5/M10.6 demo content had zero
+parent/child relationships (so `GetWorldMatrix` degenerated to
+`Transform::ToMatrix()`, no benefit), and `Scene` had no mesh/tint
+("renderable") concept at all, so using it would still require a
+hand-maintained side-table outside `Scene`. M12 closes both gaps: it
+gives `Scene` a minimal `Renderable` concept, and the demo scene now has
+a real parent/child relationship (`cubeB` under `referenceCube`) that
+actually contributes to rendering.
+
+`runtime/` was found to already link both `AREngine::Rendering` and
+`AREngine::Scene`, with a comment claiming to be "the only place allowed
+to depend on every engine module at once" - but `runtime/src/Runtime.cpp`
+is stale M4-era code (`CreateNullRenderDevice()`, a hardcoded 3-vertex
+dummy draw). **No Vulkan implementation of the abstract `RenderDevice`
+interface exists anywhere in the codebase**, and every real Vulkan
+milestone since M8B has bypassed `Runtime`/`RenderDevice` entirely,
+going straight from a `tests/`-leaf demo into `engine/rendering/src/vulkan`'s
+private classes - the same pattern `tests/OpenXRVulkanViewTarget.hpp`
+already established and justified (kept at the `tests/` leaf,
+deliberately not promoted into `engine/xr` or `engine/rendering`, to
+avoid forcing a new inter-module dependency).
+
+### Runtime vs. `tests/`-leaf, Reconfirmed (M12)
+
+Given `runtime/`'s existing (but dormant) "depends on everything" role,
+M12 explicitly re-evaluated whether to route the new Scene-to-render
+bridge through it instead of `tests/`. Conclusion: no - the
+`Runtime`/`RenderDevice` integration path was tried in M4 and abandoned
+in practice by M8, and nothing since has revived it; reviving it now
+would be unscoped work with no evidence-based justification (matching
+M10.5's own, independently-reached "no concrete gap justifies a new
+module" conclusion for the neighboring `SceneRenderer` question). The
+`tests/`-leaf pattern remains the actual, consistently-used integration
+point for every real rendering milestone from M8B onward.
+
+### Where `Renderable` lives
+
+Considered the milestone's own four options (A: `Scene::RenderableComponent`,
+B: an external render-scene/extraction layer, C: an application/runtime-
+owned `EntityId -> render resource` map, D: another bridge) and chose
+**A**, evaluated against the actual architecture rather than picked by
+default:
+
+```cpp
+// engine/scene/include/AREngine/Scene/MeshId.hpp
+struct MeshId { std::uint64_t id = 0; bool IsValid() const; }; // mirrors EntityId exactly
+
+// engine/scene/include/AREngine/Scene/Renderable.hpp
+struct Renderable { MeshId mesh; Core::Math::Vec4 tint{1,1,1,1}; bool visible = true; };
+
+// engine/scene/include/AREngine/Scene/RenderableInstance.hpp
+struct RenderableInstance { EntityId entity; Core::Math::Mat4 worldTransform; MeshId mesh; Core::Math::Vec4 tint; };
+```
+
+`MeshId` carries zero Rendering/Vulkan types - an opaque Scene-local
+identifier - so `Scene` stays `Core`-only. `Renderable` is added as
+`std::optional<Renderable> renderable;` on the existing private
+`EntityRecord`, not a new external side-table: `DestroyEntity`'s already-
+correct recursive destruction removes it for free, so every entity-
+lifetime requirement (destroyed entity disappears, recursive parent
+destruction removes descendants, no dangling for an invalid `EntityId`)
+is satisfied by code that already existed, with zero new bookkeeping -
+directly closing M10.5's "would need a hand-maintained side-table" gap.
+Options B and C were rejected specifically because neither Scene nor an
+external map has any entity-destruction-sync hook today; only living
+inside `EntityRecord` gets that correctness for free.
+
+`Scene` gained:
+```cpp
+void SetRenderable(EntityId entity, Renderable renderable);        // asserts on invalid entity (mirrors GetTransform)
+void RemoveRenderable(EntityId entity);                            // no-op on invalid (mirrors ClearParent)
+bool HasRenderable(EntityId entity) const;                         // asserts on invalid entity
+const Renderable* GetRenderable(EntityId entity) const;            // asserts on invalid entity; nullptr = "valid entity, no renderable"
+std::vector<RenderableInstance> ExtractRenderables() const;
+```
+The assert-vs-nullptr split matters: `Scene`'s own class comment already
+draws a line between queries that assert on an invalid id and commands
+that predictably no-op on one - conflating "invalid entity" with "valid
+entity, no renderable" into one nullptr would silently mask exactly the
+bug class that line exists to catch.
+
+### Extraction: a `Scene` method, not a free function or new module
+
+`ExtractRenderables()` is a member because `m_entities` is private with
+no enumeration API at all (no `GetAllEntities`, no `begin()/end()`) - a
+free function outside `Scene` isn't achievable without first adding a
+general-purpose iterator nobody asked for - and because it's the same
+*category* of thing `Scene` already does once: `GetWorldMatrix` is
+already an uncached, read-only, derived computation over `Scene`'s own
+private data; `ExtractRenderables` is that same pattern, not a new
+responsibility. Implementation walks `m_entities`, skips any entity with
+no `renderable` or `renderable->visible == false`, calls the existing
+`GetWorldMatrix(id)` (unchanged, still uncached), and emplaces a
+`RenderableInstance`. Deliberately left uncached, same as
+`GetWorldMatrix` itself - caching either now, at M12's five-entity scale,
+would be the premature optimization the milestone explicitly warned
+against.
+
+### Draw planning and execution
+
+Split into two `tests/`-leaf files specifically by Vulkan/OpenXR
+dependency - a real coupling issue was caught during design review before
+implementation: `tests/OpenXRVulkanViewTarget.hpp` (home of the existing
+`DrawOpenXRViewObject` per-object draw primitive) transitively `#include`s
+`openxr/OpenXRSwapchain.hpp`, so it is **never compiled** into a
+`VULKAN=ON, OPENXR=OFF` target. A shared draw-execution helper built on
+top of it would have silently broken that build configuration.
+
+**`tests/RenderDrawPlanning.hpp/.cpp`** - pure, zero Vulkan/OpenXR
+dependency (`Scene` + `Core` only), compiled unconditionally:
+```cpp
+struct PlannedDraw { std::size_t viewIndex; Core::Math::Mat4 mvp; Scene::MeshId mesh; Core::Math::Vec4 tint; };
+std::vector<PlannedDraw> BuildDrawPlan(
+    std::span<const Scene::RenderableInstance> renderables,
+    std::span<const Core::Math::Mat4> viewProjections);
+```
+For each view, for each renderable: `mvp = viewProjections[i] *
+renderable.worldTransform`. Output is grouped `[view][renderable]`,
+contiguous per view - callers slice per-view sub-spans by stride
+`renderables.size()` rather than needing a second data structure.
+
+**`tests/MeshRegistry.hpp/.cpp`** - Vulkan-only (needs `VulkanMesh`),
+compiled only under `ARENGINE_ENABLE_VULKAN`, kept deliberately separate
+from `OpenXRVulkanViewTarget.hpp`:
+```cpp
+class MeshRegistry {
+public:
+    void Register(Scene::MeshId id, const Rendering::Vulkan::VulkanMesh* mesh);
+    const Rendering::Vulkan::VulkanMesh* Resolve(Scene::MeshId id) const; // nullptr if unregistered
+private:
+    std::unordered_map<Scene::MeshId, const Rendering::Vulkan::VulkanMesh*> m_meshes; // demo-owned, not global
+};
+void DrawPlannedInstances(VkCommandBuffer, VkPipelineLayout, const MeshRegistry&, std::span<const PlannedDraw>);
+```
+`DrawPlannedInstances` resolves each planned draw's mesh, binds, pushes
+`MvpPushConstants{mvp, tint}`, draws - an unresolvable mesh id is skipped,
+not fatal, matching `RenderDevice::SubmitDraw`'s existing "don't crash on
+a coordination gap" posture.
+
+### Shared scene content
+
+**`tests/PopulateDemoScene.hpp/.cpp`** - Vulkan-free, used by both the
+new desktop demo and `xr_demo.cpp`, so the two presentation paths render
+genuinely the same `Scene` data:
+```cpp
+struct DemoMeshIds { Scene::MeshId cube; Scene::MeshId floor; }; // minted once per demo's own main()
+struct DemoSceneEntities { Scene::EntityId floor, referenceCube, cubeA, cubeB, moveOffsetCube; };
+DemoSceneEntities PopulateDemoScene(Scene::Scene& scene, const DemoMeshIds& meshIds);
+```
+`cubeB` is parented under `referenceCube` (local position chosen so its
+initial WORLD position is unchanged from the old flat layout) - the
+milestone's required hierarchy proof, reusing `referenceCube`'s existing
+slow-rotation animation rather than inventing new demo behavior, so the
+child visibly swings through world space as the parent rotates in both
+demos.
+
+### Desktop: new `tests/scene_render_demo.cpp`
+
+New file, not a modification of `vulkan_present_demo.cpp` (left as a
+stable, untouched regression baseline), matching this codebase's "new
+file per new capability" demo convention. Creates a `Scene::Scene`, calls
+`PopulateDemoScene`, reuses `DemoCameraController` unchanged for camera
+movement (not this milestone's concern), and each frame: `ExtractRenderables()`
+-> one-element `viewProjections` -> `BuildDrawPlan` -> `DrawPlannedInstances`.
+No OpenXR dependency.
+
+### XR: `tests/xr_demo.cpp` changes
+
+The `std::vector<SceneObject>` for the five ordinary world objects (floor,
+referenceCube, cubeA, cubeB, moveOffsetCube) is gone, replaced by a
+`Scene::Scene` populated via the same `PopulateDemoScene`. Per-frame
+interaction mutation (reference cube rotation/scale/tint,
+moveOffsetCube position) now mutates `scene.GetTransform(id)` directly
+and re-calls `SetRenderable` for tint changes - moved to run
+unconditionally (previously, a frame where `projectionLayer.Prepare()`
+failed silently left the reference cube's animation un-advanced that
+frame; extracting/mutating unconditionally now removes that latent
+staleness). Per view: the SAME extraction (computed once per frame, not
+per eye) sliced per view by `BuildDrawPlan`'s stride -> `DrawPlannedInstances`.
+
+**The pose marker stays demo-owned, outside `Scene` and outside
+extraction.** Its position/orientation is live OpenXR aim-pose action
+state recomputed every frame - ephemeral input visualization, not
+authored world data - so it is still drawn directly via the original
+`DrawOpenXRViewObject` call, issued alongside (not instead of) the new
+scene-driven draws.
+
+### Final module dependencies
+
+- `Scene -> Core` only - **unchanged**. Verified: no Vulkan/OpenXR/
+  Rendering type appears in any `Scene` header.
+- `Rendering -> Core` only (+ private Vulkan/Platform) - **unchanged**.
+  Rendering's public API never learns about `Scene`, `RenderableInstance`,
+  or `MeshId`.
+- **No new `engine/` module.** The two new bridge points live in
+  `tests/`, extending the existing `OpenXRVulkanViewTarget.hpp` leaf-
+  bridge precedent.
+
+### Validation
+
+Full build matrix (`OPENXR`x`VULKAN` on/off, all four combinations) and
+`ctest` green (18/16/13/12 tests respectively - the count differs only
+by which OpenXR/Vulkan-gated targets exist per config); confirmed
+`VULKAN=ON, OPENXR=OFF` specifically builds `MeshRegistry`/
+`scene_render_demo` without pulling in OpenXR. One `[[nodiscard]]`
+warning (an unused `CreateEntity` return in a new test) found and fixed.
+
+`arengine_scene_render_demo`: 326 frames, `Uploaded 2 persistent meshes
+(cube, floor quad)`, `Scene: 5 entities`, `Frame 1: 5 renderable(s)
+extracted, 1 view(s), 5 planned draw(s)`, clean exit, zero Vulkan
+validation errors.
+
+`arengine_xr_demo` (against SteamVR, its own compositor/server started
+fresh for this run): 1000/1000 frames, `objects rendered=10, draw
+calls=10` (5 renderables x 2 eyes, exact match), clean teardown through
+every `TeardownMarker` (no crash). The only Vulkan validation messages
+present are the `BlankEyeBuffer`-tagged SteamVR-internal noise already
+documented since M9E and reconfirmed through M9G/M9H/M10.5/M10.6/M11.2/
+M11.3 - nothing references any AREngine-owned handle. Zero new
+AREngine-attributable errors.
+
+### Deferred / left demo-only
+
+The pose marker (see above). `GetWorldMatrix`/`ExtractRenderables` stay
+uncached - fine at five entities, revisit only with profiling evidence.
+No material/texture-selection concept yet - every `Renderable` implicitly
+shares one hardcoded checkerboard texture/pipeline; `MeshId` must not be
+allowed to quietly grow into that role or a general asset-handle system -
+see M13.

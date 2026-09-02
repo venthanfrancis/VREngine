@@ -58,9 +58,12 @@
 #include "AREngine/Frame/Frame.hpp"
 #include "AREngine/Input/ActionState.hpp"
 #include "AREngine/Rendering/ProceduralMesh.hpp"
-#include "AREngine/Scene/Transform.hpp"
+#include "AREngine/Scene/Scene.hpp"
 
+#include "MeshRegistry.hpp"
 #include "OpenXRVulkanViewTarget.hpp"
+#include "PopulateDemoScene.hpp"
+#include "RenderDrawPlanning.hpp"
 #include "XRInteractionState.hpp"
 
 #include "openxr/OpenXRActionSystem.hpp"
@@ -185,23 +188,19 @@ namespace
     constexpr float kReferenceCubeRotationRadiansPerSecond = 0.5f;
     constexpr float kAnalogLogThreshold = 0.05f;
 
-    // --- Scene content: a flat, non-hierarchical list of objects, each
-    // pairing a Scene::Transform (M5's TRS type, reused directly - not
-    // Scene::Scene itself; see docs/ARCHITECTURE.md, "Scene Integration
-    // Evaluated And Declined (M10.5)") with which persistent mesh it
-    // draws and its own tint. Deliberately NOT a "gameplay entity" - no
-    // behavior, no update logic beyond the one optional rotation below. ---
-    struct SceneObject
-    {
-        AREngine::Scene::Transform transform;
-        const AREngine::Rendering::Vulkan::VulkanMesh* mesh = nullptr;
-        AREngine::Core::Math::Vec4 tint;
-        bool visible = true; // M10.6: the pose marker toggles this; every other object stays true always
-        bool isReferenceCube = false; // M10H-style slow rotation, plus M10.6's tint/scale interaction
-        bool isMoveOffsetCube = false; // M10.6: position = basePosition + XRInteractionState::moveOffset
-        bool isPoseMarker = false; // M10.6: visible/transform driven entirely by XRInteractionState::poseMarker*
-        AREngine::Core::Math::Vec3 basePosition; // only meaningful for isMoveOffsetCube
-    };
+    // M12: scene content (floor, reference cube, cubeA/B, moveOffset
+    // cube) is now real AREngine::Scene::Scene data, populated via the
+    // SAME PopulateDemoScene function tests/scene_render_demo.cpp calls
+    // - see docs/ARCHITECTURE.md, "M12 - Renderable Scene Integration
+    // Foundation" (which also documents why this reverses M10.5/M10.6's
+    // "Scene integration declined" evaluations: this milestone gives
+    // Scene both a real hierarchy - cubeB is a child of referenceCube -
+    // and a Renderable component, closing both gaps that evaluation
+    // found). The pose marker alone stays outside Scene: its
+    // transform/visibility are driven by live OpenXR aim-pose action
+    // state recomputed every frame (ephemeral input visualization, not
+    // authored world data), so it's still drawn directly via
+    // DrawOpenXRViewObject below, exactly as before.
 
     // M10.6 tint/scale constants - purely a visualization choice
     // (distinguishing "highlighted" from "neutral" by eye), not a
@@ -528,67 +527,25 @@ int main()
     const TeardownMarker teardownViewTargets("viewTargets (per-view: depth VulkanImage, then VulkanFramebuffers)");
     AR_LOG_INFO(std::format("Created {} per-view render target(s), built once", viewTargets.size()));
 
-    // --- M10.5 scene content: floor + 3 small cubes + 1 larger
-    // reference cube - a flat, non-hierarchical list (see
-    // docs/ARCHITECTURE.md for why Scene::Scene itself was evaluated and
-    // declined). ALL views render these SAME five world transforms -
-    // never one set of objects per eye. ---
-    std::vector<SceneObject> sceneObjects;
+    // --- M12: scene content is real AREngine::Scene::Scene data - see
+    // the comment above the (now-removed) SceneObject struct for the
+    // full boundary/reasoning. ALL views render this SAME extracted
+    // renderable list - never one set of objects per eye. ---
+    const ARDemo::DemoMeshIds meshIds{Scene::MeshId{1}, Scene::MeshId{2}};
+    ARDemo::MeshRegistry meshRegistry;
+    meshRegistry.Register(meshIds.cube, cubeMesh.get());
+    meshRegistry.Register(meshIds.floor, floorMesh.get());
 
-    SceneObject floor;
-    floor.transform.position = Math::Vec3(0.0f, -0.6f, -2.0f);
-    floor.transform.rotation = Math::Quaternion::FromAxisAngle(Math::Vec3(1.0f, 0.0f, 0.0f), -1.5707963f); // -90 deg: quad +Z -> world +Y
-    floor.transform.scale = Math::Vec3(4.0f, 4.0f, 4.0f);
-    floor.mesh = floorMesh.get();
-    floor.tint = Math::Vec4(0.6f, 0.6f, 0.6f, 1.0f);
-    sceneObjects.push_back(floor);
+    Scene::Scene scene;
+    const ARDemo::DemoSceneEntities sceneEntities = ARDemo::PopulateDemoScene(scene, meshIds);
+    // Recorded once, right after PopulateDemoScene, rather than
+    // duplicating its hard-coded initial position here - the single
+    // source of truth for "where this cube starts" stays in
+    // PopulateDemoScene.cpp.
+    const Math::Vec3 moveOffsetCubeBasePosition = scene.GetTransform(sceneEntities.moveOffsetCube).position;
 
-    SceneObject referenceCube;
-    referenceCube.transform.position = Math::Vec3(0.0f, 0.0f, -2.0f);
-    referenceCube.transform.scale = Math::Vec3(0.6f, 0.6f, 0.6f);
-    referenceCube.mesh = cubeMesh.get();
-    referenceCube.tint = Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f);
-    referenceCube.isReferenceCube = true;
-    sceneObjects.push_back(referenceCube);
-
-    SceneObject cubeA;
-    cubeA.transform.position = Math::Vec3(-0.8f, 0.0f, -2.2f);
-    cubeA.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
-    cubeA.mesh = cubeMesh.get();
-    cubeA.tint = Math::Vec4(1.0f, 0.4f, 0.4f, 1.0f);
-    sceneObjects.push_back(cubeA);
-
-    SceneObject cubeB;
-    cubeB.transform.position = Math::Vec3(0.8f, 0.0f, -2.2f);
-    cubeB.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
-    cubeB.mesh = cubeMesh.get();
-    cubeB.tint = Math::Vec4(0.4f, 1.0f, 0.4f, 1.0f);
-    sceneObjects.push_back(cubeB);
-
-    SceneObject cubeC;
-    cubeC.transform.position = Math::Vec3(0.0f, 0.6f, -2.5f);
-    cubeC.transform.scale = Math::Vec3(0.3f, 0.3f, 0.3f);
-    cubeC.mesh = cubeMesh.get();
-    cubeC.tint = Math::Vec4(0.4f, 0.4f, 1.0f, 1.0f);
-    cubeC.isMoveOffsetCube = true;
-    cubeC.basePosition = cubeC.transform.position;
-    sceneObjects.push_back(cubeC);
-
-    // M10.6: a small debug marker, positioned/oriented directly from
-    // the right hand's aim-pose action state - not a controller/hand
-    // model, just the existing cube mesh at a small scale (see
-    // docs/ARCHITECTURE.md, "No Controller Rendering System (M10.6)").
-    // Starts invisible: shown only on a frame where the interaction
-    // state reports the pose active and fully valid.
-    SceneObject poseMarker;
-    poseMarker.transform.scale = Math::Vec3(0.15f, 0.15f, 0.15f);
-    poseMarker.mesh = cubeMesh.get();
-    poseMarker.tint = kPoseMarkerTint;
-    poseMarker.isPoseMarker = true;
-    poseMarker.visible = false;
-    sceneObjects.push_back(poseMarker);
-
-    AR_LOG_INFO(std::format("Scene: {} object(s) (floor + reference cube + 3 small cubes + 1 pose marker), shared across every view", sceneObjects.size()));
+    AR_LOG_INFO("Scene: 5 entities (floor, referenceCube, cubeA, cubeB[child of referenceCube], moveOffsetCube) "
+                "+ 1 demo-owned pose marker (outside Scene - see the boundary note above), shared across every view");
 
     // --- M9E/M9G: one reusable command buffer, one fence, fully
     // synchronous - unchanged from every prior XR rendering demo. ---
@@ -706,6 +663,42 @@ int main()
 
             const std::vector<Frame::ViewInfo> views = frameDriver.GetViews();
 
+            // M12: apply this frame's already-computed interactionState
+            // directly to the Scene entities (no local SceneObject
+            // shadow copy anymore), then extract + plan ONCE per frame -
+            // independent of whether Prepare() below succeeds, since
+            // neither step touches OpenXR/Vulkan state. This also fixes
+            // a latent M10.5/M10.6 behavior: previously, a frame where
+            // Prepare() failed left the reference cube's rotation/tint
+            // and the move-offset cube's position silently un-updated
+            // that frame; extracting unconditionally here means Scene
+            // state always advances with real time/input, whether or
+            // not that particular frame ends up rendering.
+            {
+                Scene::Transform& referenceCubeTransform = scene.GetTransform(sceneEntities.referenceCube);
+                referenceCubeTransform.rotation = Math::Quaternion::FromAxisAngle(
+                    Math::Vec3(0.0f, 1.0f, 0.0f),
+                    kReferenceCubeRotationRadiansPerSecond * static_cast<float>(frameContext.timing.totalTimeSeconds));
+                referenceCubeTransform.scale = kReferenceCubeBaseScale * interactionState.scaleFactor;
+                scene.SetRenderable(sceneEntities.referenceCube, Scene::Renderable{
+                    meshIds.cube,
+                    interactionState.highlightEnabled ? kReferenceCubeHighlightTint : kReferenceCubeBaseTint,
+                    true});
+
+                scene.GetTransform(sceneEntities.moveOffsetCube).position = moveOffsetCubeBasePosition +
+                    Math::Vec3(interactionState.moveOffset.x, interactionState.moveOffset.y, 0.0f);
+            }
+
+            const std::vector<Scene::RenderableInstance> renderables = scene.ExtractRenderables();
+            std::vector<Math::Mat4> viewProjections;
+            viewProjections.reserve(views.size());
+            for (const Frame::ViewInfo& viewInfo : views)
+            {
+                viewProjections.push_back(
+                    ApplyVulkanYFlip(viewInfo.projection) * Math::ViewMatrixFromPoseRH(viewInfo.position, viewInfo.orientation));
+            }
+            const std::vector<ARDemo::PlannedDraw> plan = ARDemo::BuildDrawPlan(renderables, viewProjections);
+
             if (projectionLayer.Prepare(frameDriver.GetLastLocatedXrViews()) && views.size() == swapchains.size())
             {
                 CheckVkResultHere(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer");
@@ -737,58 +730,36 @@ int main()
                 vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
                     0, 1, &descriptorSet, 0, nullptr);
 
-                // Apply this frame's already-computed interactionState
-                // to the shared world objects - computed ONCE here, read
-                // identically by every view in the loop below (see
-                // docs/ARCHITECTURE.md, "Shared World State (M10.6)").
-                // Slow rotation on the reference cube (M9H-style, for
-                // repeated-frame verification, unchanged from M10.5)
-                // stays independent of and layered alongside the new
-                // tint/scale interaction effects.
-                for (SceneObject& object : sceneObjects)
-                {
-                    if (object.isReferenceCube)
-                    {
-                        object.transform.rotation = Math::Quaternion::FromAxisAngle(
-                            Math::Vec3(0.0f, 1.0f, 0.0f),
-                            kReferenceCubeRotationRadiansPerSecond * static_cast<float>(frameContext.timing.totalTimeSeconds));
-                        object.transform.scale = kReferenceCubeBaseScale * interactionState.scaleFactor;
-                        object.tint = interactionState.highlightEnabled ? kReferenceCubeHighlightTint : kReferenceCubeBaseTint;
-                    }
-                    else if (object.isMoveOffsetCube)
-                    {
-                        object.transform.position = object.basePosition +
-                            Math::Vec3(interactionState.moveOffset.x, interactionState.moveOffset.y, 0.0f);
-                    }
-                    else if (object.isPoseMarker)
-                    {
-                        object.visible = interactionState.poseMarkerVisible;
-                        if (object.visible)
-                        {
-                            object.transform.position = interactionState.poseMarkerPosition;
-                            object.transform.rotation = interactionState.poseMarkerOrientation;
-                        }
-                    }
-                }
-
+                // M12: per-view draw loop - scene renderables come from
+                // the plan already built above (once per frame, sliced
+                // per view here since BuildDrawPlan produces its output
+                // grouped [view][renderable], contiguous per view - see
+                // RenderDrawPlanning.hpp/tests). The pose marker (never
+                // part of Scene/extraction - see the boundary note near
+                // PopulateDemoScene's call above) is still drawn
+                // directly via DrawOpenXRViewObject, exactly as before.
                 for (std::size_t i = 0; i < views.size(); ++i)
                 {
-                    const Math::Mat4 view = Math::ViewMatrixFromPoseRH(views[i].position, views[i].orientation);
-                    const Math::Mat4 projection = ApplyVulkanYFlip(views[i].projection);
-
                     BeginOpenXRViewRenderPass(commandBuffer, renderPass.Get(), *viewTargets[i], acquiredIndices[i],
                                                kEyeClearColors[i % kEyeClearColors.size()]);
-                    for (const SceneObject& object : sceneObjects)
+
+                    const std::span<const ARDemo::PlannedDraw> viewPlan(
+                        plan.data() + i * renderables.size(), renderables.size());
+                    ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, viewPlan);
+                    diag.objectsRendered += viewPlan.size();
+                    diag.drawCalls += viewPlan.size();
+
+                    if (interactionState.poseMarkerVisible)
                     {
-                        if (!object.visible)
-                        {
-                            continue; // M10.6: the pose marker, when the aim-pose action isn't active+valid
-                        }
-                        const Math::Mat4 mvp = projection * view * object.transform.ToMatrix();
-                        DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *object.mesh, mvp, object.tint);
+                        const Scene::Transform poseMarkerTransform{
+                            interactionState.poseMarkerPosition, interactionState.poseMarkerOrientation,
+                            Math::Vec3(0.15f, 0.15f, 0.15f)};
+                        const Math::Mat4 poseMarkerMvp = viewProjections[i] * poseMarkerTransform.ToMatrix();
+                        DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *cubeMesh, poseMarkerMvp, kPoseMarkerTint);
                         ++diag.objectsRendered;
                         ++diag.drawCalls;
                     }
+
                     EndOpenXRViewRenderPass(commandBuffer);
                 }
                 diag.viewsRendered += views.size();
@@ -829,14 +800,11 @@ int main()
             {
                 if (renderedThisFrame)
                 {
-                    std::size_t visibleObjectCount = 0;
-                    for (const SceneObject& object : sceneObjects)
-                    {
-                        if (object.visible) ++visibleObjectCount;
-                    }
+                    const std::size_t visibleObjectCount = renderables.size() + (interactionState.poseMarkerVisible ? 1 : 0);
+                    const std::size_t totalDrawCalls = plan.size() + (interactionState.poseMarkerVisible ? views.size() : 0);
                     AR_LOG_INFO(std::format("  Rendered {} view(s) x {} visible object(s) = {} draw(s) this frame "
                                              "(highlight={}, scale={:.2f}, moveOffset=({:.2f},{:.2f}), poseMarkerVisible={})",
-                                             views.size(), visibleObjectCount, views.size() * visibleObjectCount,
+                                             views.size(), visibleObjectCount, totalDrawCalls,
                                              interactionState.highlightEnabled, interactionState.scaleFactor,
                                              interactionState.moveOffset.x, interactionState.moveOffset.y,
                                              interactionState.poseMarkerVisible));
@@ -930,8 +898,10 @@ int main()
 
     // Destruction, in exact reverse declaration order: frameDriver
     // (trivial) -> viewTargets (each destroys its own depth image +
-    // framebuffers) -> sceneObjects (trivial - raw, non-owning mesh
-    // pointers only) -> descriptorPool -> sampler -> texture ->
+    // framebuffers) -> moveOffsetCubeBasePosition/sceneEntities/scene/
+    // meshRegistry/meshIds (all trivial - Scene::Scene owns no GPU/
+    // OpenXR handle, MeshRegistry holds only raw non-owning mesh
+    // pointers) -> descriptorPool -> sampler -> texture ->
     // floorMesh -> cubeMesh -> commandPool (frees commandBuffer
     // implicitly) -> pipeline -> descriptorSetLayout -> renderPass ->
     // projectionLayer (trivial) -> swapchains (each xrDestroySwapchain,

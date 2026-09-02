@@ -1,8 +1,11 @@
 #pragma once
 
 #include "AREngine/Scene/EntityId.hpp"
+#include "AREngine/Scene/Renderable.hpp"
+#include "AREngine/Scene/RenderableInstance.hpp"
 #include "AREngine/Scene/Transform.hpp"
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -72,6 +75,34 @@ namespace AREngine::Scene
 
         [[nodiscard]] const std::vector<EntityId>& GetChildren(EntityId entity) const;
 
+        // M12: the minimal "this entity can be drawn" component. Follows
+        // the same invalid-input philosophy as the rest of Scene's API —
+        // SetRenderable/HasRenderable/GetRenderable assert on an
+        // invalid/unknown EntityId (mirroring GetTransform: there is no
+        // safe fallback that wouldn't risk masking a bug), while
+        // RemoveRenderable no-ops on one (mirroring ClearParent: removing
+        // a component from a possibly-already-destroyed entity is a
+        // normal, plausible cross-frame pattern). GetRenderable returning
+        // nullptr means "valid entity, no renderable set" — never
+        // "invalid entity" — those two cases are deliberately not
+        // conflated. See docs/ARCHITECTURE.md, "M12 - Renderable Scene
+        // Integration Foundation".
+        void SetRenderable(EntityId entity, Renderable renderable);
+        void RemoveRenderable(EntityId entity);
+        [[nodiscard]] bool HasRenderable(EntityId entity) const;
+        [[nodiscard]] const Renderable* GetRenderable(EntityId entity) const;
+
+        // Snapshots every entity that currently has a visible Renderable
+        // into a flat, backend-neutral list, resolving each one's WORLD
+        // transform via GetWorldMatrix (so hierarchy is already baked
+        // in). Not cached — recomputed on every call, same philosophy as
+        // GetWorldMatrix itself. Takes no view/camera parameter: the
+        // result is meant to be rendered against any number of views
+        // afterward, not extracted separately per view. See
+        // docs/ARCHITECTURE.md, "M12 - Renderable Scene Integration
+        // Foundation".
+        [[nodiscard]] std::vector<RenderableInstance> ExtractRenderables() const;
+
     private:
         struct EntityRecord
         {
@@ -79,6 +110,7 @@ namespace AREngine::Scene
             Transform transform;
             EntityId parent; // invalid (id == 0) means "no parent, this is a root"
             std::vector<EntityId> children;
+            std::optional<Renderable> renderable;
         };
 
         [[nodiscard]] const EntityRecord& GetRecord(EntityId entity) const;

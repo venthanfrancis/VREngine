@@ -173,6 +173,50 @@ namespace AREngine::Scene
         return GetRecord(entity).children;
     }
 
+    void Scene::SetRenderable(EntityId entity, Renderable renderable)
+    {
+        GetRecordMutable(entity).renderable = renderable;
+    }
+
+    void Scene::RemoveRenderable(EntityId entity)
+    {
+        if (!IsValid(entity))
+        {
+            return;
+        }
+        m_entities.at(entity).renderable.reset();
+    }
+
+    bool Scene::HasRenderable(EntityId entity) const
+    {
+        return GetRecord(entity).renderable.has_value();
+    }
+
+    const Renderable* Scene::GetRenderable(EntityId entity) const
+    {
+        const EntityRecord& record = GetRecord(entity);
+        return record.renderable.has_value() ? &record.renderable.value() : nullptr;
+    }
+
+    std::vector<RenderableInstance> Scene::ExtractRenderables() const
+    {
+        std::vector<RenderableInstance> result;
+        result.reserve(m_entities.size());
+
+        for (const auto& [id, record] : m_entities)
+        {
+            if (!record.renderable.has_value() || !record.renderable->visible)
+            {
+                continue;
+            }
+
+            result.push_back(RenderableInstance{
+                id, GetWorldMatrix(id), record.renderable->mesh, record.renderable->tint});
+        }
+
+        return result;
+    }
+
     const Scene::EntityRecord& Scene::GetRecord(EntityId entity) const
     {
         AR_ASSERT_MSG(IsValid(entity), "Scene query called with an invalid or unknown EntityId - check IsValid() first");

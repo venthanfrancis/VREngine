@@ -103,6 +103,20 @@ target_link_libraries(arengine_demo_camera_controller_tests PRIVATE AREngine::Co
 target_compile_features(arengine_demo_camera_controller_tests PRIVATE cxx_std_20)
 add_test(NAME DemoCameraControllerTests COMMAND arengine_demo_camera_controller_tests)
 
+# Pure-logic tests for ARDemo::BuildDrawPlan (RenderDrawPlanning.hpp) —
+# M12's "extract once, render against N views" step. Built
+# unconditionally, not gated behind ARENGINE_ENABLE_VULKAN: this file
+# depends only on AREngine::Core/AREngine::Scene, no Vulkan/OpenXR type
+# anywhere. See docs/ARCHITECTURE.md, "M12 - Renderable Scene
+# Integration Foundation".
+add_executable(arengine_render_draw_planning_tests
+    render_draw_planning_tests.cpp
+    RenderDrawPlanning.cpp
+)
+target_link_libraries(arengine_render_draw_planning_tests PRIVATE AREngine::Core AREngine::Scene)
+target_compile_features(arengine_render_draw_planning_tests PRIVATE cxx_std_20)
+add_test(NAME RenderDrawPlanningTests COMMAND arengine_render_draw_planning_tests)
+
 # Everything Vulkan-specific is gated on ARENGINE_ENABLE_VULKAN (top-
 # level option, default ON) — when OFF, none of this is added: no
 # find_package(Vulkan) call, no Vulkan targets at all. See
@@ -147,6 +161,26 @@ if(ARENGINE_ENABLE_VULKAN)
     target_link_libraries(arengine_vulkan_present_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering Vulkan::Vulkan)
     target_include_directories(arengine_vulkan_present_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
     target_compile_features(arengine_vulkan_present_demo PRIVATE cxx_std_20)
+
+    # Manual-only, M12: AREngine's first desktop demo driven by real
+    # AREngine::Scene::Scene data through Scene::ExtractRenderables ->
+    # ARDemo::BuildDrawPlan -> ARDemo::DrawPlannedInstances, instead of a
+    # hand-rolled per-demo object list. Requires a real Vulkan-capable
+    # GPU/driver and opens a real window. Built by CMake but deliberately
+    # NOT registered with add_test. Run it directly instead. Deliberately
+    # NOT gated behind ARENGINE_ENABLE_OPENXR - proves the desktop half
+    # of "one Scene, two presentation paths" independent of XR. See
+    # docs/ARCHITECTURE.md, "M12 - Renderable Scene Integration
+    # Foundation".
+    add_executable(arengine_scene_render_demo
+        scene_render_demo.cpp
+        PopulateDemoScene.cpp
+        RenderDrawPlanning.cpp
+        MeshRegistry.cpp
+    )
+    target_link_libraries(arengine_scene_render_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering Vulkan::Vulkan)
+    target_include_directories(arengine_scene_render_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+    target_compile_features(arengine_scene_render_demo PRIVATE cxx_std_20)
 endif()
 
 # Everything OpenXR-specific is gated on ARENGINE_ENABLE_OPENXR (top-
@@ -326,6 +360,9 @@ if(ARENGINE_ENABLE_OPENXR)
             xr_demo.cpp
             OpenXRVulkanViewTarget.cpp
             XRInteractionState.cpp
+            PopulateDemoScene.cpp
+            RenderDrawPlanning.cpp
+            MeshRegistry.cpp
         )
         target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_xr_demo PRIVATE

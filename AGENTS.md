@@ -872,6 +872,15 @@ values - or M8I+ (Scene integration, still pending within M8) — see
     make an XR development runtime load.**
 19. **Treat vendor runtime signing/reputation failures as
     environment/toolchain issues, not AREngine defects.**
+20. **Scene owns world/renderable state, never GPU resources.**
+21. **Renderable data must remain backend-neutral.**
+22. **Resolve MeshId or future render-resource identifiers outside
+    Scene.**
+23. **Extract scene renderables once, then consume them across any
+    number of views.**
+24. **XR eyes are runtime-driven views, not Scene camera entities.**
+25. **Do not introduce transform/extraction caching without profiling
+    evidence.**
 
 ## Build
 
