@@ -892,6 +892,17 @@ values - or M8I+ (Scene integration, still pending within M8) — see
     remain blocked. If necessary, force a genuine full relink/rebuild
     that produces a new executable hash before considering any
     security-setting change.**
+28. **Keep `AssetId` distinct from `MeshId`; source-content identity and
+    render-resource identity are separate concepts.**
+29. **Mesh import stays content-side/backend-neutral; no Vulkan/OpenXR
+    types in `Assets`.**
+30. **Do not assume OBJ position/UV indices are identical; reconstruct
+    engine vertices from the full attribute tuple.**
+31. **Keep vendored third-party source verbatim when possible; isolate
+    compiler workarounds to the integration translation unit.**
+32. **If source asset extensions collide with generic build-artifact
+    ignore patterns, add targeted exceptions rather than weakening
+    ignore rules globally.**
 
 ## Build
 

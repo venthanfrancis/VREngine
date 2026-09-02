@@ -1,0 +1,9 @@
+# Syntactically valid OBJ with real vertex positions but zero faces -
+# a distinct failure mode from corrupt.obj (which has no valid records
+# at all): this file parses cleanly, but DecodeMeshOBJ must still
+# reject it, since an empty mesh (no faces) cannot be uploaded to the
+# GPU.
+
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0

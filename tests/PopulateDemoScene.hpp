@@ -21,13 +21,20 @@
 namespace ARDemo
 {
     // Minted once by each demo's own main() (the single source of truth
-    // for which MeshId means "cube" vs. "floor"), then passed to both
+    // for which MeshId means "pyramid" vs. "floor"), then passed to both
     // PopulateDemoScene (to assign Renderables) and a MeshRegistry (to
     // resolve them to actual uploaded VulkanMesh objects) - the two
     // never need to independently agree on matching integers.
+    //
+    // M15: `pyramid` is now asset-backed (loaded from meshes/pyramid.obj
+    // via AssetManager - see tests/PopulateDemoMeshes.hpp), replacing
+    // the earlier procedural cube; `floor` stays fully procedural
+    // (Rendering::CreateQuadMesh), proving the two coexist in one
+    // MeshRegistry. See docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh
+    // Loading Foundation".
     struct DemoMeshIds
     {
-        AREngine::Scene::MeshId cube;
+        AREngine::Scene::MeshId pyramid;
         AREngine::Scene::MeshId floor;
     };
 
@@ -54,21 +61,32 @@ namespace ARDemo
 
     // Populates `scene` with the same 5-object layout M10.5/M10.6
     // originally hand-rolled as a std::vector<SceneObject>: a floor, a
-    // reference cube, two small cubes, and one small "move offset" cube
-    // - except cubeB is now a real child of referenceCube (local
+    // reference object, two small objects, and one small "move offset"
+    // object - except cubeB is now a real child of referenceCube (local
     // position chosen so its initial WORLD position is unchanged),
     // giving both demos a genuine, visually meaningful hierarchy proof
     // for free (it swings through world space as referenceCube's
-    // existing rotation animation runs).
+    // existing rotation animation runs). The C++ identifiers below
+    // (referenceCube, cubeA, cubeB, moveOffsetCube) are kept unchanged
+    // from M12/M13 even though M15 gave them a pyramid mesh instead of
+    // a cube - only their debug-name string literals were updated - to
+    // avoid an unrelated cascading rename into every call site that
+    // already references these fields (see tests/xr_demo.cpp).
     //
     // M13: material assignment across these same 5 entities proves all
     // three required combinations in one scene (see
     // docs/ARCHITECTURE.md, "M13 - Material & Render Resource Binding
     // Foundation"): referenceCube/cubeB/floor share `redChecker`
     // (multiple entities sharing one material, including across
-    // different meshes - floor is a quad, the other two are cubes);
+    // different meshes - floor is a quad, the other two are pyramids);
     // cubeA shares referenceCube's MeshId but uses `blueChecker` instead
     // (same mesh, different material).
+    //
+    // M15: referenceCube/cubeA/cubeB/moveOffsetCube all share the SAME
+    // asset-backed pyramid MeshId - simultaneously proving "one
+    // GPU-uploaded asset-backed mesh, reused by multiple entities" and
+    // (combined with the material split above) "different materials on
+    // one imported mesh."
     [[nodiscard]] DemoSceneEntities PopulateDemoScene(
         AREngine::Scene::Scene& scene, const DemoMeshIds& meshIds, const DemoMaterialIds& materialIds);
 }

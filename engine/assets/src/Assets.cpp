@@ -1,6 +1,7 @@
 #include "AREngine/Assets/Assets.hpp"
 
 #include "ImageDecode.hpp"
+#include "MeshDecode.hpp"
 
 #include "AREngine/Core/Assert.hpp"
 #include "AREngine/Core/Log.hpp"
@@ -212,9 +213,48 @@ namespace AREngine::Assets
         return id;
     }
 
+    std::optional<AssetId> AssetManager::LoadMesh(const std::filesystem::path& relativePath)
+    {
+        const std::optional<std::filesystem::path> resolved = ResolvePath(relativePath);
+        if (!resolved.has_value())
+        {
+            return std::nullopt;
+        }
+
+        const std::string cacheKey = resolved->generic_string();
+        const auto cached = m_meshPathToId.find(cacheKey);
+        if (cached != m_meshPathToId.end())
+        {
+            return cached->second;
+        }
+
+        // Deliberate exception to LoadText/LoadBinary/LoadTexture's
+        // "read bytes ourselves, then decode from memory" shape:
+        // DecodeMeshOBJ takes the resolved path directly and reads the
+        // file itself via tinyobjloader's own file-based LoadObj - see
+        // MeshDecode.hpp's header comment for why.
+        std::optional<MeshAsset> decoded = DecodeMeshOBJ(*resolved);
+        if (!decoded.has_value())
+        {
+            AR_LOG_WARNING(std::format("Failed to load mesh asset (missing, unreadable, or unparsable OBJ): {}", relativePath.string()));
+            return std::nullopt;
+        }
+
+        const AssetId id{m_nextAssetId++};
+        decoded->id = id;
+        decoded->path = relativePath;
+
+        m_meshAssets.emplace(id, std::move(*decoded));
+        m_meshPathToId.emplace(cacheKey, id);
+
+        return id;
+    }
+
     bool AssetManager::IsValid(AssetId id) const
     {
-        return id.IsValid() && (m_textAssets.contains(id) || m_binaryAssets.contains(id) || m_textureAssets.contains(id));
+        return id.IsValid() &&
+            (m_textAssets.contains(id) || m_binaryAssets.contains(id) ||
+             m_textureAssets.contains(id) || m_meshAssets.contains(id));
     }
 
     const TextAsset& AssetManager::GetText(AssetId id) const
@@ -235,6 +275,13 @@ namespace AREngine::Assets
     {
         const auto it = m_textureAssets.find(id);
         AR_ASSERT_MSG(it != m_textureAssets.end(), "GetTexture called with an id that is not a known texture asset - check IsValid() first");
+        return it->second;
+    }
+
+    const MeshAsset& AssetManager::GetMesh(AssetId id) const
+    {
+        const auto it = m_meshAssets.find(id);
+        AR_ASSERT_MSG(it != m_meshAssets.end(), "GetMesh called with an id that is not a known mesh asset - check IsValid() first");
         return it->second;
     }
 }

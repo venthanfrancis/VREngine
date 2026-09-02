@@ -28,8 +28,10 @@
 #include "AREngine/Scene/Transform.hpp"
 
 #include "DemoCameraController.hpp"
+#include "MeshCache.hpp"
 #include "MeshRegistry.hpp"
 #include "PopulateDemoMaterials.hpp"
+#include "PopulateDemoMeshes.hpp"
 #include "PopulateDemoScene.hpp"
 #include "RenderDrawPlanning.hpp"
 
@@ -151,20 +153,29 @@ int main()
 
     VulkanCommandPool commandPool(device.Get(), physicalDevice.queueFamilies.graphicsFamily);
 
-    // M12: TWO mesh resources (cube + floor quad), each uploaded exactly
-    // once - the milestone's own required "at least two mesh types"
-    // proof, plus mesh REUSE (multiple Scene entities reference the same
-    // cube MeshId - see PopulateDemoScene.cpp).
-    auto cubeMesh = CreateVulkanMesh(
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(), Rendering::CreateCubeMesh());
+    // M15: AssetManager + MeshCache must exist before any asset-backed
+    // mesh can be uploaded - restructured from M12/M14's original
+    // ordering (which uploaded every mesh, all procedural, before
+    // AssetManager even existed) to support the file-backed pyramid
+    // mesh below. See docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh
+    // Loading Foundation".
+    Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
+    ARDemo::MeshCache meshCache;
+    ARDemo::MeshRegistry meshRegistry;
+    const Scene::MeshId pyramidMeshId = ARDemo::PopulateDemoMeshes(
+        assetManager, meshCache, meshRegistry,
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue());
+
+    // Floor stays fully procedural (M8D/ProceduralMesh) - proves
+    // procedural and asset-backed meshes coexist in one MeshRegistry.
     auto floorMesh = CreateVulkanMesh(
         physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(), Rendering::CreateQuadMesh());
-    AR_LOG_INFO("Uploaded 2 persistent meshes (cube, floor quad) - never re-uploaded per frame or per entity");
+    const Scene::MeshId floorMeshId{2};
+    meshRegistry.Register(floorMeshId, floorMesh.get());
+    AR_LOG_INFO("Uploaded 1 asset-backed mesh (pyramid.obj, via AssetManager+MeshCache) + 1 procedural mesh "
+                "(floor quad) - never re-uploaded per frame or per entity");
 
-    const ARDemo::DemoMeshIds meshIds{Scene::MeshId{1}, Scene::MeshId{2}};
-    ARDemo::MeshRegistry meshRegistry;
-    meshRegistry.Register(meshIds.cube, cubeMesh.get());
-    meshRegistry.Register(meshIds.floor, floorMesh.get());
+    const ARDemo::DemoMeshIds meshIds{pyramidMeshId, floorMeshId};
 
     // M14: two real PNG files, loaded through AssetManager, decoded to
     // RGBA8, and uploaded exactly once each via TextureCache - replacing
@@ -173,7 +184,6 @@ int main()
     // mesh, different material" is actually observable. See
     // docs/ARCHITECTURE.md, "M14 - Asset-Backed Texture & Material
     // Loading Foundation".
-    Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
     ARDemo::TextureCache textureCache;
     VulkanSampler sampler(device.Get()); // one sampler, shared by every material - describes filtering only, not a specific image
 
@@ -434,7 +444,8 @@ int main()
         if (loggedFrameCount == 0)
         {
             AR_LOG_INFO(std::format("Frame {}: {} renderable(s) extracted, {} view(s), {} planned draw(s) "
-                                     "(2 unique meshes, 2 file-backed materials [checker_red.png, checker_blue.png], "
+                                     "(1 asset-backed mesh [pyramid.obj] + 1 procedural mesh [floor quad], "
+                                     "2 file-backed materials [checker_red.png, checker_blue.png], "
                                      "2 GPU texture uploads, 1 shared pipeline)",
                                      loggedFrameCount + 1, renderables.size(), viewProjections.size(), plan.size()));
         }

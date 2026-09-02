@@ -61,8 +61,10 @@
 #include "AREngine/Rendering/ProceduralMesh.hpp"
 #include "AREngine/Scene/Scene.hpp"
 
+#include "MeshCache.hpp"
 #include "MeshRegistry.hpp"
 #include "PopulateDemoMaterials.hpp"
+#include "PopulateDemoMeshes.hpp"
 #include "OpenXRVulkanViewTarget.hpp"
 #include "PopulateDemoScene.hpp"
 #include "RenderDrawPlanning.hpp"
@@ -489,16 +491,42 @@ int main()
     NameVulkanObject(bindingData.instance, bindingData.device, VK_OBJECT_TYPE_COMMAND_POOL,
         reinterpret_cast<std::uint64_t>(commandPool.Get()), "AREngine.xr_demo.commandPool");
 
-    // --- M10.5: TWO persistent meshes - the cube (M8H) and a quad
-    // (M8D/ProceduralMesh) used as the floor. Both uploaded exactly
-    // once, before the frame loop - never per-frame, never per-object. ---
-    auto cubeMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
-                                      Rendering::CreateCubeMesh());
-    const TeardownMarker teardownCubeMesh("cubeMesh (vertex+index VulkanBuffer)");
+    // M15: AssetManager + MeshCache must exist before any asset-backed
+    // mesh can be uploaded - restructured from M10.5/M14's original
+    // ordering (which uploaded every mesh, all procedural, before
+    // AssetManager even existed) to support the file-backed pyramid
+    // mesh below. See docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh
+    // Loading Foundation".
+    Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
+    const TeardownMarker teardownAssetManager("assetManager (trivial - CPU-only content cache, no GPU/OpenXR handle)");
+    ARDemo::MeshCache meshCache;
+    const TeardownMarker teardownMeshCache("meshCache (owns the pyramid mesh's VulkanMesh)");
+    ARDemo::MeshRegistry meshRegistry;
+    const TeardownMarker teardownMeshRegistry("meshRegistry (trivial, no owned handle)");
+    const Scene::MeshId pyramidMeshId = ARDemo::PopulateDemoMeshes(
+        assetManager, meshCache, meshRegistry,
+        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue());
+
+    // Floor stays fully procedural (M8D/ProceduralMesh) - proves
+    // procedural and asset-backed meshes coexist in one MeshRegistry.
     auto floorMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
                                        Rendering::CreateQuadMesh());
     const TeardownMarker teardownFloorMesh("floorMesh (vertex+index VulkanBuffer)");
-    AR_LOG_INFO("Uploaded 2 persistent meshes (cube, floor quad) - never re-uploaded per frame");
+    const Scene::MeshId floorMeshId{2};
+    meshRegistry.Register(floorMeshId, floorMesh.get());
+    AR_LOG_INFO("Uploaded 1 asset-backed mesh (pyramid.obj, via AssetManager+MeshCache) + 1 procedural mesh "
+                "(floor quad) - never re-uploaded per frame");
+
+    const ARDemo::DemoMeshIds meshIds{pyramidMeshId, floorMeshId};
+
+    // The pose marker (outside Scene - see the boundary note below)
+    // still draws its mesh directly via DrawOpenXRViewObject, same
+    // shape M10.5 used for the old procedural cube - resolved through
+    // meshRegistry rather than a locally-named unique_ptr, since the
+    // pyramid's VulkanMesh is now owned by meshCache, not by this
+    // function directly.
+    const VulkanMesh* poseMarkerMesh = meshRegistry.Resolve(pyramidMeshId);
+    AR_ASSERT_MSG(poseMarkerMesh != nullptr, "pyramidMeshId must resolve - it was just registered above");
 
     // M14: two real PNG files, loaded through AssetManager, decoded to
     // RGBA8, and uploaded exactly once each via TextureCache - replacing
@@ -507,8 +535,6 @@ int main()
     // "M13 - Material & Render Resource Binding Foundation" for the
     // single-pipeline/multiple-descriptor-set invariant this still
     // relies on, unchanged).
-    Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
-    const TeardownMarker teardownAssetManager("assetManager (trivial - CPU-only content cache, no GPU/OpenXR handle)");
     ARDemo::TextureCache textureCache;
     const TeardownMarker teardownTextureCache("textureCache (owns redTexture/blueTexture's VulkanImage objects)");
     VulkanSampler sampler(bindingData.device); // one sampler, shared by every material
@@ -540,11 +566,6 @@ int main()
     // the comment above the (now-removed) SceneObject struct for the
     // full boundary/reasoning. ALL views render this SAME extracted
     // renderable list - never one set of objects per eye. ---
-    const ARDemo::DemoMeshIds meshIds{Scene::MeshId{1}, Scene::MeshId{2}};
-    ARDemo::MeshRegistry meshRegistry;
-    meshRegistry.Register(meshIds.cube, cubeMesh.get());
-    meshRegistry.Register(meshIds.floor, floorMesh.get());
-
     Scene::Scene scene;
     const ARDemo::DemoSceneEntities sceneEntities = ARDemo::PopulateDemoScene(scene, meshIds, materialIds);
     // Recorded once, right after PopulateDemoScene, rather than
@@ -700,7 +721,7 @@ int main()
                 // during M13 design review - see docs/ARCHITECTURE.md,
                 // "M13 - Material Field Placement".
                 scene.SetRenderable(sceneEntities.referenceCube, Scene::Renderable{
-                    meshIds.cube,
+                    meshIds.pyramid,
                     materialIds.redChecker,
                     interactionState.highlightEnabled ? kReferenceCubeHighlightTint : kReferenceCubeBaseTint,
                     true});
@@ -794,7 +815,7 @@ int main()
                             interactionState.poseMarkerPosition, interactionState.poseMarkerOrientation,
                             Math::Vec3(0.15f, 0.15f, 0.15f)};
                         const Math::Mat4 poseMarkerMvp = viewProjections[i] * poseMarkerTransform.ToMatrix();
-                        DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *cubeMesh, poseMarkerMvp, kPoseMarkerTint);
+                        DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *poseMarkerMesh, poseMarkerMvp, kPoseMarkerTint);
                         ++diag.objectsRendered;
                         ++diag.drawCalls;
                     }
@@ -938,23 +959,26 @@ int main()
     // Destruction, in exact reverse declaration order: frameDriver
     // (trivial) -> viewTargets (each destroys its own depth image +
     // framebuffers) -> moveOffsetCubeBasePosition/sceneEntities/scene/
-    // materialIds/materialRegistry/meshRegistry/meshIds (all trivial -
-    // Scene::Scene owns no GPU/OpenXR handle, MeshRegistry/MaterialRegistry
-    // hold only raw non-owning pointers/handles) -> descriptorPool
+    // materialIds (all trivial - Scene::Scene owns no GPU/OpenXR handle)
+    // -> materialRegistry (trivial, no owned handle) -> descriptorPool
     // (frees both descriptor sets implicitly) -> sampler -> textureCache
     // (destroys its owned redTexture/blueTexture VulkanImage objects) ->
-    // assetManager (trivial - CPU-only content cache) ->
-    // floorMesh -> cubeMesh -> commandPool (frees commandBuffer
-    // implicitly) -> pipeline -> descriptorSetLayout -> renderPass ->
-    // projectionLayer (trivial) -> swapchains (each xrDestroySwapchain,
-    // and its own cached AREngine-owned VkImageViews first) ->
-    // actionSystem (destroys both aim_pose action spaces, then all four
-    // actions, then the action set itself - all while `session` is
-    // still alive) -> localSpace (xrDestroySpace) -> session
-    // (xrDestroySession) -> binding (VkDevice, then VkInstance) ->
-    // instance (xrDestroyInstance) last. Every GPU/OpenXR resource this
-    // demo owns is destroyed while the handle it depends on
-    // (bindingData.device/session/instance) is still alive, a direct
+    // poseMarkerMesh (trivial, non-owning raw pointer) -> meshIds/
+    // floorMeshId (trivial) -> floorMesh (vertex+index VulkanBuffer) ->
+    // pyramidMeshId (trivial) -> meshRegistry (trivial, no owned handle
+    // - only non-owning pointers) -> meshCache (destroys its owned
+    // pyramid VulkanMesh - see "M15 - Asset-Backed Mesh Loading
+    // Foundation") -> assetManager (trivial - CPU-only content cache) ->
+    // commandPool (frees commandBuffer implicitly) -> pipeline ->
+    // descriptorSetLayout -> renderPass -> projectionLayer (trivial) ->
+    // swapchains (each xrDestroySwapchain, and its own cached AREngine-
+    // owned VkImageViews first) -> actionSystem (destroys both aim_pose
+    // action spaces, then all four actions, then the action set itself -
+    // all while `session` is still alive) -> localSpace (xrDestroySpace)
+    // -> session (xrDestroySession) -> binding (VkDevice, then
+    // VkInstance) -> instance (xrDestroyInstance) last. Every GPU/OpenXR
+    // resource this demo owns is destroyed while the handle it depends
+    // on (bindingData.device/session/instance) is still alive, a direct
     // consequence of declaration order - verified against the actual
     // order above, not assumed.
 }

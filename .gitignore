@@ -48,6 +48,12 @@ build.ninja
 *.ilk
 *.exp
 
+# M15: *.obj above targets MSVC's compiled object files, but Wavefront
+# OBJ mesh fixtures committed under tests/data/assets/meshes/ share the
+# same extension - explicitly un-ignore them so they aren't silently
+# dropped from commits.
+!tests/data/assets/meshes/*.obj
+
 # OS junk
 Thumbs.db
 .DS_Store

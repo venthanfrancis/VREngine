@@ -1,6 +1,7 @@
 add_library(arengine_assets STATIC
     src/Assets.cpp
     src/ImageDecode.cpp
+    src/MeshDecode.cpp
 )
 add_library(AREngine::Assets ALIAS arengine_assets)
 
@@ -11,7 +12,9 @@ target_sources(arengine_assets
         include/AREngine/Assets/TextAsset.hpp
         include/AREngine/Assets/BinaryAsset.hpp
         include/AREngine/Assets/TextureAsset.hpp
+        include/AREngine/Assets/MeshAsset.hpp
         src/ImageDecode.hpp
+        src/MeshDecode.hpp
 )
 
 target_include_directories(arengine_assets
@@ -46,4 +49,15 @@ target_compile_features(arengine_assets PUBLIC cxx_std_20)
 target_include_directories(arengine_assets
     PRIVATE
         ${CMAKE_SOURCE_DIR}/third_party/stb
+)
+
+# M15: tiny_obj_loader.h is vendored directly (third_party/tinyobjloader/),
+# same reasoning and same PRIVATE scoping as stb_image.h above - an
+# implementation detail of src/MeshDecode.cpp only. See
+# docs/ROADMAP.md's "No third-party dependencies until a milestone
+# explicitly calls for one" and docs/ARCHITECTURE.md, "M15 - Asset-
+# Backed Mesh Loading Foundation".
+target_include_directories(arengine_assets
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/third_party/tinyobjloader
 )

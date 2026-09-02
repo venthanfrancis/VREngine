@@ -1,0 +1,11 @@
+# Minimal single-triangle fixture with NO texture coordinates at all -
+# exercises DecodeMeshOBJ's texcoord_index == -1 fallback path (uv
+# defaults to (0,0)), which pyramid.obj (every face corner has a vt)
+# never exercises. Also serves as a second, distinct valid mesh asset
+# for the "distinct meshes get distinct AssetIds" test.
+
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+
+f 1 2 3

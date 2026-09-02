@@ -2,6 +2,7 @@
 
 #include "AREngine/Assets/AssetId.hpp"
 #include "AREngine/Assets/BinaryAsset.hpp"
+#include "AREngine/Assets/MeshAsset.hpp"
 #include "AREngine/Assets/TextAsset.hpp"
 #include "AREngine/Assets/TextureAsset.hpp"
 
@@ -13,13 +14,15 @@
 namespace AREngine::Assets
 {
     // Owns one asset root directory and every asset loaded relative to
-    // it. Loads raw text/binary content, and decoded RGBA8 image
-    // content (M14), from disk, assigns each a distinct AssetId, and
-    // caches by resolved path so repeated loads of the same file don't
-    // hit the disk twice. See docs/ARCHITECTURE.md, "M6 Implementation
-    // Notes" for the asset root model, cache key strategy, and failure
-    // model, and "M14 - Asset-Backed Texture & Material Loading
-    // Foundation" for LoadTexture/TextureAsset specifically.
+    // it. Loads raw text/binary content, decoded RGBA8 image content
+    // (M14), and decoded/unified OBJ mesh content (M15), from disk,
+    // assigns each a distinct AssetId, and caches by resolved path so
+    // repeated loads of the same file don't hit the disk twice. See
+    // docs/ARCHITECTURE.md, "M6 Implementation Notes" for the asset
+    // root model, cache key strategy, and failure model, "M14 - Asset-
+    // Backed Texture & Material Loading Foundation" for
+    // LoadTexture/TextureAsset, and "M15 - Asset-Backed Mesh Loading
+    // Foundation" for LoadMesh/MeshAsset specifically.
     //
     // Depends only on Core — see docs/ARCHITECTURE.md, "Why Assets
     // Does Not Depend On Platform". No Vulkan/OpenXR/graphics-backend
@@ -69,11 +72,27 @@ namespace AREngine::Assets
         // Behavior".
         [[nodiscard]] std::optional<AssetId> LoadTexture(const std::filesystem::path& relativePath);
 
+        // M15: loads (or returns the cached AssetId for) the OBJ mesh
+        // file at `relativePath`, parsed and unified into a single
+        // vertex+index list. Returns std::nullopt if the file doesn't
+        // exist, can't be read, the resolved path would escape the
+        // asset root, the file can't be parsed as OBJ, or the parsed
+        // mesh has zero faces or an out-of-range vertex/texcoord
+        // reference - one consistent failure path, same philosophy as
+        // LoadText/LoadBinary/LoadTexture. A fourth independent {path,
+        // type} cache, same shape as the other three - see
+        // docs/ARCHITECTURE.md, "Same-Path/Different-Type Behavior".
+        // Only a narrow v/vt/f OBJ subset is supported - see
+        // docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh Loading
+        // Foundation" for exactly what is and is not parsed.
+        [[nodiscard]] std::optional<AssetId> LoadMesh(const std::filesystem::path& relativePath);
+
         [[nodiscard]] bool IsValid(AssetId id) const;
 
         [[nodiscard]] const TextAsset& GetText(AssetId id) const;
         [[nodiscard]] const BinaryAsset& GetBinary(AssetId id) const;
         [[nodiscard]] const TextureAsset& GetTexture(AssetId id) const;
+        [[nodiscard]] const MeshAsset& GetMesh(AssetId id) const;
 
         [[nodiscard]] const std::filesystem::path& GetRoot() const { return m_root; }
 
@@ -101,5 +120,8 @@ namespace AREngine::Assets
 
         std::unordered_map<std::string, AssetId> m_texturePathToId;
         std::unordered_map<AssetId, TextureAsset> m_textureAssets;
+
+        std::unordered_map<std::string, AssetId> m_meshPathToId;
+        std::unordered_map<AssetId, MeshAsset> m_meshAssets;
     };
 }

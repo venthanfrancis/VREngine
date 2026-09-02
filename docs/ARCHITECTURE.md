@@ -9789,3 +9789,317 @@ AREngine-attributable errors.
 A material asset format, asset-backed mesh content, material/shader
 parameters, pipeline variants, model importing, PBR/lighting, hot
 reload/asset database/editor tooling - see M15.
+
+## M15 - Asset-Backed Mesh Loading Foundation
+
+### Goal
+
+Bridge `engine/assets` into the M12 `MeshId`/`MeshRegistry` GPU-mesh
+path so a real OBJ file, loaded through `AssetManager`, becomes a GPU
+mesh referenced by `MeshId` - closing the last M12/M13/M14 gap (all
+geometry so far was procedural). `AssetId` and `MeshId` stay
+deliberately distinct throughout, exactly as `AssetId`/`MaterialId`
+already do: source content identity vs. logical render-mesh identity.
+Only a narrow OBJ subset is supported - `v`/`vt`/`f` records, triangles
+only, no normals, no vertex color, no `.mtl` material import.
+
+### Audit findings
+
+`Rendering::MeshData`/`MeshVertex` (M8H) have no normal field
+(`position`/`color`/`uv` only) - the exact shape this milestone's OBJ
+subset needs, no gaps to fill. The winding/culling chain (`VK_CULL_MODE_BACK_BIT`
++ `VK_FRONT_FACE_CLOCKWISE`, `ApplyVulkanYFlip` applied once to the
+projection matrix, every procedural face authored CCW-from-outside -
+see "Back-Face Culling (M8H)") was re-derived from scratch, not
+assumed, since a sign error in a hand-authored test fixture would be
+silently invisible (fully back-face-culled) with no compiler or log
+symptom. `docs/ARCHITECTURE.md`'s own M8H section already flagged the
+UV vertical (V) convention as *unproven* anywhere in this codebase (a
+symmetric checkerboard can't distinguish a V-flip bug) - M15
+deliberately sidesteps resolving that open question rather than
+guessing (see Design below). `TextureCache` (M14) is the exact
+owning-cache template `MeshCache` mirrors; `MeshRegistry` (M12) needed
+zero changes - it already accepts any raw `VulkanMesh*` via `Register`.
+No OBJ-parsing library existed anywhere in the repo.
+
+### Winding: hand-authored fixture, zero import-side correction
+
+Rather than resolving the open UV-V-flip/winding-convention question in
+general, `tests/data/assets/meshes/pyramid.obj` (a square-based
+pyramid) is authored directly in AREngine's own already-proven
+local-space convention (CCW-from-outside, `uv(0,0)` = local low-U/
+low-V corner per face - the exact rule `ProceduralMesh::AppendFace`
+already uses). `DecodeMeshOBJ` performs **zero** winding reversal, axis
+conversion, or V-flip - a documented, narrow assumption ("this OBJ must
+already be authored in AREngine's convention"), not a general importer.
+The fixture's four base corners are byte-for-byte `ProceduralMesh.cpp`'s
+own already-shipping `-Y` cube face, in the same order - so the base
+triangulation is provably correct by structural identity with existing
+rendering code, not just re-derived cross-product math (both checks
+were independently performed and agreed). A winding mistake here would
+be catastrophic and unambiguous - the whole mesh invisible - rather
+than subtle, which is why a visual screenshot (see Validation) is the
+real proof, not just log counts.
+
+### `Assets::MeshAsset` - independent struct, not `Rendering::MeshVertex`
+
+`engine/assets/include/AREngine/Assets/MeshAsset.hpp`:
+```cpp
+struct MeshVertexData { Vec3 position; Vec3 color; Vec2 uv; };
+struct MeshAsset { AssetId id; std::filesystem::path path; std::vector<MeshVertexData> vertices; std::vector<std::uint32_t> indices; };
+```
+Independent from `Rendering::MeshVertex` for the same reason
+`TextureAsset` doesn't reuse any `Rendering` type: `Assets` depends only
+on `Core`, and reusing a `Rendering` type here would force a new
+`Assets -> Rendering` dependency purely to share a vertex layout.
+Conversion happens at the `tests/`-leaf bridge (`MeshCache`, below),
+mirroring `TextureCache` exactly. `color` is always white `(1,1,1)` - no
+OBJ vertex-color import, matching `ProceduralMesh`'s own convention
+(visible color comes from `Renderable::tint`).
+
+### `AssetManager`'s fourth parallel type
+
+`LoadMesh(relativePath) -> std::optional<AssetId>`,
+`GetMesh(AssetId) const -> const MeshAsset&` (asserts on unknown id),
+a fourth `{path -> id, id -> Asset}` pair, same shape as the other
+three. `IsValid()` was extended to also check the new mesh map - a real
+gap caught during design review (a fourth map added without updating
+`IsValid` would have silently misreported a freshly-loaded mesh
+`AssetId` as invalid). Deliberate, documented deviation from
+`LoadTexture`'s shape: after `ResolvePath` succeeds (still enforcing
+traversal protection first), `LoadMesh` passes the resolved absolute
+path directly to `DecodeMeshOBJ`, which reads the file itself via
+tinyobjloader's own file-based `LoadObj` - it does **not** go through
+`ReadBinaryFile` + decode-from-memory like `ImageDecode.cpp`.
+`ImageDecode.cpp`'s own `STBI_NO_STDIO` comment states an "always
+decode from memory" invariant for that module; `LoadMesh`/`MeshDecode.cpp`
+explicitly document this as the one deliberate exception, since
+tinyobjloader's memory/callback API (`LoadObjWithCallback`) uses a
+different, riskier, un-normalized index convention than its file API
+(see below).
+
+### Decoder: `engine/assets/src/MeshDecode.hpp/.cpp` (private, tinyobjloader-only boundary)
+
+One exposed function, `DecodeMeshOBJ(const std::filesystem::path&) ->
+std::optional<MeshAsset>`. Contains the ONLY `#define
+TINYOBJLOADER_IMPLEMENTATION` + `tiny_obj_loader.h` include anywhere in
+this codebase, wrapped in `#pragma warning(push, 0)`/`pop` the same way
+`ImageDecode.cpp` fences stb_image. Calls tinyobjloader's simple,
+filename-based `tinyobj::LoadObj(&attrib, &shapes, &materials, &warn,
+&err, path)` - not the stream/callback-based `LoadObjWithCallback`.
+This choice was verified against the real vendored source, not assumed:
+the simple API's internal parser (`sr_parseTriple`, via `fixIndex`)
+normalizes every index to 0-based with an unambiguous `-1` "absent"
+sentinel (including the zero-index OBJ-spec-violation edge case,
+handled explicitly); the callback API's parser (`sr_parseRawTriple`) is
+lower-level, hands back un-normalized indices with a *different*
+sentinel (`0`, not `-1`), and does not call `fixIndex` at all -
+reimplementing that normalization correctly would be strictly riskier
+than the one narrow divergence from `ImageDecode.cpp`'s memory-decode
+pattern. `materials` is parsed (if any `mtllib` line is even present -
+none of this milestone's fixtures have one) but discarded entirely - no
+`.mtl`-derived `MaterialId`, matching the milestone's explicit scope. A
+non-empty `warn` string is logged via `AR_LOG_WARNING` even on success
+(not just checked on failure) - a real gap caught during design review.
+
+Dedup logic: for every `shape.mesh.indices` entry
+(`{vertex_index, normal_index, texcoord_index}` - `normal_index` always
+ignored, no normal import), a local `std::map<std::pair<int,int>,
+uint32_t>` keyed by `(vertex_index, texcoord_index)` maps each unique
+pair to an already-appended `MeshVertexData` index; a repeat pair reuses
+the existing index. `texcoord_index == -1` (confirmed the sole,
+unambiguous "no `vt`" sentinel) defaults that corner's UV to `(0,0)`.
+Both `vertex_index` and `texcoord_index` are explicitly bounds-checked
+against the parsed `attrib.vertices`/`attrib.texcoords` array sizes
+before indexing - **not** trusted to tinyobjloader itself: reading
+`fixIndex`'s actual implementation shows it does *not* validate a
+positive index against the parsed vertex count at all (only relative/
+negative indices are range-checked), so a face referencing a
+wildly-out-of-range positive vertex index would otherwise read past the
+end of `attrib.vertices` - confirmed as a genuine defense (not
+redundant) by `tests/data/assets/meshes/invalid_index.obj`, whose face
+references vertex 999 with only 3 vertices defined; in practice
+tinyobjloader's own separate post-parse validation catches this
+specific case too (`warn`: "Vertex indices out of bounds"), but
+AREngine's own bounds check is the one guaranteed layer, not an
+assumption about parser internals that could change upstream. A
+syntactically valid OBJ with zero faces (`asset.vertices.empty()`)
+returns `nullopt`, same failure path as a corrupt/degenerate texture.
+
+### MSVC/C++20 compile workaround (upstream fast_float bug)
+
+The pinned tinyobjloader commit's embedded `fast_float` snapshot failed
+to compile under MSVC in this project's required C++20 mode: error
+C3615, `loop_parse_if_eight_digits` guarded behind a `constexpr` that
+MSVC's own checker rejects, even though MSVC's STL already advertises
+the feature-test macro (`__cpp_lib_constexpr_algorithms`) that gates it
+- a genuine upstream fast_float/MSVC incompatibility, not an AREngine
+defect, and not fixable by relaxing `/W4` (it's a hard error, not a
+warning). Worked around entirely from `MeshDecode.cpp` (the vendored
+file itself stays verbatim/unmodified, per policy): `#include <version>`
++ `#undef __cpp_lib_constexpr_algorithms` immediately before including
+`tiny_obj_loader.h`, steering the header's own existing feature-test
+check onto its non-constexpr fallback path - a compile-time code-path
+choice inside fast_float's digit-parsing fast path only, with no effect
+on parsed values. Verified fixed by a clean build immediately after.
+
+### Vendoring `tiny_obj_loader.h` directly, not `FetchContent`
+
+Commit `62ff207968f3dc14a64a1e2378dce67b760e7c4a`, fetched directly via
+`curl` for byte-exact source, at
+`third_party/tinyobjloader/tiny_obj_loader.h` - MIT licensed, license
+text embedded in the file, provenance recorded in
+`third_party/tinyobjloader/README.md` (including the MSVC workaround
+above). Same reasoning as `stb_image.h`: `engine/assets` builds
+unconditionally, so `FetchContent` here would make network access
+mandatory on every fresh configure project-wide, unlike the OpenXR-SDK
+precedent (optional, default-OFF). `engine/assets/CMakeLists.txt` adds
+a second, separate `PRIVATE` include directory for it.
+
+### `MeshCache` (`tests/MeshCache.hpp/.cpp`, Vulkan-only)
+
+Mirrors `TextureCache` exactly - owns every `VulkanMesh` it creates:
+```cpp
+class MeshCache {
+public:
+    const VulkanMesh* GetOrCreate(AssetId, const MeshAsset&, VkPhysicalDevice, VkDevice, VkCommandPool, VkQueue);
+private:
+    std::unordered_map<AssetId, std::unique_ptr<VulkanMesh>> m_meshes;
+};
+```
+Cache hit: zero Vulkan calls. Cache miss: converts `Assets::MeshAsset`
+field-by-field into a local `Rendering::MeshData`
+(`MeshVertexData{position,color,uv}` -> `MeshVertex{position,color,uv}`,
+indices copied as-is), calls the existing unchanged `CreateVulkanMesh`,
+caches, returns. `MeshRegistry` (M12) needed no changes at all - the
+new `PopulateDemoMeshes` helper calls `meshCache.GetOrCreate(...)` for
+the raw pointer, then `meshRegistry.Register(mintedMeshId, thatPointer)`,
+the exact call shape already used for procedural meshes. No automated
+`ctest` coverage - real Vulkan calls, no opaque-handle shortcut
+available - verified manually through the demos only, consistent with
+`TextureCache`'s own established posture.
+
+### `tests/PopulateDemoMeshes.hpp/.cpp` (shared by both demos)
+
+Mirrors `PopulateDemoMaterials`'s shape (flat parameters, no bundling
+struct). Loads `meshes/pyramid.obj` via `AssetManager::LoadMesh`,
+resolves via `GetMesh`, uploads/caches via `MeshCache::GetOrCreate`,
+mints a `MeshId`, registers it into `MeshRegistry`, returns the
+`MeshId`. Missing committed fixture is treated as a setup/packaging bug
+(`AR_ASSERT_MSG`), matching `PopulateDemoMaterials`'s own philosophy.
+Deliberately does **not** also own the floor quad's upload - both
+demos' `main()` still create+register the procedural floor directly,
+so "procedural and asset-backed meshes coexist in one `MeshRegistry`"
+stays visible at each demo's own call site rather than hidden behind
+one helper that does everything.
+
+### Demo restructuring (an ordering bug caught before it was written)
+
+Design review found that in both demo files, procedural mesh upload +
+`MeshRegistry` registration happened entirely *before* `AssetManager`/
+`TextureCache` were even constructed - a structure M15's asset-backed
+mesh (needing `AssetManager` + the new `MeshCache` to exist *first*)
+could not simply extend in place. Both `scene_render_demo.cpp` and
+`xr_demo.cpp` were restructured: `AssetManager` and `MeshCache` now
+construct immediately after `commandPool`, followed by
+`PopulateDemoMeshes` (pyramid), then the procedural floor
+upload+registration, then `TextureCache`/materials as before.
+`DemoMeshIds::cube` was renamed to `pyramid` (`PopulateDemoScene.hpp`);
+`CreateEntity(...)` debug-name string literals were updated
+("ReferenceCube" -> "ReferencePyramid", etc.) but the underlying C++
+identifiers (`sceneEntities.referenceCube`, `cubeA`, `cubeB`,
+`moveOffsetCube`) were deliberately left unchanged, to avoid an
+unrelated cascading rename into `xr_demo.cpp`'s interaction-state code
+for no functional benefit.
+
+`xr_demo.cpp`'s pose marker (still outside `Scene`, unchanged M12
+boundary) used to draw a locally-owned `cubeMesh` unique_ptr directly;
+since the pyramid's `VulkanMesh` is now owned by `meshCache` instead, it
+resolves through `meshRegistry.Resolve(pyramidMeshId)` once, right
+after registration, into a `const VulkanMesh* poseMarkerMesh` used at
+the draw call site. New `TeardownMarker`s were added for `meshCache`/
+`meshRegistry`, and the trailing destruction-order comment was updated
+- confirmed byte-for-byte correct against the actual teardown trace
+from the validation run (see Validation).
+
+`referenceCube`/`cubeA`/`cubeB`/`moveOffsetCube` (4 entities) all end up
+referencing the same asset-backed pyramid `MeshId`, with their existing
+M13/M14 Red/Blue `MaterialId` split unchanged - simultaneously proving
+"same asset-backed mesh, multiple entities, one GPU upload" and
+"different materials on one imported mesh," while the procedural floor
+proves procedural/asset-backed coexistence.
+
+### Test fixtures
+
+`tests/data/assets/meshes/pyramid.obj` (the hand-authored fixture
+above); `triangle.obj` (a minimal single-triangle mesh with **no** `vt`
+records at all, exercising `DecodeMeshOBJ`'s `texcoord_index == -1`
+default-to-`(0,0)` fallback path, which `pyramid.obj` never exercises
+since every one of its face corners has a `vt`); `corrupt.obj` (plain
+non-OBJ text, parses to zero vertices); `empty_mesh.obj` (syntactically
+valid `v` records, zero `f` records); `invalid_index.obj` (a face
+referencing vertex index 999 with only 3 vertices defined).
+
+### Pure tests added
+
+14 new tests in `tests/asset_tests.cpp` (unconditional, no Vulkan):
+`pyramid.obj`'s 18 raw face-corner references unify into exactly 16
+vertices/18 indices (2 exact `(vertex_index, texcoord_index)` duplicates
+in the base quad's two triangles); the apex position appears exactly 4
+times (referenced by all 4 side faces, each with a *different* texcoord
+index, so deliberately *not* deduplicated); a known vertex's exact
+position+UV pair; `triangle.obj`'s no-`vt` fallback; missing file,
+corrupt file, empty mesh, and out-of-range vertex index all return
+`nullopt`; caching/path-normalization reuse; distinct meshes get
+distinct `AssetId`s; root-traversal rejection; `IsValid()` recognizes a
+freshly-loaded mesh `AssetId` (the map-coverage gap, now covered).
+
+### Validation
+
+Full build matrix (all 4 `OPENXR`x`VULKAN` combinations, Debug and
+Release) and `ctest` green (19/16/14/12), zero compiler warnings
+anywhere including from the vendored tinyobjloader header (once the
+MSVC/C++20 workaround above was applied).
+
+`arengine_scene_render_demo`: `Uploaded 1 asset-backed mesh (pyramid.obj,
+via AssetManager+MeshCache) + 1 procedural mesh (floor quad)`, `Scene: 5
+entities..., 2 meshes, 2 materials`, `Frame 1: 5 renderable(s)
+extracted, 1 view(s), 5 planned draw(s)`. A full-screen screenshot
+captured while running visually confirms all 4 pyramids fully visible
+(the unambiguous winding proof - a sign error would have culled them
+completely, not subtly), correctly mapped red/blue checkerboard
+textures, and no garbling - real pixel evidence, not just log counts.
+
+`arengine_xr_demo` (against SteamVR - two attempts hit the
+already-documented `xrGetVulkanGraphicsDevice2KHR` -> `XR_ERROR_RUNTIME_FAILURE`
+stale-session-state issue from M11.3A/M11.3, resolved the same
+documented way, a full SteamVR restart via `vrstartup.exe`; unrelated to
+any M15 code, occurring before any Assets/mesh code runs): 1000/1000
+frames attempted, `frames rendered=14` (SteamVR's null driver again
+exposing `shouldRender=true` on only a handful of frames, the same
+documented environment limitation since M9H), `objects rendered=140,
+draw calls=140` (14 rendered frames x 2 eyes x 5 renderables - confirms
+the pyramid mesh and both materials resolved correctly on every
+rendered frame). Full clean teardown trace through every
+`TeardownMarker`, in the exact order the updated destruction-order
+comment documents (`... textureCache -> floorMesh -> meshRegistry ->
+meshCache -> assetManager -> ...`). Only the already-documented
+`BlankEyeBuffer`/D3D11-KMT SteamVR-internal noise present (including the
+expected `VUID-vkDestroyDevice-device-05137` leaked-object warning at
+teardown, SteamVR's own compositor objects, none of them AREngine's) -
+zero new AREngine-attributable errors.
+
+The UV vertical (V) convention remains genuinely unproven in the
+general sense - M15 sidesteps it by construction (the fixture is
+authored directly in AREngine's own convention, requiring zero
+conversion), it does not resolve it. A future general-purpose importer
+that must convert from an externally-authored OBJ's own convention will
+need to actually answer this question.
+
+### Deferred
+
+glTF/FBX import, skeletal animation/skinning, `.mtl`-derived materials,
+node hierarchy/multi-object OBJ import, morph targets, animation clips,
+LOD, an asset database, editor tooling, general axis/winding conversion
+(V-flip convention resolution) - none of this was in scope, and none of
+it is needed by anything built so far.

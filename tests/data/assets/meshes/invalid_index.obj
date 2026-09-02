@@ -1,0 +1,11 @@
+# A face referencing a vertex index (999) far beyond the 3 positions
+# actually defined below - DecodeMeshOBJ's own defensive bounds check
+# must reject this (tinyobjloader's own index-fixing does not validate
+# an index against the parsed vertex count itself - only relative
+# (negative) indices are range-checked).
+
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+
+f 1 2 999

@@ -180,6 +180,8 @@ if(ARENGINE_ENABLE_VULKAN)
         MaterialRegistry.cpp
         TextureCache.cpp
         PopulateDemoMaterials.cpp
+        MeshCache.cpp
+        PopulateDemoMeshes.cpp
     )
     target_link_libraries(arengine_scene_render_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering AREngine::Assets Vulkan::Vulkan)
     target_include_directories(arengine_scene_render_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
@@ -390,6 +392,8 @@ if(ARENGINE_ENABLE_OPENXR)
             MaterialRegistry.cpp
             TextureCache.cpp
             PopulateDemoMaterials.cpp
+            MeshCache.cpp
+            PopulateDemoMeshes.cpp
         )
         target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input AREngine::Assets OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_xr_demo PRIVATE

@@ -1,14 +1,16 @@
 // M6 automated tests for AREngine::Assets: AssetId, AssetManager's
 // text/binary loading, caching, path normalization, root-traversal
 // protection, and same-path/different-type behavior. Plus M14's
-// LoadTexture/GetTexture (decoded RGBA8 image loading). No human
+// LoadTexture/GetTexture (decoded RGBA8 image loading) and M15's
+// LoadMesh/GetMesh (decoded/unified OBJ mesh loading). No human
 // interaction, fully headless — reads tiny fixture files from
 // tests/data/assets/ (path supplied by CMake via AR_TEST_ASSETS_ROOT,
 // so no machine-specific path is hard-coded here). tests/data/assets/
-// now holds both test-only fixtures AND the two small PNGs the desktop/
-// XR demos load at runtime (tests/data/assets/textures/) - see
-// docs/ARCHITECTURE.md, "M14 - Asset-Backed Texture & Material Loading
-// Foundation".
+// now holds both test-only fixtures AND the small PNGs/OBJs the
+// desktop/XR demos load at runtime (tests/data/assets/textures/,
+// tests/data/assets/meshes/) - see docs/ARCHITECTURE.md, "M14 - Asset-
+// Backed Texture & Material Loading Foundation" and "M15 - Asset-
+// Backed Mesh Loading Foundation".
 
 #include "AREngine/Assets/Assets.hpp"
 
@@ -256,6 +258,178 @@ namespace
         const auto escapeAttempt = manager.LoadTexture("../outside.png");
         Check(!escapeAttempt.has_value(), "A texture path that escapes the asset root is rejected, same as text/binary");
     }
+
+    // --- M15: LoadMesh / GetMesh ---
+    //
+    // meshes/pyramid.obj has 6 triangular faces (18 total face-corner
+    // references), 2 of which are exact (vertex_index, texcoord_index)
+    // duplicates (the base quad's two triangles deliberately reuse
+    // vt1/vt3) - so DecodeMeshOBJ must unify them down to exactly 16
+    // unique vertices / 18 indices. The apex (v1, position (0,0.5,0))
+    // is referenced by all 4 side faces with 4 DIFFERENT texcoord
+    // indices, so it is deliberately NOT deduplicated - it appears as
+    // 4 separate MeshVertexData entries, all sharing the same position.
+
+    void TestMeshLoadSucceedsWithCorrectCounts()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto id = manager.LoadMesh("meshes/pyramid.obj");
+        Check(id.has_value(), "A valid OBJ file loads successfully");
+        Check(id->IsValid(), "The returned AssetId is valid");
+
+        const MeshAsset& asset = manager.GetMesh(*id);
+        Check(asset.vertices.size() == 16, "pyramid.obj's 18 face-corner references unify into exactly 16 vertices");
+        Check(asset.indices.size() == 18, "pyramid.obj has exactly 18 indices (6 triangular faces * 3)");
+    }
+
+    void TestMeshLoadDedupOccurred()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto id = manager.LoadMesh("meshes/pyramid.obj");
+        Check(id.has_value(), "pyramid.obj loads");
+        const MeshAsset& asset = manager.GetMesh(*id);
+
+        Check(asset.vertices.size() < asset.indices.size(),
+              "Unique vertex count is strictly less than the raw index count - real dedup occurred, not a 1:1 passthrough");
+    }
+
+    void TestMeshLoadHasCorrectApexPosition()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto id = manager.LoadMesh("meshes/pyramid.obj");
+        Check(id.has_value(), "pyramid.obj loads");
+        const MeshAsset& asset = manager.GetMesh(*id);
+
+        const AREngine::Core::Math::Vec3 apex(0.0f, 0.5f, 0.0f);
+        std::size_t apexCount = 0;
+        for (const MeshVertexData& vertex : asset.vertices)
+        {
+            if (vertex.position == apex) { ++apexCount; }
+        }
+        Check(apexCount == 4, "The apex position appears exactly 4 times (once per side face, each with a distinct UV - not deduplicated)");
+    }
+
+    void TestMeshLoadHasCorrectUV()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto id = manager.LoadMesh("meshes/pyramid.obj");
+        Check(id.has_value(), "pyramid.obj loads");
+        const MeshAsset& asset = manager.GetMesh(*id);
+
+        // B0 = (-0.5,-0.5,-0.5), the base corner assigned vt1 = (0,0) -
+        // the same corner/UV pairing ProceduralMesh::AppendFace uses.
+        const AREngine::Core::Math::Vec3 b0(-0.5f, -0.5f, -0.5f);
+        const AREngine::Core::Math::Vec2 expectedUv(0.0f, 0.0f);
+        bool found = false;
+        for (const MeshVertexData& vertex : asset.vertices)
+        {
+            if (vertex.position == b0 && vertex.uv == expectedUv) { found = true; break; }
+        }
+        Check(found, "A vertex with B0's position and its expected (0,0) UV exists in the decoded mesh");
+    }
+
+    void TestMeshLoadWithNoTexcoordsDefaultsUvToZero()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto id = manager.LoadMesh("meshes/triangle.obj");
+        Check(id.has_value(), "triangle.obj (no vt records at all) loads successfully");
+        const MeshAsset& asset = manager.GetMesh(*id);
+
+        Check(asset.vertices.size() == 3, "triangle.obj has exactly 3 unique vertices");
+        Check(asset.indices.size() == 3, "triangle.obj has exactly 3 indices (1 face * 3)");
+        for (const MeshVertexData& vertex : asset.vertices)
+        {
+            Check(vertex.uv == AREngine::Core::Math::Vec2(0.0f, 0.0f),
+                  "A face corner with no vt (texcoord_index == -1) defaults its UV to (0,0)");
+        }
+    }
+
+    void TestMeshMissingFileFailsPredictably()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto result = manager.LoadMesh("meshes/does_not_exist.obj");
+        Check(!result.has_value(), "Loading a missing OBJ file returns std::nullopt, not a crash");
+    }
+
+    void TestMeshCorruptFileFailsPredictably()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto result = manager.LoadMesh("meshes/corrupt.obj");
+        Check(!result.has_value(), "Loading a file with an .obj extension but no parseable v/vt/f records returns std::nullopt, not a crash");
+    }
+
+    void TestMeshEmptyFailsPredictably()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto result = manager.LoadMesh("meshes/empty_mesh.obj");
+        Check(!result.has_value(), "Loading a syntactically valid OBJ with real vertices but zero faces returns std::nullopt");
+    }
+
+    void TestMeshInvalidIndexFailsPredictably()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto result = manager.LoadMesh("meshes/invalid_index.obj");
+        Check(!result.has_value(), "Loading an OBJ whose face references an out-of-range vertex index returns std::nullopt, not a crash");
+    }
+
+    void TestMeshCachingReturnsSameIdentity()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto first = manager.LoadMesh("meshes/pyramid.obj");
+        const auto second = manager.LoadMesh("meshes/pyramid.obj");
+
+        Check(first.has_value() && second.has_value(), "Both loads succeed");
+        Check(*first == *second, "Loading the same mesh twice returns the same cached AssetId - no re-parse");
+    }
+
+    void TestMeshNormalizedPathDoesNotDuplicateCache()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto plain = manager.LoadMesh("meshes/pyramid.obj");
+        const auto dotted = manager.LoadMesh("./meshes/pyramid.obj");
+
+        Check(plain.has_value() && dotted.has_value(), "Both path spellings load successfully");
+        Check(*plain == *dotted, "Both path spellings resolve to the same cached mesh asset");
+    }
+
+    void TestDistinctMeshesGetDistinctIds()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto pyramid = manager.LoadMesh("meshes/pyramid.obj");
+        const auto triangle = manager.LoadMesh("meshes/triangle.obj");
+
+        Check(pyramid.has_value() && triangle.has_value(), "Both distinct mesh assets load");
+        Check(!(*pyramid == *triangle), "Two different OBJ files receive different AssetIds");
+    }
+
+    void TestMeshRootTraversalIsRejected()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto escapeAttempt = manager.LoadMesh("../outside.obj");
+        Check(!escapeAttempt.has_value(), "A mesh path that escapes the asset root is rejected, same as text/binary/texture");
+    }
+
+    void TestMeshAssetIdIsValidAfterLoad()
+    {
+        AssetManager manager = MakeTestManager();
+
+        const auto id = manager.LoadMesh("meshes/pyramid.obj");
+        Check(id.has_value(), "pyramid.obj loads");
+        Check(manager.IsValid(*id), "AssetManager::IsValid recognizes a freshly-loaded mesh AssetId (checks the mesh map, not just text/binary/texture)");
+    }
 }
 
 int main()
@@ -280,9 +454,24 @@ int main()
     TestDistinctTexturesGetDistinctIds();
     TestTextureRootTraversalIsRejected();
 
+    TestMeshLoadSucceedsWithCorrectCounts();
+    TestMeshLoadDedupOccurred();
+    TestMeshLoadHasCorrectApexPosition();
+    TestMeshLoadHasCorrectUV();
+    TestMeshLoadWithNoTexcoordsDefaultsUvToZero();
+    TestMeshMissingFileFailsPredictably();
+    TestMeshCorruptFileFailsPredictably();
+    TestMeshEmptyFailsPredictably();
+    TestMeshInvalidIndexFailsPredictably();
+    TestMeshCachingReturnsSameIdentity();
+    TestMeshNormalizedPathDoesNotDuplicateCache();
+    TestDistinctMeshesGetDistinctIds();
+    TestMeshRootTraversalIsRejected();
+    TestMeshAssetIdIsValidAfterLoad();
+
     if (g_failureCount == 0)
     {
-        std::printf("All Assets M6/M14 checks passed\n");
+        std::printf("All Assets M6/M14/M15 checks passed\n");
         return 0;
     }
 

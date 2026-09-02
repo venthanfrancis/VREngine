@@ -57,6 +57,7 @@ all come after that chain is proven.
 | M12 | **Renderable Scene Integration Foundation: COMPLETE.** `Scene -> Renderable + world transform -> ExtractRenderables() -> generic render planning -> desktop or XR views`, with no Scene->Rendering/Vulkan/OpenXR dependency. See the M12 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M12 - Renderable Scene Integration Foundation". |
 | M13 | **Material & Render Resource Binding Foundation: COMPLETE.** Backend-neutral `MaterialId` added alongside `MeshId`, resolved outside Scene by a demo-owned `MaterialRegistry`, with one shared Vulkan pipeline serving multiple materials. See the M13 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M13 - Material & Render Resource Binding Foundation". |
 | M14 | **Asset-Backed Texture & Material Loading Foundation: COMPLETE.** Real PNG files, loaded through `AssetManager` and decoded via a privately-isolated stb_image, become GPU textures deduplicated by `AssetId` through a render-side `TextureCache`, referenced by `MaterialId` exactly like M13's generated textures were. See the M14 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M14 - Asset-Backed Texture & Material Loading Foundation". |
+| M15 | **Asset-Backed Mesh Loading Foundation: COMPLETE.** Real OBJ mesh files, loaded through `AssetManager` and decoded via a privately-isolated tinyobjloader, become GPU meshes deduplicated by `AssetId` through a render-side `MeshCache`, referenced by `MeshId` exactly like M12's procedural meshes were. See the M15 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M15 - Asset-Backed Mesh Loading Foundation". |
 | M16 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M17 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M18 | `Editor` skeleton | Deprioritized | After the core chain is proven |
@@ -186,6 +187,36 @@ Deferred:
 - model importing beyond a narrowly-scoped mesh format
 - PBR/lighting
 - hot reload / asset database / editor tooling
+```
+
+### M15 closeout
+
+```
+M15 — Asset-Backed Mesh Loading Foundation: COMPLETE
+
+Completed:
+- OBJ mesh decoding added through privately-isolated tinyobjloader
+- backend-neutral Assets::MeshAsset introduced
+- AssetManager supports cached file-backed mesh content
+- AssetId remains distinct from MeshId
+- render-side MeshCache provides AssetId → deduplicated GPU mesh upload
+- imported position/UV tuple reconstruction validated
+- malformed, empty, invalid-index and no-UV paths tested
+- imported and procedural geometry coexist
+- same imported MeshId reused by multiple entities
+- same imported mesh works with multiple MaterialIds
+- no file I/O, parsing, or mesh upload in frame loops
+- desktop and XR use identical file-backed mesh semantics
+- full build matrix and CTest green
+
+Deferred:
+- glTF/FBX
+- material import
+- normals/tangents expansion
+- skeletal animation/skinning
+- LOD/mesh optimization
+- asset database/cooked assets
+- editor model tooling
 ```
 
 ## Rules while working through the roadmap
