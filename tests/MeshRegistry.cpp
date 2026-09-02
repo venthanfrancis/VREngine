@@ -19,15 +19,25 @@ namespace ARDemo
         VkCommandBuffer commandBuffer,
         VkPipelineLayout pipelineLayout,
         const MeshRegistry& meshes,
+        const MaterialRegistry& materials,
         std::span<const PlannedDraw> plan)
     {
         for (const PlannedDraw& draw : plan)
         {
+            const VkDescriptorSet descriptorSet = materials.Resolve(draw.material);
+            if (descriptorSet == VK_NULL_HANDLE)
+            {
+                continue; // unresolvable material id - skip, not fatal (same posture as RenderDevice::SubmitDraw)
+            }
+
             const AREngine::Rendering::Vulkan::VulkanMesh* mesh = meshes.Resolve(draw.mesh);
             if (mesh == nullptr)
             {
                 continue; // unresolvable mesh id - skip, not fatal (same posture as RenderDevice::SubmitDraw)
             }
+
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                0, 1, &descriptorSet, 0, nullptr);
 
             mesh->Bind(commandBuffer);
 

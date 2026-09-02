@@ -177,10 +177,26 @@ if(ARENGINE_ENABLE_VULKAN)
         PopulateDemoScene.cpp
         RenderDrawPlanning.cpp
         MeshRegistry.cpp
+        MaterialRegistry.cpp
     )
     target_link_libraries(arengine_scene_render_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering Vulkan::Vulkan)
     target_include_directories(arengine_scene_render_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
     target_compile_features(arengine_scene_render_demo PRIVATE cxx_std_20)
+
+    # Pure-logic tests for ARDemo::MaterialRegistry (MaterialRegistry.hpp)
+    # — M13. Gated under ARENGINE_ENABLE_VULKAN only because
+    # VkDescriptorSet is a Vulkan type (mirrors arengine_vulkan_tests'
+    # own "no real Vulkan API call, but the loader must be resolvable"
+    # pattern) - no real device/GPU is required at runtime. See
+    # docs/ARCHITECTURE.md, "M13 - Material & Render Resource Binding
+    # Foundation".
+    add_executable(arengine_material_registry_tests
+        material_registry_tests.cpp
+        MaterialRegistry.cpp
+    )
+    target_link_libraries(arengine_material_registry_tests PRIVATE AREngine::Core AREngine::Scene Vulkan::Vulkan)
+    target_compile_features(arengine_material_registry_tests PRIVATE cxx_std_20)
+    add_test(NAME MaterialRegistryTests COMMAND arengine_material_registry_tests)
 endif()
 
 # Everything OpenXR-specific is gated on ARENGINE_ENABLE_OPENXR (top-
@@ -363,6 +379,7 @@ if(ARENGINE_ENABLE_OPENXR)
             PopulateDemoScene.cpp
             RenderDrawPlanning.cpp
             MeshRegistry.cpp
+            MaterialRegistry.cpp
         )
         target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_xr_demo PRIVATE

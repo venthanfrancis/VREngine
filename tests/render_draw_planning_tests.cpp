@@ -26,7 +26,7 @@ namespace
     using namespace AREngine::Scene;
     using namespace ARDemo;
 
-    std::vector<RenderableInstance> MakeRenderables(std::size_t count)
+    std::vector<RenderableInstance> MakeRenderables(std::size_t count, MaterialId material = MaterialId{1})
     {
         std::vector<RenderableInstance> renderables;
         renderables.reserve(count);
@@ -34,7 +34,7 @@ namespace
         {
             renderables.push_back(RenderableInstance{
                 EntityId{i + 1}, Mat4::Translation(Vec3(static_cast<float>(i), 0.0f, 0.0f)),
-                MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+                MeshId{1}, material, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
         }
         return renderables;
     }
@@ -59,6 +59,7 @@ namespace
         Check(plan.size() == 1, "1 renderable x 1 view produces exactly 1 planned draw");
         Check(plan[0].viewIndex == 0, "The single planned draw targets view 0");
         Check(plan[0].mesh == MeshId{1}, "The planned draw carries the renderable's MeshId");
+        Check(plan[0].material == MaterialId{1}, "The planned draw carries the renderable's MaterialId");
     }
 
     void TestFiveRenderablesOneView()
@@ -88,11 +89,50 @@ namespace
         Check(plan[2].viewIndex == 1 && plan[3].viewIndex == 1, "Last two planned draws target view 1");
     }
 
+    void TestFiveRenderablesTwoMaterialsStillTenDraws()
+    {
+        // M13: material diversity must not change view multiplication -
+        // 5 renderables split across two distinct materials x 2 views
+        // still produces exactly 10 planned draws.
+        std::vector<RenderableInstance> renderables = MakeRenderables(3, MaterialId{1});
+        const std::vector<RenderableInstance> moreRenderables = MakeRenderables(2, MaterialId{2});
+        renderables.insert(renderables.end(), moreRenderables.begin(), moreRenderables.end());
+
+        const std::vector<PlannedDraw> plan = BuildDrawPlan(renderables, MakeIdentityViews(2));
+        Check(plan.size() == 10, "5 renderables (2 distinct materials) x 2 views still produces exactly 10 planned draws");
+    }
+
+    void TestSameMeshDifferentMaterialProducesDistinctPlannedDraws()
+    {
+        std::vector<RenderableInstance> renderables;
+        renderables.push_back(RenderableInstance{EntityId{1}, Mat4::Identity(), MeshId{1}, MaterialId{10}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+        renderables.push_back(RenderableInstance{EntityId{2}, Mat4::Identity(), MeshId{1}, MaterialId{20}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+
+        const std::vector<PlannedDraw> plan = BuildDrawPlan(renderables, MakeIdentityViews(1));
+        Check(plan.size() == 2, "Two renderables produce two planned draws");
+        Check(plan[0].mesh == MeshId{1} && plan[1].mesh == MeshId{1}, "Both planned draws carry the same MeshId");
+        Check(plan[0].material == MaterialId{10} && plan[1].material == MaterialId{20},
+              "Same MeshId, distinct MaterialIds preserved independently in the resulting PlannedDraws");
+    }
+
+    void TestDifferentMeshSameMaterialProducesDistinctPlannedDraws()
+    {
+        std::vector<RenderableInstance> renderables;
+        renderables.push_back(RenderableInstance{EntityId{1}, Mat4::Identity(), MeshId{1}, MaterialId{10}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+        renderables.push_back(RenderableInstance{EntityId{2}, Mat4::Identity(), MeshId{2}, MaterialId{10}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+
+        const std::vector<PlannedDraw> plan = BuildDrawPlan(renderables, MakeIdentityViews(1));
+        Check(plan.size() == 2, "Two renderables produce two planned draws");
+        Check(plan[0].material == MaterialId{10} && plan[1].material == MaterialId{10}, "Both planned draws carry the same MaterialId");
+        Check(plan[0].mesh == MeshId{1} && plan[1].mesh == MeshId{2},
+              "Same MaterialId, distinct MeshIds preserved independently - material identity is independent from mesh identity");
+    }
+
     void TestMvpCombinesViewProjectionAndWorldTransform()
     {
         std::vector<RenderableInstance> renderables;
         renderables.push_back(RenderableInstance{
-            EntityId{1}, Mat4::Translation(Vec3(1.0f, 0.0f, 0.0f)), MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+            EntityId{1}, Mat4::Translation(Vec3(1.0f, 0.0f, 0.0f)), MeshId{1}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f)});
 
         std::vector<Mat4> views;
         views.push_back(Mat4::Translation(Vec3(0.0f, 10.0f, 0.0f)));
@@ -109,7 +149,7 @@ namespace
     {
         std::vector<RenderableInstance> renderables;
         renderables.push_back(RenderableInstance{
-            EntityId{1}, Mat4::Identity(), MeshId{1}, Vec4(0.2f, 0.4f, 0.6f, 1.0f)});
+            EntityId{1}, Mat4::Identity(), MeshId{1}, MaterialId{1}, Vec4(0.2f, 0.4f, 0.6f, 1.0f)});
 
         const std::vector<PlannedDraw> plan = BuildDrawPlan(renderables, MakeIdentityViews(1));
         Check(plan.size() == 1 && plan[0].tint == Vec4(0.2f, 0.4f, 0.6f, 1.0f),
@@ -125,6 +165,9 @@ int main()
     TestFiveRenderablesTwoViews();
     TestFiveRenderablesThreeViews();
     TestPlanIsOrderedByViewThenRenderable();
+    TestFiveRenderablesTwoMaterialsStillTenDraws();
+    TestSameMeshDifferentMaterialProducesDistinctPlannedDraws();
+    TestDifferentMeshSameMaterialProducesDistinctPlannedDraws();
     TestMvpCombinesViewProjectionAndWorldTransform();
     TestTintPreservedInPlannedDraw();
 

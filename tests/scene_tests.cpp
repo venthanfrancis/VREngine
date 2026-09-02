@@ -377,13 +377,14 @@ namespace
         Check(scene.GetRenderable(entity) == nullptr,
               "GetRenderable returns nullptr for a valid entity with no renderable set - not the same as an invalid entity");
 
-        const Renderable renderable{MeshId{1}, Vec4(1.0f, 0.5f, 0.0f, 1.0f), true};
+        const Renderable renderable{MeshId{1}, MaterialId{9}, Vec4(1.0f, 0.5f, 0.0f, 1.0f), true};
         scene.SetRenderable(entity, renderable);
 
         Check(scene.HasRenderable(entity), "HasRenderable is true after SetRenderable");
         const Renderable* stored = scene.GetRenderable(entity);
         Check(stored != nullptr, "GetRenderable returns non-null after SetRenderable");
         Check(stored->mesh == MeshId{1}, "Stored renderable's MeshId round-trips");
+        Check(stored->material == MaterialId{9}, "Stored renderable's MaterialId round-trips");
         Check(stored->tint == Vec4(1.0f, 0.5f, 0.0f, 1.0f), "Stored renderable's tint round-trips");
 
         scene.RemoveRenderable(entity);
@@ -405,7 +406,7 @@ namespace
         const EntityId withRenderable = scene.CreateEntity("WithRenderable");
         const EntityId withoutRenderable = scene.CreateEntity("WithoutRenderable");
         (void)withoutRenderable; // created only to prove ExtractRenderables ignores it - id itself unused
-        scene.SetRenderable(withRenderable, Renderable{MeshId{7}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(withRenderable, Renderable{MeshId{7}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
 
         const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
         Check(instances.size() == 1, "ExtractRenderables returns exactly one instance when only one entity has a renderable");
@@ -417,7 +418,7 @@ namespace
         Scene scene;
         const EntityId entity = scene.CreateEntity();
         scene.GetTransform(entity).position = Vec3(4.0f, 5.0f, 6.0f);
-        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(entity, Renderable{MeshId{1}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
 
         const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
         Check(instances.size() == 1, "One renderable extracted");
@@ -429,7 +430,7 @@ namespace
     {
         Scene scene;
         const EntityId entity = scene.CreateEntity();
-        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), /*visible=*/false});
+        scene.SetRenderable(entity, Renderable{MeshId{1}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), /*visible=*/false});
 
         Check(scene.ExtractRenderables().empty(), "ExtractRenderables skips an entity whose Renderable::visible is false");
     }
@@ -438,7 +439,7 @@ namespace
     {
         Scene scene;
         const EntityId entity = scene.CreateEntity();
-        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(entity, Renderable{MeshId{1}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
         Check(scene.ExtractRenderables().size() == 1, "Renderable extracted before destruction");
 
         scene.DestroyEntity(entity);
@@ -451,13 +452,13 @@ namespace
         const EntityId parent = scene.CreateEntity("Parent");
         const EntityId child = scene.CreateEntity("Child");
         scene.SetParent(child, parent);
-        scene.SetRenderable(parent, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
-        scene.SetRenderable(child, Renderable{MeshId{2}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(parent, Renderable{MeshId{1}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(child, Renderable{MeshId{2}, MaterialId{2}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
         Check(scene.ExtractRenderables().size() == 2, "Both parent and child renderables extracted before destruction");
 
         scene.DestroyEntity(parent);
         Check(scene.ExtractRenderables().empty(),
-              "Destroying a parent recursively removes the child's renderable from extraction too - no dangling mapping");
+              "Destroying a parent recursively removes the child's renderable (and material reference) from extraction too - no dangling mapping");
     }
 
     void TestExtractRenderablesChildWorldTransformIncludesParent()
@@ -468,7 +469,7 @@ namespace
         scene.GetTransform(parent).position = Vec3(10.0f, 0.0f, 0.0f);
         scene.GetTransform(child).position = Vec3(0.0f, 5.0f, 0.0f);
         scene.SetParent(child, parent);
-        scene.SetRenderable(child, Renderable{MeshId{3}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(child, Renderable{MeshId{3}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
 
         const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
         Check(instances.size() == 1, "Only the child (which has a renderable) is extracted");
@@ -483,8 +484,8 @@ namespace
         const EntityId a = scene.CreateEntity("A");
         const EntityId b = scene.CreateEntity("B");
         const MeshId sharedMesh{42};
-        scene.SetRenderable(a, Renderable{sharedMesh, Vec4(1.0f, 0.0f, 0.0f, 1.0f), true});
-        scene.SetRenderable(b, Renderable{sharedMesh, Vec4(0.0f, 1.0f, 0.0f, 1.0f), true});
+        scene.SetRenderable(a, Renderable{sharedMesh, MaterialId{1}, Vec4(1.0f, 0.0f, 0.0f, 1.0f), true});
+        scene.SetRenderable(b, Renderable{sharedMesh, MaterialId{1}, Vec4(0.0f, 1.0f, 0.0f, 1.0f), true});
 
         const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
         Check(instances.size() == 2, "Two entities sharing the same MeshId both extract independently");
@@ -492,11 +493,44 @@ namespace
               "Both extracted instances reference the same shared MeshId - one mesh, multiple instances");
     }
 
+    void TestExtractRenderablesPreservesMaterialId()
+    {
+        // M13: same mesh, different materials - and the reverse (same
+        // material, different mesh) - both preserved independently
+        // through extraction, proving MaterialId is not conflated with
+        // MeshId anywhere in the pipeline.
+        Scene scene;
+        const EntityId cubeRed = scene.CreateEntity("CubeRed");
+        const EntityId cubeBlue = scene.CreateEntity("CubeBlue");
+        const EntityId floorRed = scene.CreateEntity("FloorRed");
+        const MeshId cubeMesh{1};
+        const MeshId floorMesh{2};
+        const MaterialId redMaterial{10};
+        const MaterialId blueMaterial{20};
+        scene.SetRenderable(cubeRed, Renderable{cubeMesh, redMaterial, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(cubeBlue, Renderable{cubeMesh, blueMaterial, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(floorRed, Renderable{floorMesh, redMaterial, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+
+        const std::vector<RenderableInstance> instances = scene.ExtractRenderables();
+        Check(instances.size() == 3, "Three renderables extracted");
+
+        int foundCubeRed = 0, foundCubeBlue = 0, foundFloorRed = 0;
+        for (const RenderableInstance& instance : instances)
+        {
+            if (instance.entity == cubeRed) { foundCubeRed += (instance.mesh == cubeMesh && instance.material == redMaterial); }
+            if (instance.entity == cubeBlue) { foundCubeBlue += (instance.mesh == cubeMesh && instance.material == blueMaterial); }
+            if (instance.entity == floorRed) { foundFloorRed += (instance.mesh == floorMesh && instance.material == redMaterial); }
+        }
+        Check(foundCubeRed == 1, "cubeRed extracts with its own mesh AND its own material (same mesh as cubeBlue, different material)");
+        Check(foundCubeBlue == 1, "cubeBlue extracts with the same mesh as cubeRed but a distinct material");
+        Check(foundFloorRed == 1, "floorRed extracts with a distinct mesh but the same material as cubeRed");
+    }
+
     void TestExtractRenderablesReflectsTransformUpdateOnNextCall()
     {
         Scene scene;
         const EntityId entity = scene.CreateEntity();
-        scene.SetRenderable(entity, Renderable{MeshId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
+        scene.SetRenderable(entity, Renderable{MeshId{1}, MaterialId{1}, Vec4(1.0f, 1.0f, 1.0f, 1.0f), true});
 
         scene.GetTransform(entity).position = Vec3(1.0f, 0.0f, 0.0f);
         const Vec3 worldA = TransformPoint(scene.ExtractRenderables()[0].worldTransform, Vec3(0.0f, 0.0f, 0.0f));
@@ -542,6 +576,7 @@ int main()
     TestExtractRenderablesSkipsRecursivelyDestroyedDescendants();
     TestExtractRenderablesChildWorldTransformIncludesParent();
     TestExtractRenderablesSameMeshIdMultipleInstances();
+    TestExtractRenderablesPreservesMaterialId();
     TestExtractRenderablesReflectsTransformUpdateOnNextCall();
 
     if (g_failureCount == 0)

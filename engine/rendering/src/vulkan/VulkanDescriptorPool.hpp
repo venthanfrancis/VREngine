@@ -4,18 +4,22 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstdint>
+
 namespace AREngine::Rendering::Vulkan
 {
-    // Owns one VkDescriptorPool sized for exactly what M8E needs: one
-    // combined-image-sampler descriptor, one descriptor set, ever. Not
-    // a generic descriptor manager - no growth, no recycling, no per-
-    // frame allocation. Created WITHOUT
-    // VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, so the one set
-    // allocated from it is freed implicitly when the pool itself is
-    // destroyed, not individually - the simplest option for "one
-    // texture, one descriptor set, one draw, for the whole demo's
-    // lifetime." See docs/ARCHITECTURE.md, "Descriptor Pool/Set
-    // Ownership (M8E)".
+    // Owns one VkDescriptorPool sized for exactly `maxSets` combined-
+    // image-sampler descriptors/sets, ever - not a generic descriptor
+    // manager, no growth, no recycling, no per-frame allocation.
+    // Defaults to 1 (M8E's original "one texture, one descriptor set,
+    // one draw, for the whole demo's lifetime" - see
+    // docs/ARCHITECTURE.md, "Descriptor Pool/Set Ownership (M8E)"), so
+    // every pre-M13 call site is unaffected; M13 passes an explicit
+    // material count instead (one descriptor set per material - see
+    // "M13 - Material & Render Resource Binding Foundation"). Created
+    // WITHOUT VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, so
+    // every set allocated from it is freed implicitly, all together,
+    // when the pool itself is destroyed - never individually.
     //
     // Not copyable or movable: exactly one VkDescriptorPool per
     // VulkanDescriptorPool, destroyed exactly once, by this object
@@ -23,7 +27,7 @@ namespace AREngine::Rendering::Vulkan
     class VulkanDescriptorPool
     {
     public:
-        explicit VulkanDescriptorPool(VkDevice device);
+        explicit VulkanDescriptorPool(VkDevice device, std::uint32_t maxSets = 1);
         ~VulkanDescriptorPool();
 
         VulkanDescriptorPool(const VulkanDescriptorPool&) = delete;

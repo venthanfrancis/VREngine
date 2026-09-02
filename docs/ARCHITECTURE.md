@@ -9411,3 +9411,168 @@ No material/texture-selection concept yet - every `Renderable` implicitly
 shares one hardcoded checkerboard texture/pipeline; `MeshId` must not be
 allowed to quietly grow into that role or a general asset-handle system -
 see M13.
+
+## M13 - Material & Render Resource Binding Foundation
+
+### Goal
+
+Close the gap M12 deliberately left open: every `Scene::Renderable`
+could identify which mesh to draw, but not which texture/appearance -
+every entity implicitly shared the same checkerboard texture, sampler,
+descriptor set, and pipeline. M13 adds a `MaterialId`, mirroring
+`MeshId`'s exact shape and philosophy, so different entities can use
+different textures while still sharing one Vulkan pipeline.
+
+### Audit findings
+
+`VulkanDescriptorPool` was hardcoded to `maxSets=1`/`descriptorCount=1`
+("sized for exactly what M8E needs... no growth") - four real call
+sites existed (`vulkan_present_demo.cpp`, `openxr_cube_demo.cpp`,
+`scene_render_demo.cpp`, `xr_demo.cpp`), only the last two needing more
+than one. `VulkanDescriptorSetLayout` (one COMBINED_IMAGE_SAMPLER
+binding) and `VulkanGraphicsPipeline` (one descriptor-set-layout slot,
+one push-constant range) were both already N-capable as-is - nothing
+pipeline-side is texture-specific, so the same `VkPipeline` can
+legitimately be used with any number of `VkDescriptorSet`s allocated
+against the same layout. `VulkanSampler` describes filtering only, not
+a specific image, so one shared sampler instance serves every material.
+`GenerateCheckerboardRGBA8` hardcoded white/black tile colors as
+literals. The actual bind call happened once per frame, before the
+draw loop - the real site that had to move to per-draw binding.
+
+### The caught bug: `Renderable` field placement
+
+Design review (before implementation) found that `Renderable` is
+constructed via positional aggregate init at many call sites, including
+**once per frame at runtime** in `xr_demo.cpp`
+(`SetRenderable(referenceCube, Renderable{meshIds.cube, tint, true})`,
+which fully replaces the entity's `Renderable` every frame, since
+`SetRenderable` is not a partial update). Had `MaterialId` been appended
+as `Renderable`'s trailing field, that one call site would have silently
+default-initialized it to an invalid `MaterialId` every frame -
+`MaterialRegistry::Resolve` would return `VK_NULL_HANDLE`, and
+`DrawPlannedInstances` would silently skip the draw (matching the
+deliberate "skip, don't crash" posture that makes this exact failure
+mode dangerous to miss) - un-rendering `referenceCube`, the single most
+visually prominent object in the demo, with zero crash, log, or assert.
+
+Fix: `MaterialId material` was placed immediately after `MeshId mesh`
+(not appended), forcing every 3-positional-argument call site to become
+a **compile error** rather than a silent runtime regression - the fix
+was verified empirically too, via the XR demo's `objects rendered=10`
+result (5 renderables x 2 eyes; had the bug shipped, `referenceCube`
+would have been silently skipped, yielding 8, not 10).
+
+**Durable rule** (added to `AGENTS.md`): positional aggregate
+initialization of `Scene::Renderable` is fragile as the struct
+gains more identity-bearing fields - future fields must not be able to
+silently change visibility/tint/material semantics at an existing call
+site. Prefer explicit field assignment where it improves correctness,
+without requiring a wholesale struct redesign now.
+
+### `MaterialId`, updated `Renderable`/`RenderableInstance`
+
+`engine/scene/include/AREngine/Scene/MaterialId.hpp` - exact mirror of
+`MeshId.hpp` (`{uint64_t id=0; bool IsValid() const;}` + `operator==` +
+`std::hash`). No new Core-level "render resource ID" module - `MaterialId`
+lives in `Scene`, alongside `MeshId`, keeping `Scene -> Core` unchanged.
+
+```cpp
+struct Renderable { MeshId mesh; MaterialId material; Core::Math::Vec4 tint{1,1,1,1}; bool visible = true; };
+struct RenderableInstance { EntityId entity; Core::Math::Mat4 worldTransform; MeshId mesh; MaterialId material; Core::Math::Vec4 tint; };
+```
+`ExtractRenderables()` copies `.material` through unchanged otherwise.
+
+### One shared pipeline, multiple descriptor sets
+
+**Invariant, explicitly documented**: every M13 material shares the
+SAME `VulkanGraphicsPipeline`/pipeline layout - only the bound
+`VkDescriptorSet` (and therefore which texture is sampled) varies per
+draw. `VulkanDescriptorPool`'s constructor gained a `maxSets` parameter
+(`explicit VulkanDescriptorPool(VkDevice device, std::uint32_t maxSets = 1);`),
+defaulted to preserve the two untouched call sites
+(`vulkan_present_demo.cpp`, `openxr_cube_demo.cpp`) unchanged; the two
+M13 demos pass `maxSets=2` explicitly. `GenerateCheckerboardRGBA8` grew
+two defaulted color parameters so a second, visually distinct texture
+("checkerboard B") reuses the existing generator instead of needing a
+new one - every pre-M13 call site (including its own unit tests in
+`vulkan_tests.cpp`, which only assert byte-size/tile-alternation/
+opacity, never literal colors) is unaffected.
+
+### `tests/MaterialRegistry.hpp/.cpp` (new, Vulkan-only)
+
+Mirrors `MeshRegistry` exactly: `Register(MaterialId, VkDescriptorSet)`,
+`Resolve(MaterialId) const -> VkDescriptorSet` (`VK_NULL_HANDLE` if
+unregistered, last-write-wins on re-registration - the same posture as
+`MeshRegistry::Register`). Stores only the already-allocated-and-written
+`VkDescriptorSet` handle, not the underlying `VulkanImage` texture -
+each demo keeps its textures alive itself as named `unique_ptr` locals,
+exactly mirroring how `MeshRegistry` doesn't own `VulkanMesh` either.
+
+### Draw planning and execution
+
+`PlannedDraw` (`tests/RenderDrawPlanning.hpp`) gained
+`Scene::MaterialId material;`, copied through unchanged by
+`BuildDrawPlan`. `DrawPlannedInstances` (`tests/MeshRegistry.hpp`, the
+Vulkan-dependent execution function - deliberately NOT built on top of
+`OpenXRVulkanViewTarget.hpp`, which transitively includes OpenXR headers
+and would have broken the `VULKAN=ON, OPENXR=OFF` config) now resolves
+and binds the material descriptor set per draw (rebinding on every
+draw, no redundant-bind-avoidance optimization - "acceptable to bind
+per draw" per the milestone's own scope, and simpler), before resolving
+and binding the mesh exactly as M12. Either lookup failing (unknown
+`MaterialId` -> `VK_NULL_HANDLE`, unknown `MeshId` -> `nullptr`) skips
+that one draw, not fatal - unchanged posture from M12.
+
+### Demo changes
+
+Both `scene_render_demo.cpp` and `xr_demo.cpp` removed their old single
+upfront `vkCmdBindDescriptorSets` call (pipeline bind stays, unchanged -
+still shared) and now construct two named textures, a 2-set descriptor
+pool, two descriptor sets, and a `MaterialRegistry`, in the same
+safety-correct declaration order the single-texture version already
+established (texture(s) -> sampler -> pool -> sets -> registry, so
+reverse destruction tears down the pool/sets before the textures they
+reference). `PopulateDemoScene` (shared by both demos, unchanged M12
+principle) assigns materials across the existing 5 entities so ONE
+scene proves all three required combinations at once: `referenceCube`/
+`cubeB`/`floor` share Red (multiple entities, and a different mesh,
+sharing one material); `cubeA` shares `referenceCube`'s cube mesh but
+uses Blue (same mesh, different material). The pose marker (still
+outside `Scene`/extraction, unchanged M12 boundary) binds one of the two
+demo materials directly before its own draw, documented as a demo-only
+convenience, not a material system of its own.
+
+### Validation
+
+Full build matrix (all 4 `OPENXR`x`VULKAN` combinations) and `ctest`
+green (19/16/14/12 tests - one transient CTest launch glitch on the
+OpenXR-only config, confirmed environmental: the same executable ran
+clean with exit 0 when invoked directly, and passed on retry). Zero
+compiler warnings.
+
+`arengine_scene_render_demo`: `Scene: 5 entities..., 2 meshes, 2
+materials`, `Frame 1: 5 renderable(s) extracted, 1 view(s), 5 planned
+draw(s) (2 unique meshes, 2 unique materials, 2 texture uploads, 1
+shared pipeline)`. A full-screen screenshot captured while the demo was
+running visually confirms the red and blue checkerboard cubes rendered
+side by side from the same cube mesh - real pixel evidence, not just
+log counts.
+
+`arengine_xr_demo` (against SteamVR, freshly started for this run):
+1000/1000 frames, `objects rendered=10, draw calls=10` (5 renderables x
+2 eyes - the exact multiplier confirms `referenceCube`'s material
+resolved correctly every frame; had the caught bug shipped, this would
+have read 8, not 10). Full clean teardown trace through every
+`TeardownMarker`, in the exact order the updated destruction-order
+comment documents (`materialRegistry -> descriptorPool -> sampler ->
+blueTexture -> redTexture -> ...`). The only Vulkan validation messages
+present are the same `BlankEyeBuffer`/D3D11-KMT SteamVR-internal noise
+already documented since M9E (byte-for-byte identical to M12's own
+baseline run) - zero new AREngine-attributable errors.
+
+### Deferred
+
+Asset-backed texture/material resources, a material asset format,
+shader/pipeline variation, shader parameters, material instances, PBR/
+lighting - see M14.

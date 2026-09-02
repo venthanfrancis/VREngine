@@ -497,21 +497,40 @@ int main()
     const TeardownMarker teardownFloorMesh("floorMesh (vertex+index VulkanBuffer)");
     AR_LOG_INFO("Uploaded 2 persistent meshes (cube, floor quad) - never re-uploaded per frame");
 
+    // M13: two distinctly-colored checkerboard textures, one per demo
+    // material - see docs/ARCHITECTURE.md, "M13 - Material & Render
+    // Resource Binding Foundation" for the single-pipeline/multiple-
+    // descriptor-set invariant this relies on.
     constexpr std::uint32_t kTextureWidth = 64;
     constexpr std::uint32_t kTextureHeight = 64;
     constexpr std::uint32_t kTextureTileSize = 8;
-    const std::vector<std::uint8_t> checkerboardPixels = GenerateCheckerboardRGBA8(kTextureWidth, kTextureHeight, kTextureTileSize);
-    auto texture = CreateTextureFromPixels(
+    const std::vector<std::uint8_t> redCheckerPixels = GenerateCheckerboardRGBA8(
+        kTextureWidth, kTextureHeight, kTextureTileSize, {200, 40, 40, 255}, {80, 10, 10, 255});
+    const std::vector<std::uint8_t> blueCheckerPixels = GenerateCheckerboardRGBA8(
+        kTextureWidth, kTextureHeight, kTextureTileSize, {40, 80, 200, 255}, {10, 20, 80, 255});
+    auto redTexture = CreateTextureFromPixels(
         bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
-        kTextureWidth, kTextureHeight, checkerboardPixels.data());
-    const TeardownMarker teardownTexture("texture (VkImageView, VkImage, VkDeviceMemory)");
-    VulkanSampler sampler(bindingData.device);
+        kTextureWidth, kTextureHeight, redCheckerPixels.data());
+    const TeardownMarker teardownRedTexture("redTexture (VkImageView, VkImage, VkDeviceMemory)");
+    auto blueTexture = CreateTextureFromPixels(
+        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
+        kTextureWidth, kTextureHeight, blueCheckerPixels.data());
+    const TeardownMarker teardownBlueTexture("blueTexture (VkImageView, VkImage, VkDeviceMemory)");
+    VulkanSampler sampler(bindingData.device); // one sampler, shared by every material
     const TeardownMarker teardownSampler("sampler (vkDestroySampler)");
 
-    VulkanDescriptorPool descriptorPool(bindingData.device);
-    const TeardownMarker teardownDescriptorPool("descriptorPool (vkDestroyDescriptorPool, frees descriptorSet implicitly)");
-    VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-    WriteCombinedImageSamplerDescriptor(bindingData.device, descriptorSet, texture->GetView(), sampler.Get());
+    const ARDemo::DemoMaterialIds materialIds{Scene::MaterialId{1}, Scene::MaterialId{2}};
+    VulkanDescriptorPool descriptorPool(bindingData.device, /*maxSets=*/2);
+    const TeardownMarker teardownDescriptorPool("descriptorPool (vkDestroyDescriptorPool, frees both descriptorSets implicitly)");
+    VkDescriptorSet redDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
+    WriteCombinedImageSamplerDescriptor(bindingData.device, redDescriptorSet, redTexture->GetView(), sampler.Get());
+    VkDescriptorSet blueDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
+    WriteCombinedImageSamplerDescriptor(bindingData.device, blueDescriptorSet, blueTexture->GetView(), sampler.Get());
+
+    ARDemo::MaterialRegistry materialRegistry;
+    const TeardownMarker teardownMaterialRegistry("materialRegistry (trivial, no owned handle)");
+    materialRegistry.Register(materialIds.redChecker, redDescriptorSet);
+    materialRegistry.Register(materialIds.blueChecker, blueDescriptorSet);
 
     AR_ASSERT_MSG(binding.GetPhysicalDeviceProperties().limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
         "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
@@ -537,15 +556,16 @@ int main()
     meshRegistry.Register(meshIds.floor, floorMesh.get());
 
     Scene::Scene scene;
-    const ARDemo::DemoSceneEntities sceneEntities = ARDemo::PopulateDemoScene(scene, meshIds);
+    const ARDemo::DemoSceneEntities sceneEntities = ARDemo::PopulateDemoScene(scene, meshIds, materialIds);
     // Recorded once, right after PopulateDemoScene, rather than
     // duplicating its hard-coded initial position here - the single
     // source of truth for "where this cube starts" stays in
     // PopulateDemoScene.cpp.
     const Math::Vec3 moveOffsetCubeBasePosition = scene.GetTransform(sceneEntities.moveOffsetCube).position;
 
-    AR_LOG_INFO("Scene: 5 entities (floor, referenceCube, cubeA, cubeB[child of referenceCube], moveOffsetCube) "
-                "+ 1 demo-owned pose marker (outside Scene - see the boundary note above), shared across every view");
+    AR_LOG_INFO("Scene: 5 entities (floor, referenceCube, cubeA, cubeB[child of referenceCube], moveOffsetCube), "
+                "2 meshes, 2 materials, + 1 demo-owned pose marker (outside Scene - see the boundary note above), "
+                "shared across every view");
 
     // --- M9E/M9G: one reusable command buffer, one fence, fully
     // synchronous - unchanged from every prior XR rendering demo. ---
@@ -680,8 +700,18 @@ int main()
                     Math::Vec3(0.0f, 1.0f, 0.0f),
                     kReferenceCubeRotationRadiansPerSecond * static_cast<float>(frameContext.timing.totalTimeSeconds));
                 referenceCubeTransform.scale = kReferenceCubeBaseScale * interactionState.scaleFactor;
+                // M13: this SetRenderable call fully replaces the
+                // entity's Renderable every frame - materialIds.redChecker
+                // must be passed explicitly here, matching referenceCube's
+                // material as assigned in PopulateDemoScene, or this
+                // object would silently stop rendering (its MaterialId
+                // would default to invalid and resolve to VK_NULL_HANDLE,
+                // which DrawPlannedInstances skips without error). Caught
+                // during M13 design review - see docs/ARCHITECTURE.md,
+                // "M13 - Material Field Placement".
                 scene.SetRenderable(sceneEntities.referenceCube, Scene::Renderable{
                     meshIds.cube,
+                    materialIds.redChecker,
                     interactionState.highlightEnabled ? kReferenceCubeHighlightTint : kReferenceCubeBaseTint,
                     true});
 
@@ -726,9 +756,12 @@ int main()
                 // command buffer). Per-object mesh binding happens
                 // inside DrawOpenXRViewObject instead - see
                 // OpenXRVulkanViewTarget.hpp.
+                // M13: pipeline bound once per frame (shared by every
+                // material), but the descriptor set is NOT bound here
+                // anymore - DrawPlannedInstances binds the correct
+                // material's descriptor set per draw now that different
+                // renderables can use different materials.
                 vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
-                vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
-                    0, 1, &descriptorSet, 0, nullptr);
 
                 // M12: per-view draw loop - scene renderables come from
                 // the plan already built above (once per frame, sliced
@@ -737,7 +770,12 @@ int main()
                 // RenderDrawPlanning.hpp/tests). The pose marker (never
                 // part of Scene/extraction - see the boundary note near
                 // PopulateDemoScene's call above) is still drawn
-                // directly via DrawOpenXRViewObject, exactly as before.
+                // directly via DrawOpenXRViewObject - M13: since the
+                // pipeline-wide upfront descriptor-set bind is gone, the
+                // pose marker now binds one of the two demo materials
+                // explicitly right before its own draw (a demo-only
+                // convenience reusing an existing material, not a
+                // material system of its own for the pose marker).
                 for (std::size_t i = 0; i < views.size(); ++i)
                 {
                     BeginOpenXRViewRenderPass(commandBuffer, renderPass.Get(), *viewTargets[i], acquiredIndices[i],
@@ -745,12 +783,14 @@ int main()
 
                     const std::span<const ARDemo::PlannedDraw> viewPlan(
                         plan.data() + i * renderables.size(), renderables.size());
-                    ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, viewPlan);
+                    ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, materialRegistry, viewPlan);
                     diag.objectsRendered += viewPlan.size();
                     diag.drawCalls += viewPlan.size();
 
                     if (interactionState.poseMarkerVisible)
                     {
+                        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
+                            0, 1, &redDescriptorSet, 0, nullptr);
                         const Scene::Transform poseMarkerTransform{
                             interactionState.poseMarkerPosition, interactionState.poseMarkerOrientation,
                             Math::Vec3(0.15f, 0.15f, 0.15f)};
@@ -899,9 +939,11 @@ int main()
     // Destruction, in exact reverse declaration order: frameDriver
     // (trivial) -> viewTargets (each destroys its own depth image +
     // framebuffers) -> moveOffsetCubeBasePosition/sceneEntities/scene/
-    // meshRegistry/meshIds (all trivial - Scene::Scene owns no GPU/
-    // OpenXR handle, MeshRegistry holds only raw non-owning mesh
-    // pointers) -> descriptorPool -> sampler -> texture ->
+    // materialIds/materialRegistry/meshRegistry/meshIds (all trivial -
+    // Scene::Scene owns no GPU/OpenXR handle, MeshRegistry/MaterialRegistry
+    // hold only raw non-owning pointers/handles) -> descriptorPool
+    // (frees both redDescriptorSet/blueDescriptorSet implicitly) ->
+    // sampler -> blueTexture -> redTexture ->
     // floorMesh -> cubeMesh -> commandPool (frees commandBuffer
     // implicitly) -> pipeline -> descriptorSetLayout -> renderPass ->
     // projectionLayer (trivial) -> swapchains (each xrDestroySwapchain,

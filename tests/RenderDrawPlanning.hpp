@@ -11,6 +11,7 @@
 
 #include "AREngine/Core/Math/Mat4.hpp"
 #include "AREngine/Core/Math/Vec4.hpp"
+#include "AREngine/Scene/MaterialId.hpp"
 #include "AREngine/Scene/MeshId.hpp"
 #include "AREngine/Scene/RenderableInstance.hpp"
 
@@ -21,12 +22,14 @@
 namespace ARDemo
 {
     // One resolved (view, renderable) pair, ready for GPU draw
-    // execution - still backend-neutral (MeshId, not a VulkanMesh*).
+    // execution - still backend-neutral (MeshId/MaterialId, not a
+    // VulkanMesh*/VkDescriptorSet).
     struct PlannedDraw
     {
         std::size_t viewIndex = 0;
         AREngine::Core::Math::Mat4 mvp;
         AREngine::Scene::MeshId mesh;
+        AREngine::Scene::MaterialId material;
         AREngine::Core::Math::Vec4 tint;
     };
 

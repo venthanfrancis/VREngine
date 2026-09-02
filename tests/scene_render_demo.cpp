@@ -165,19 +165,35 @@ int main()
     meshRegistry.Register(meshIds.cube, cubeMesh.get());
     meshRegistry.Register(meshIds.floor, floorMesh.get());
 
+    // M13: two distinctly-colored checkerboard textures - one material
+    // resource per demo material, each uploaded exactly once. Red/blue
+    // are arbitrary; the point is that they are visually distinguishable
+    // so "same mesh, different material" is actually observable.
     constexpr std::uint32_t kTextureWidth = 64;
     constexpr std::uint32_t kTextureHeight = 64;
     constexpr std::uint32_t kTextureTileSize = 8;
-    const std::vector<std::uint8_t> checkerboardPixels =
-        GenerateCheckerboardRGBA8(kTextureWidth, kTextureHeight, kTextureTileSize);
-    auto texture = CreateTextureFromPixels(
+    const std::vector<std::uint8_t> redCheckerPixels = GenerateCheckerboardRGBA8(
+        kTextureWidth, kTextureHeight, kTextureTileSize, {200, 40, 40, 255}, {80, 10, 10, 255});
+    const std::vector<std::uint8_t> blueCheckerPixels = GenerateCheckerboardRGBA8(
+        kTextureWidth, kTextureHeight, kTextureTileSize, {40, 80, 200, 255}, {10, 20, 80, 255});
+    auto redTexture = CreateTextureFromPixels(
         physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
-        kTextureWidth, kTextureHeight, checkerboardPixels.data());
-    VulkanSampler sampler(device.Get());
+        kTextureWidth, kTextureHeight, redCheckerPixels.data());
+    auto blueTexture = CreateTextureFromPixels(
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
+        kTextureWidth, kTextureHeight, blueCheckerPixels.data());
+    VulkanSampler sampler(device.Get()); // one sampler, shared by every material - describes filtering only, not a specific image
 
-    VulkanDescriptorPool descriptorPool(device.Get());
-    VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-    WriteCombinedImageSamplerDescriptor(device.Get(), descriptorSet, texture->GetView(), sampler.Get());
+    const ARDemo::DemoMaterialIds materialIds{Scene::MaterialId{1}, Scene::MaterialId{2}};
+    VulkanDescriptorPool descriptorPool(device.Get(), /*maxSets=*/2);
+    VkDescriptorSet redDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
+    WriteCombinedImageSamplerDescriptor(device.Get(), redDescriptorSet, redTexture->GetView(), sampler.Get());
+    VkDescriptorSet blueDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
+    WriteCombinedImageSamplerDescriptor(device.Get(), blueDescriptorSet, blueTexture->GetView(), sampler.Get());
+
+    ARDemo::MaterialRegistry materialRegistry;
+    materialRegistry.Register(materialIds.redChecker, redDescriptorSet);
+    materialRegistry.Register(materialIds.blueChecker, blueDescriptorSet);
 
     Scene::Camera camera;
     camera.nearZ = 0.1f;
@@ -199,8 +215,9 @@ int main()
     // PopulateDemoScene is the SAME function tests/xr_demo.cpp calls -
     // one scene-content definition, two presentation paths.
     Scene::Scene scene;
-    const ARDemo::DemoSceneEntities sceneEntities = ARDemo::PopulateDemoScene(scene, meshIds);
-    AR_LOG_INFO("Scene: 5 entities (floor, referenceCube, cubeA, cubeB[child of referenceCube], moveOffsetCube)");
+    const ARDemo::DemoSceneEntities sceneEntities = ARDemo::PopulateDemoScene(scene, meshIds, materialIds);
+    AR_LOG_INFO("Scene: 5 entities (floor, referenceCube, cubeA, cubeB[child of referenceCube], moveOffsetCube), "
+                "2 meshes, 2 materials");
 
     Platform::SteadyClock clock;
     double totalTimeSeconds = 0.0;
@@ -368,9 +385,13 @@ int main()
         scissor.extent = extent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+        // M13: pipeline bound once per frame (shared by every material -
+        // see docs/ARCHITECTURE.md, "M13 - Material & Render Resource
+        // Binding Foundation"), but the descriptor set is NOT bound here
+        // anymore - DrawPlannedInstances binds the correct material's
+        // descriptor set per draw now that different renderables can use
+        // different materials.
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
-            0, 1, &descriptorSet, 0, nullptr);
 
         // M12's whole data-flow proof: Scene -> ExtractRenderables ->
         // BuildDrawPlan (against this ONE desktop view) ->
@@ -383,7 +404,7 @@ int main()
         const std::vector<Scene::RenderableInstance> renderables = scene.ExtractRenderables();
         const std::array<Core::Math::Mat4, 1> viewProjections{viewProjection};
         const std::vector<ARDemo::PlannedDraw> plan = ARDemo::BuildDrawPlan(renderables, viewProjections);
-        ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, plan);
+        ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, materialRegistry, plan);
 
         vkCmdEndRenderPass(commandBuffer);
         CheckVkResult(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
@@ -424,7 +445,8 @@ int main()
 
         if (loggedFrameCount == 0)
         {
-            AR_LOG_INFO(std::format("Frame {}: {} renderable(s) extracted, {} view(s), {} planned draw(s)",
+            AR_LOG_INFO(std::format("Frame {}: {} renderable(s) extracted, {} view(s), {} planned draw(s) "
+                                     "(2 unique meshes, 2 unique materials, 2 texture uploads, 1 shared pipeline)",
                                      loggedFrameCount + 1, renderables.size(), viewProjections.size(), plan.size()));
         }
         ++loggedFrameCount;

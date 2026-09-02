@@ -7,6 +7,7 @@ target_sources(arengine_scene
     PRIVATE
         include/AREngine/Scene/Scene.hpp
         include/AREngine/Scene/EntityId.hpp
+        include/AREngine/Scene/MaterialId.hpp
         include/AREngine/Scene/MeshId.hpp
         include/AREngine/Scene/Renderable.hpp
         include/AREngine/Scene/RenderableInstance.hpp

@@ -14,6 +14,7 @@
 // codebase later.
 
 #include "AREngine/Scene/EntityId.hpp"
+#include "AREngine/Scene/MaterialId.hpp"
 #include "AREngine/Scene/MeshId.hpp"
 #include "AREngine/Scene/Scene.hpp"
 
@@ -28,6 +29,14 @@ namespace ARDemo
     {
         AREngine::Scene::MeshId cube;
         AREngine::Scene::MeshId floor;
+    };
+
+    // M13: same minting pattern as DemoMeshIds, for the two demo
+    // materials (each a distinctly-colored checkerboard texture).
+    struct DemoMaterialIds
+    {
+        AREngine::Scene::MaterialId redChecker;
+        AREngine::Scene::MaterialId blueChecker;
     };
 
     // The entities PopulateDemoScene created, so callers can mutate them
@@ -51,5 +60,15 @@ namespace ARDemo
     // giving both demos a genuine, visually meaningful hierarchy proof
     // for free (it swings through world space as referenceCube's
     // existing rotation animation runs).
-    [[nodiscard]] DemoSceneEntities PopulateDemoScene(AREngine::Scene::Scene& scene, const DemoMeshIds& meshIds);
+    //
+    // M13: material assignment across these same 5 entities proves all
+    // three required combinations in one scene (see
+    // docs/ARCHITECTURE.md, "M13 - Material & Render Resource Binding
+    // Foundation"): referenceCube/cubeB/floor share `redChecker`
+    // (multiple entities sharing one material, including across
+    // different meshes - floor is a quad, the other two are cubes);
+    // cubeA shares referenceCube's MeshId but uses `blueChecker` instead
+    // (same mesh, different material).
+    [[nodiscard]] DemoSceneEntities PopulateDemoScene(
+        AREngine::Scene::Scene& scene, const DemoMeshIds& meshIds, const DemoMaterialIds& materialIds);
 }

@@ -211,7 +211,7 @@ namespace AREngine::Scene
             }
 
             result.push_back(RenderableInstance{
-                id, GetWorldMatrix(id), record.renderable->mesh, record.renderable->tint});
+                id, GetWorldMatrix(id), record.renderable->mesh, record.renderable->material, record.renderable->tint});
         }
 
         return result;

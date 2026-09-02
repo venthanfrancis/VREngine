@@ -4,18 +4,18 @@
 
 namespace AREngine::Rendering::Vulkan
 {
-    VulkanDescriptorPool::VulkanDescriptorPool(VkDevice device)
+    VulkanDescriptorPool::VulkanDescriptorPool(VkDevice device, std::uint32_t maxSets)
         : m_device(device)
     {
         VkDescriptorPoolSize poolSize{};
         poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 1;
+        poolSize.descriptorCount = maxSets; // one combined-image-sampler descriptor per set
 
         VkDescriptorPoolCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         createInfo.poolSizeCount = 1;
         createInfo.pPoolSizes = &poolSize;
-        createInfo.maxSets = 1;
+        createInfo.maxSets = maxSets;
 
         const VkResult result = vkCreateDescriptorPool(device, &createInfo, nullptr, &m_pool);
         CheckVkResult(result, "vkCreateDescriptorPool");

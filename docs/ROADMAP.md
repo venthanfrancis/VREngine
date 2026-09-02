@@ -55,6 +55,7 @@ all come after that chain is proven.
 | — M11.1C | **Meta XR Operator setup: PARTIAL.** Completed: Meta XR Operator v205.1 standalone/native package validated; Unity not required; OpenXR API layer loads successfully; AREngine still uses Meta XR Simulator normally; Vulkan/OpenXR path remains healthy; zero new pre-teardown OpenXR/Vulkan errors; no AREngine source dependency on Meta XR Operator. Pending: MCP agent connection; programmatic head movement; driven select press/release; nonzero trigger input; nonzero thumbstick input; moving controller pose; visible M10.6 interaction from driven values. | **Partial** | Blocker: Meta XR Operator MCP proxy must be registered from the user's normal terminal where the Claude CLI is available. See `docs/ARCHITECTURE.md`, "M11.1C - Meta XR Operator Input-Driving Validation". M11.1 not yet marked complete. |
 | — M11.1D-B | **Smart App Control / Meta runtime load diagnosis: COMPLETE.** Conclusion: Windows/Defender/network health verified; Smart App Control enforcement confirmed healthy and unchanged; Meta XR Simulator v205 `SIMULATOR.dll` is an authentic official file but is not Authenticode-signed; Smart App Control blocks the DLL under `VerifiedAndReputableDesktop` before the OpenXR runtime can load; no AREngine defect is involved; no supported per-file Smart App Control exception exists. Durable fixes: (1) Meta ships a validly signed simulator runtime, or (2) Microsoft establishes reputation/trust for the file through the supported submission process. | **Complete** | M11.1 live-driven validation remains externally blocked by the current Meta runtime package under Smart App Control. See `docs/ARCHITECTURE.md`, "M11.1D - Live Input Validation Attempt" and "M11.1D-B - Smart App Control / Meta Runtime Load Diagnosis". |
 | M12 | **Renderable Scene Integration Foundation: COMPLETE.** `Scene -> Renderable + world transform -> ExtractRenderables() -> generic render planning -> desktop or XR views`, with no Scene->Rendering/Vulkan/OpenXR dependency. See the M12 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M12 - Renderable Scene Integration Foundation". |
+| M13 | **Material & Render Resource Binding Foundation: COMPLETE.** Backend-neutral `MaterialId` added alongside `MeshId`, resolved outside Scene by a demo-owned `MaterialRegistry`, with one shared Vulkan pipeline serving multiple materials. See the M13 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M13 - Material & Render Resource Binding Foundation". |
 | M16 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M17 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M18 | `Editor` skeleton | Deprioritized | After the core chain is proven |
@@ -125,6 +126,36 @@ Deferred:
 - asset-backed GPU resources
 - culling/batching/render queues
 - transform/extraction caching
+```
+
+### M13 closeout
+
+```
+M13 — Material & Render Resource Binding Foundation: COMPLETE
+
+Completed:
+- backend-neutral MaterialId added to Scene::Renderable
+- MaterialId preserved through render extraction and draw planning
+- explicit render-side MaterialRegistry added
+- material selection resolved outside Scene
+- one shared graphics pipeline supports multiple materials
+- same mesh + different material proven
+- different mesh + same material proven
+- shared material reuse across multiple entities proven
+- two persistent generated textures/materials used
+- no per-entity mesh or material upload duplication
+- desktop and XR use identical MeshId + MaterialId semantics
+- no per-view material duplication
+- Scene remains Core-only
+- full build matrix and CTest green
+
+Deferred:
+- asset-backed texture/material resources
+- material asset format
+- shader/pipeline variation
+- shader parameters
+- material instances
+- PBR/lighting
 ```
 
 ## Rules while working through the roadmap

@@ -15,7 +15,7 @@ namespace ARDemo
             {
                 plan.push_back(PlannedDraw{
                     viewIndex, viewProjections[viewIndex] * renderable.worldTransform,
-                    renderable.mesh, renderable.tint});
+                    renderable.mesh, renderable.material, renderable.tint});
             }
         }
 

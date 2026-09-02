@@ -881,6 +881,12 @@ values - or M8I+ (Scene integration, still pending within M8) — see
 24. **XR eyes are runtime-driven views, not Scene camera entities.**
 25. **Do not introduce transform/extraction caching without profiling
     evidence.**
+26. **Avoid fragile positional aggregate initialization for
+    Scene::Renderable as the structure evolves. Prefer explicit field
+    assignment/designated-style construction supported by the project's
+    C++ conventions when it improves correctness. Adding a new render-
+    resource field must not silently change visibility/tint/material
+    semantics.**
 
 ## Build
 
