@@ -54,6 +54,7 @@
 // docs/ARCHITECTURE.md, "M10.6 Implementation Notes" for the full
 // design and the explicit test-vs-live evidence split.
 
+#include "AREngine/Assets/Assets.hpp"
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Frame/Frame.hpp"
 #include "AREngine/Input/ActionState.hpp"
@@ -61,6 +62,7 @@
 #include "AREngine/Scene/Scene.hpp"
 
 #include "MeshRegistry.hpp"
+#include "PopulateDemoMaterials.hpp"
 #include "OpenXRVulkanViewTarget.hpp"
 #include "PopulateDemoScene.hpp"
 #include "RenderDrawPlanning.hpp"
@@ -324,6 +326,7 @@ int main()
 {
     using namespace AREngine::XR::OpenXR;
     using namespace AREngine::Rendering::Vulkan;
+    namespace Assets = AREngine::Assets;
     namespace Frame = AREngine::Frame;
     namespace Rendering = AREngine::Rendering;
     namespace Scene = AREngine::Scene;
@@ -497,40 +500,27 @@ int main()
     const TeardownMarker teardownFloorMesh("floorMesh (vertex+index VulkanBuffer)");
     AR_LOG_INFO("Uploaded 2 persistent meshes (cube, floor quad) - never re-uploaded per frame");
 
-    // M13: two distinctly-colored checkerboard textures, one per demo
-    // material - see docs/ARCHITECTURE.md, "M13 - Material & Render
-    // Resource Binding Foundation" for the single-pipeline/multiple-
-    // descriptor-set invariant this relies on.
-    constexpr std::uint32_t kTextureWidth = 64;
-    constexpr std::uint32_t kTextureHeight = 64;
-    constexpr std::uint32_t kTextureTileSize = 8;
-    const std::vector<std::uint8_t> redCheckerPixels = GenerateCheckerboardRGBA8(
-        kTextureWidth, kTextureHeight, kTextureTileSize, {200, 40, 40, 255}, {80, 10, 10, 255});
-    const std::vector<std::uint8_t> blueCheckerPixels = GenerateCheckerboardRGBA8(
-        kTextureWidth, kTextureHeight, kTextureTileSize, {40, 80, 200, 255}, {10, 20, 80, 255});
-    auto redTexture = CreateTextureFromPixels(
-        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
-        kTextureWidth, kTextureHeight, redCheckerPixels.data());
-    const TeardownMarker teardownRedTexture("redTexture (VkImageView, VkImage, VkDeviceMemory)");
-    auto blueTexture = CreateTextureFromPixels(
-        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
-        kTextureWidth, kTextureHeight, blueCheckerPixels.data());
-    const TeardownMarker teardownBlueTexture("blueTexture (VkImageView, VkImage, VkDeviceMemory)");
+    // M14: two real PNG files, loaded through AssetManager, decoded to
+    // RGBA8, and uploaded exactly once each via TextureCache - replacing
+    // M13's in-memory generated checkerboards. See docs/ARCHITECTURE.md,
+    // "M14 - Asset-Backed Texture & Material Loading Foundation" (and
+    // "M13 - Material & Render Resource Binding Foundation" for the
+    // single-pipeline/multiple-descriptor-set invariant this still
+    // relies on, unchanged).
+    Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
+    const TeardownMarker teardownAssetManager("assetManager (trivial - CPU-only content cache, no GPU/OpenXR handle)");
+    ARDemo::TextureCache textureCache;
+    const TeardownMarker teardownTextureCache("textureCache (owns redTexture/blueTexture's VulkanImage objects)");
     VulkanSampler sampler(bindingData.device); // one sampler, shared by every material
     const TeardownMarker teardownSampler("sampler (vkDestroySampler)");
 
-    const ARDemo::DemoMaterialIds materialIds{Scene::MaterialId{1}, Scene::MaterialId{2}};
     VulkanDescriptorPool descriptorPool(bindingData.device, /*maxSets=*/2);
     const TeardownMarker teardownDescriptorPool("descriptorPool (vkDestroyDescriptorPool, frees both descriptorSets implicitly)");
-    VkDescriptorSet redDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-    WriteCombinedImageSamplerDescriptor(bindingData.device, redDescriptorSet, redTexture->GetView(), sampler.Get());
-    VkDescriptorSet blueDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-    WriteCombinedImageSamplerDescriptor(bindingData.device, blueDescriptorSet, blueTexture->GetView(), sampler.Get());
-
     ARDemo::MaterialRegistry materialRegistry;
     const TeardownMarker teardownMaterialRegistry("materialRegistry (trivial, no owned handle)");
-    materialRegistry.Register(materialIds.redChecker, redDescriptorSet);
-    materialRegistry.Register(materialIds.blueChecker, blueDescriptorSet);
+    const ARDemo::DemoMaterialIds materialIds = ARDemo::PopulateDemoMaterials(
+        assetManager, textureCache, descriptorSetLayout, descriptorPool, sampler, materialRegistry,
+        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue());
 
     AR_ASSERT_MSG(binding.GetPhysicalDeviceProperties().limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
         "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
@@ -789,8 +779,17 @@ int main()
 
                     if (interactionState.poseMarkerVisible)
                     {
+                        // Resolved through materialRegistry, not a
+                        // locally-named descriptor set variable - M14
+                        // moved descriptor-set creation into
+                        // PopulateDemoMaterials, so this is the only way
+                        // demo code can still reach "the red material"
+                        // directly, matching M13's own "demo-only
+                        // convenience, not a material system of its own
+                        // for the pose marker" boundary.
+                        const VkDescriptorSet poseMarkerDescriptorSet = materialRegistry.Resolve(materialIds.redChecker);
                         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
-                            0, 1, &redDescriptorSet, 0, nullptr);
+                            0, 1, &poseMarkerDescriptorSet, 0, nullptr);
                         const Scene::Transform poseMarkerTransform{
                             interactionState.poseMarkerPosition, interactionState.poseMarkerOrientation,
                             Math::Vec3(0.15f, 0.15f, 0.15f)};
@@ -942,8 +941,9 @@ int main()
     // materialIds/materialRegistry/meshRegistry/meshIds (all trivial -
     // Scene::Scene owns no GPU/OpenXR handle, MeshRegistry/MaterialRegistry
     // hold only raw non-owning pointers/handles) -> descriptorPool
-    // (frees both redDescriptorSet/blueDescriptorSet implicitly) ->
-    // sampler -> blueTexture -> redTexture ->
+    // (frees both descriptor sets implicitly) -> sampler -> textureCache
+    // (destroys its owned redTexture/blueTexture VulkanImage objects) ->
+    // assetManager (trivial - CPU-only content cache) ->
     // floorMesh -> cubeMesh -> commandPool (frees commandBuffer
     // implicitly) -> pipeline -> descriptorSetLayout -> renderPass ->
     // projectionLayer (trivial) -> swapchains (each xrDestroySwapchain,

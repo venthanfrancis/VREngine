@@ -3,6 +3,7 @@
 #include "AREngine/Assets/AssetId.hpp"
 #include "AREngine/Assets/BinaryAsset.hpp"
 #include "AREngine/Assets/TextAsset.hpp"
+#include "AREngine/Assets/TextureAsset.hpp"
 
 #include <filesystem>
 #include <optional>
@@ -12,15 +13,19 @@
 namespace AREngine::Assets
 {
     // Owns one asset root directory and every asset loaded relative to
-    // it. Loads raw text/binary content from disk, assigns each a
-    // distinct AssetId, and caches by resolved path so repeated loads
-    // of the same file don't hit the disk twice. See
-    // docs/ARCHITECTURE.md, "M6 Implementation Notes" for the asset
-    // root model, cache key strategy, and failure model.
+    // it. Loads raw text/binary content, and decoded RGBA8 image
+    // content (M14), from disk, assigns each a distinct AssetId, and
+    // caches by resolved path so repeated loads of the same file don't
+    // hit the disk twice. See docs/ARCHITECTURE.md, "M6 Implementation
+    // Notes" for the asset root model, cache key strategy, and failure
+    // model, and "M14 - Asset-Backed Texture & Material Loading
+    // Foundation" for LoadTexture/TextureAsset specifically.
     //
     // Depends only on Core — see docs/ARCHITECTURE.md, "Why Assets
-    // Does Not Depend On Platform". No graphics concepts, no Scene
-    // integration, no Runtime ownership requirement.
+    // Does Not Depend On Platform". No Vulkan/OpenXR/graphics-backend
+    // concepts leak into this header even with image decoding added -
+    // TextureAsset is CPU pixel data only. No Scene integration, no
+    // Runtime ownership requirement.
     //
     // Deliberately not a singleton: an application owns an AssetManager
     // instance explicitly, the same ownership philosophy used
@@ -52,10 +57,23 @@ namespace AREngine::Assets
         // docs/ARCHITECTURE.md, "Same-Path/Different-Type Behavior".
         [[nodiscard]] std::optional<AssetId> LoadBinary(const std::filesystem::path& relativePath);
 
+        // M14: loads (or returns the cached AssetId for) the image file
+        // at `relativePath`, decoded and normalized to RGBA8. Returns
+        // std::nullopt if the file doesn't exist, can't be read, the
+        // resolved path would escape the asset root, or the file's
+        // contents can't be decoded as a supported image format (corrupt
+        // file, zero-size, unsupported format) - one consistent failure
+        // path for all of these, same philosophy as LoadText/LoadBinary.
+        // A third independent {path, type} cache, same shape as text and
+        // binary - see docs/ARCHITECTURE.md, "Same-Path/Different-Type
+        // Behavior".
+        [[nodiscard]] std::optional<AssetId> LoadTexture(const std::filesystem::path& relativePath);
+
         [[nodiscard]] bool IsValid(AssetId id) const;
 
         [[nodiscard]] const TextAsset& GetText(AssetId id) const;
         [[nodiscard]] const BinaryAsset& GetBinary(AssetId id) const;
+        [[nodiscard]] const TextureAsset& GetTexture(AssetId id) const;
 
         [[nodiscard]] const std::filesystem::path& GetRoot() const { return m_root; }
 
@@ -80,5 +98,8 @@ namespace AREngine::Assets
 
         std::unordered_map<std::string, AssetId> m_binaryPathToId;
         std::unordered_map<AssetId, BinaryAsset> m_binaryAssets;
+
+        std::unordered_map<std::string, AssetId> m_texturePathToId;
+        std::unordered_map<AssetId, TextureAsset> m_textureAssets;
     };
 }

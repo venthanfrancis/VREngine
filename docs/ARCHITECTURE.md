@@ -9576,3 +9576,216 @@ baseline run) - zero new AREngine-attributable errors.
 Asset-backed texture/material resources, a material asset format,
 shader/pipeline variation, shader parameters, material instances, PBR/
 lighting - see M14.
+
+## M14 - Asset-Backed Texture & Material Loading Foundation
+
+### Goal
+
+Bridge the M6 `Assets` module into the M13 `MaterialId` path so real PNG
+files, loaded through `AssetManager`, become GPU textures referenced by
+`MaterialId` - closing M13's last deferred gap (its two materials were
+generated in-memory checkerboards). `AssetId` and `MaterialId` stay
+deliberately distinct throughout: source content identity vs. logical
+render-appearance identity.
+
+### Audit findings
+
+`AssetManager` was exactly two structurally-parallel, independent
+`{path -> id, id -> Asset}` pairs (text, binary), sharing one private
+`ResolvePath` and one cache-key convention, with no notion of images.
+`docs/ARCHITECTURE.md`'s own M6 section had already anticipated this
+exact milestone: *"Real future content types (`MeshAsset`, `TextureAsset`)
+are expected to build on top of `TextAsset`/`BinaryAsset`... as their
+own independent structs, following the same pattern."* No third-party
+dependency mechanism existed for a library like an image decoder - the
+only precedent in the repo, `FetchContent` for OpenXR-SDK in
+`engine/xr/CMakeLists.txt`, is structurally gated behind the optional,
+default-OFF `ARENGINE_ENABLE_OPENXR` flag specifically because XR
+bring-up is optional; `engine/assets` has no such flag and builds
+unconditionally.
+
+### `TextureAsset` and `AssetManager`'s third parallel type
+
+`engine/assets/include/AREngine/Assets/TextureAsset.hpp`:
+```cpp
+struct TextureAsset {
+    AssetId id;
+    std::filesystem::path path;
+    std::uint32_t width = 0, height = 0, channels = 4; // always normalized to RGBA8
+    std::vector<std::uint8_t> pixels; // row-major, tightly packed, top-left origin
+};
+```
+`uint8_t`, not `std::byte` like `BinaryAsset::bytes` - this is decoded,
+channel-typed pixel data (matching `GenerateCheckerboardRGBA8`'s and
+`CreateTextureFromPixels`'s existing pixel-data convention), not opaque
+file bytes; a deliberate divergence from `BinaryAsset`, confirmed
+against both existing call sites before implementing.
+
+`AssetManager` gained a third pair, mirroring `Text`/`Binary` exactly:
+`LoadTexture(relativePath) -> std::optional<AssetId>` (reuses the
+existing private `ResolvePath`; reads bytes independently, the same way
+`LoadBinary` itself does, rather than calling the *public* `LoadBinary`
+and decoding its result - routing through `LoadBinary` would mint a
+second, throwaway `AssetId` for what's really just a decode input, and
+pollute the binary cache with large intermediate content nothing else
+needs; this is explicitly documented at the call site to preempt a
+plausible misreading of the M6 doc's own "build on top of `BinaryAsset`"
+phrasing), `GetTexture(AssetId) const -> const TextureAsset&` (asserts
+on an unknown id, matching `GetText`/`GetBinary`). Missing file or
+failed/corrupt decode both route through the same `nullopt` +
+logged-warning failure path - one consistent philosophy, no new
+category.
+
+### Decoder: `engine/assets/src/ImageDecode.hpp/.cpp` (private, stb-only boundary)
+
+One exposed function, `DecodeImageRGBA8(std::span<const std::byte>) ->
+std::optional<TextureAsset>`. Contains the ONLY `#define
+STB_IMAGE_IMPLEMENTATION` + `stb_image.h` include anywhere in this
+codebase, wrapped in `#pragma warning(push, 0)`/`pop` so stb's own
+internal warnings never leak into AREngine's `/W4` build without
+weakening AREngine's own warning level anywhere else - confirmed by a
+clean, zero-warning build of `arengine_assets` immediately after
+vendoring. `STBI_NO_STDIO` defined (AREngine always decodes from an
+in-memory buffer `AssetManager` already read - no stb-side file I/O
+needed). `stbi_load_from_memory(..., desired_channels=4)` decodes
+straight to RGBA8; `stbi_image_free()` called after copying into
+`TextureAsset::pixels` (independently owned memory) - no stb type or
+pointer ever crosses out of `ImageDecode.cpp`.
+
+### Vendoring `stb_image.h` directly, not `FetchContent`
+
+Commit `013ac3beddff3dbffafd5177e7972067cd2b5083` (v2.30), fetched
+directly via `curl` for byte-exact source (not through any summarizing
+tool), at `third_party/stb/stb_image.h` - dual MIT/public-domain
+licensed, license text embedded in the file itself, provenance recorded
+in `third_party/stb/README.md`. Per `docs/ROADMAP.md`'s own standing
+rule ("No third-party dependencies until a milestone explicitly calls
+for one") - M14 is that milestone. Deliberately **not** `FetchContent`,
+despite that being the only existing precedent: OpenXR-SDK is a full
+multi-file library, genuinely optional, gated OFF by default - lazily
+fetching it only when needed is right. `engine/assets` is unconditional
+(every build needs it, no equivalent flag exists or should exist), so
+`FetchContent`-ing stb there would make network access mandatory on
+every fresh configure of the whole project from now on - a real,
+permanent regression the OpenXR precedent's "network access on first
+configure" caveat doesn't currently impose project-wide. stb is a
+single header, explicitly designed by its own author to be vendored
+directly. `engine/assets/CMakeLists.txt` just adds a `PRIVATE` include
+directory for it - `stb_image.h` is an implementation detail of
+`ImageDecode.cpp` only, never part of `arengine_assets`'s public
+interface.
+
+### `TextureCache` (`tests/TextureCache.hpp/.cpp`, Vulkan-only)
+
+Unlike `MeshRegistry`/`MaterialRegistry` (non-owning lookup tables over
+demo-owned objects), `TextureCache` **owns** every `VulkanImage` it
+creates - its whole job is create-once-and-cache:
+```cpp
+class TextureCache {
+public:
+    const VulkanImage* GetOrCreate(AssetId, const TextureAsset&, VkPhysicalDevice, VkDevice, VkCommandPool, VkQueue);
+private:
+    std::unordered_map<AssetId, std::unique_ptr<VulkanImage>> m_textures;
+};
+```
+Cache hit: zero Vulkan calls. Cache miss: calls the existing, unchanged
+`CreateTextureFromPixels`, caches, returns. This is the concrete
+"`AssetId` identity -> deduplicated GPU upload" proof, verified by both
+demos' logs reporting exactly 2 GPU texture uploads for 2 distinct
+assets shared across 5 scene entities. No automated `ctest` coverage:
+`GetOrCreate` calls real Vulkan creation/upload APIs with no
+opaque-handle shortcut available (unlike `MaterialRegistry`'s fake-
+`VkDescriptorSet` trick), so it's verified manually through the demos
+only - consistent with this codebase's existing treatment of
+`vulkan_demo.cpp`/`vulkan_present_demo.cpp` (built, never
+`add_test`-registered).
+
+### `tests/PopulateDemoMaterials.hpp/.cpp` (shared by both demos)
+
+Mirrors `PopulateDemoScene`'s "one definition, two consumers" shape.
+Kept flat (7 individual parameters, not bundled into a new "render
+context" struct) - no such bundling precedent exists anywhere in this
+codebase, and this matches `CreateTextureFromPixels`'s own established
+individual-handle signature exactly. Per material:
+`assetManager.LoadTexture(...)` -> `assetManager.GetTexture(id)` ->
+`textureCache.GetOrCreate(...)` -> `descriptorPool.Allocate(...)` +
+`WriteCombinedImageSamplerDescriptor(...)` ->
+`materialRegistry.Register(materialId, descriptorSet)`. Returns the
+same `DemoMaterialIds{redChecker, blueChecker}` shape M13 already
+defined, now file-backed instead of generated. Both demos' `main()`
+shrank to: construct `AssetManager` + `TextureCache`, call
+`PopulateDemoMaterials(...)`, pass the result into the existing
+`PopulateDemoScene(scene, meshIds, materialIds)` unchanged. Missing
+committed fixture textures are treated as a setup/packaging bug
+(`AR_ASSERT_MSG`), not a normal runtime condition - distinct from
+`AssetManager::LoadTexture`'s own predictable-`nullopt` philosophy for
+genuinely arbitrary/untrusted paths.
+
+### Test PNG fixtures and demo asset root
+
+Two tiny (16x16) checkerboard PNGs plus one deliberately-corrupt fixture,
+generated once via PowerShell's `System.Drawing.Bitmap`/`Save(...,
+ImageFormat.Png)` and committed at `tests/data/assets/textures/` -
+reusing M6's existing fixture root rather than inventing a new one
+(low-risk: `ResolvePath`'s traversal protection means test and demo
+loads through the same root can't interfere). Since this repurposes
+`tests/data/assets/` from "test-only fixtures" to also "demo runtime
+content," `asset_tests.cpp`'s header comment was updated accordingly,
+and a new `AR_DEMO_ASSETS_ROOT` compile definition (mirroring the
+existing `AR_TEST_ASSETS_ROOT` pattern) was added for both Vulkan demo
+targets rather than hardcoding the path.
+
+### `xr_demo.cpp` RAII/teardown-trace placement
+
+`AssetManager`/`TextureCache` declared at exactly the point
+`redTexture`/`blueTexture` used to sit (before `descriptorPool` -
+`TextureCache` must outlive `descriptorPool`, since a descriptor set
+referencing a destroyed image view is a validation error even after the
+pool itself is otherwise fine). Matching `TeardownMarker` locals added
+for both, and the trailing destruction-order doc comment updated - the
+teardown trace from the actual validation run confirms the exact
+intended order: `materialRegistry -> descriptorPool -> sampler ->
+textureCache -> assetManager -> floorMesh -> cubeMesh -> ...`. The pose
+marker's direct descriptor-set bind (a demo-only convenience, unchanged
+M13 boundary) now resolves through `materialRegistry.Resolve(...)`
+instead of a locally-named descriptor-set variable, since descriptor-set
+creation moved into `PopulateDemoMaterials`.
+
+### Scene/MaterialId boundary (unchanged, reconfirmed)
+
+`Scene::Renderable`/`RenderableInstance` did not change at all in M14 -
+they already carried only `MaterialId`. `AssetId` never reaches `Scene`;
+it's resolved entirely at demo setup time, before any `MaterialId` is
+minted. `MaterialRegistry` itself is unchanged from M13.
+
+### Validation
+
+Full build matrix (all 4 `OPENXR`x`VULKAN` combinations) and `ctest`
+green (19/16/14/12), zero compiler warnings anywhere including from the
+vendored stb header. Several transient Smart App Control blocks on
+freshly-built local test/demo executables recurred during validation
+(same class as M11.3A) - each resolved by relinking/rebuilding, no
+security setting touched; one case needed a *forced full* relink (an
+incremental relink with unchanged source reproduced an identical binary
+hash and stayed blocked) - see the new `AGENTS.md` rule.
+
+`arengine_scene_render_demo`: `Scene: 5 entities..., 2 meshes, 2
+materials`, `Frame 1: 5 renderable(s) extracted, 1 view(s), 5 planned
+draw(s) (2 unique meshes, 2 file-backed materials [checker_red.png,
+checker_blue.png], 2 GPU texture uploads, 1 shared pipeline)`. A
+full-screen screenshot captured while running visually confirms the red
+and blue checkerboard cubes rendered distinctly from real PNG content.
+
+`arengine_xr_demo` (against SteamVR, freshly started for this run):
+1000/1000 frames, `objects rendered=10, draw calls=10` (5 renderables x
+2 eyes - identical multiplier to M13, confirming the asset-backed swap
+changed nothing about draw multiplicity). Full clean teardown trace
+through every `TeardownMarker`. Only the already-documented
+`BlankEyeBuffer`/D3D11-KMT SteamVR-internal noise present - zero new
+AREngine-attributable errors.
+
+### Deferred
+
+A material asset format, asset-backed mesh content, material/shader
+parameters, pipeline variants, model importing, PBR/lighting, hot
+reload/asset database/editor tooling - see M15.

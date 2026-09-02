@@ -56,6 +56,7 @@ all come after that chain is proven.
 | — M11.1D-B | **Smart App Control / Meta runtime load diagnosis: COMPLETE.** Conclusion: Windows/Defender/network health verified; Smart App Control enforcement confirmed healthy and unchanged; Meta XR Simulator v205 `SIMULATOR.dll` is an authentic official file but is not Authenticode-signed; Smart App Control blocks the DLL under `VerifiedAndReputableDesktop` before the OpenXR runtime can load; no AREngine defect is involved; no supported per-file Smart App Control exception exists. Durable fixes: (1) Meta ships a validly signed simulator runtime, or (2) Microsoft establishes reputation/trust for the file through the supported submission process. | **Complete** | M11.1 live-driven validation remains externally blocked by the current Meta runtime package under Smart App Control. See `docs/ARCHITECTURE.md`, "M11.1D - Live Input Validation Attempt" and "M11.1D-B - Smart App Control / Meta Runtime Load Diagnosis". |
 | M12 | **Renderable Scene Integration Foundation: COMPLETE.** `Scene -> Renderable + world transform -> ExtractRenderables() -> generic render planning -> desktop or XR views`, with no Scene->Rendering/Vulkan/OpenXR dependency. See the M12 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M12 - Renderable Scene Integration Foundation". |
 | M13 | **Material & Render Resource Binding Foundation: COMPLETE.** Backend-neutral `MaterialId` added alongside `MeshId`, resolved outside Scene by a demo-owned `MaterialRegistry`, with one shared Vulkan pipeline serving multiple materials. See the M13 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M13 - Material & Render Resource Binding Foundation". |
+| M14 | **Asset-Backed Texture & Material Loading Foundation: COMPLETE.** Real PNG files, loaded through `AssetManager` and decoded via a privately-isolated stb_image, become GPU textures deduplicated by `AssetId` through a render-side `TextureCache`, referenced by `MaterialId` exactly like M13's generated textures were. See the M14 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M14 - Asset-Backed Texture & Material Loading Foundation". |
 | M16 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M17 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
 | M18 | `Editor` skeleton | Deprioritized | After the core chain is proven |
@@ -156,6 +157,35 @@ Deferred:
 - shader parameters
 - material instances
 - PBR/lighting
+```
+
+### M14 closeout
+
+```
+M14 — Asset-Backed Texture & Material Loading Foundation: COMPLETE
+
+Completed:
+- PNG image decoding added to Assets using privately-isolated stb_image
+- backend-neutral TextureAsset with normalized RGBA8 pixels
+- image loading participates in existing AssetId/path cache semantics
+- missing/corrupt image handling validated
+- Assets remain Vulkan/OpenXR independent
+- AssetId remains distinct from MaterialId
+- render-side TextureCache provides AssetId → deduplicated GPU texture upload
+- file-backed textures integrated with MaterialRegistry
+- no file I/O, decoding, or texture upload in frame loops
+- two persistent file-backed materials proven in desktop and XR
+- one shared sampler and persistent descriptor sets
+- full build matrix and CTest green
+
+Deferred:
+- material asset format
+- asset-backed mesh content
+- material/shader parameters
+- pipeline variants
+- model importing beyond a narrowly-scoped mesh format
+- PBR/lighting
+- hot reload / asset database / editor tooling
 ```
 
 ## Rules while working through the roadmap

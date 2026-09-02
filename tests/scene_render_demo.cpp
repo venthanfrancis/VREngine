@@ -18,6 +18,7 @@
 // scene, two presentation paths, no duplicated world data. See
 // docs/ARCHITECTURE.md, "M12 - Renderable Scene Integration Foundation".
 
+#include "AREngine/Assets/Assets.hpp"
 #include "AREngine/Core/Core.hpp"
 #include "AREngine/Input/Input.hpp"
 #include "AREngine/Platform/Platform.hpp"
@@ -28,10 +29,10 @@
 
 #include "DemoCameraController.hpp"
 #include "MeshRegistry.hpp"
+#include "PopulateDemoMaterials.hpp"
 #include "PopulateDemoScene.hpp"
 #include "RenderDrawPlanning.hpp"
 
-#include "vulkan/VulkanCheckerboard.hpp"
 #include "vulkan/VulkanClipSpace.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDepthFormat.hpp"
@@ -165,35 +166,22 @@ int main()
     meshRegistry.Register(meshIds.cube, cubeMesh.get());
     meshRegistry.Register(meshIds.floor, floorMesh.get());
 
-    // M13: two distinctly-colored checkerboard textures - one material
-    // resource per demo material, each uploaded exactly once. Red/blue
-    // are arbitrary; the point is that they are visually distinguishable
-    // so "same mesh, different material" is actually observable.
-    constexpr std::uint32_t kTextureWidth = 64;
-    constexpr std::uint32_t kTextureHeight = 64;
-    constexpr std::uint32_t kTextureTileSize = 8;
-    const std::vector<std::uint8_t> redCheckerPixels = GenerateCheckerboardRGBA8(
-        kTextureWidth, kTextureHeight, kTextureTileSize, {200, 40, 40, 255}, {80, 10, 10, 255});
-    const std::vector<std::uint8_t> blueCheckerPixels = GenerateCheckerboardRGBA8(
-        kTextureWidth, kTextureHeight, kTextureTileSize, {40, 80, 200, 255}, {10, 20, 80, 255});
-    auto redTexture = CreateTextureFromPixels(
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
-        kTextureWidth, kTextureHeight, redCheckerPixels.data());
-    auto blueTexture = CreateTextureFromPixels(
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
-        kTextureWidth, kTextureHeight, blueCheckerPixels.data());
+    // M14: two real PNG files, loaded through AssetManager, decoded to
+    // RGBA8, and uploaded exactly once each via TextureCache - replacing
+    // M13's in-memory generated checkerboards. Red/blue are arbitrary;
+    // the point is that they are visually distinguishable so "same
+    // mesh, different material" is actually observable. See
+    // docs/ARCHITECTURE.md, "M14 - Asset-Backed Texture & Material
+    // Loading Foundation".
+    Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
+    ARDemo::TextureCache textureCache;
     VulkanSampler sampler(device.Get()); // one sampler, shared by every material - describes filtering only, not a specific image
 
-    const ARDemo::DemoMaterialIds materialIds{Scene::MaterialId{1}, Scene::MaterialId{2}};
     VulkanDescriptorPool descriptorPool(device.Get(), /*maxSets=*/2);
-    VkDescriptorSet redDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-    WriteCombinedImageSamplerDescriptor(device.Get(), redDescriptorSet, redTexture->GetView(), sampler.Get());
-    VkDescriptorSet blueDescriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-    WriteCombinedImageSamplerDescriptor(device.Get(), blueDescriptorSet, blueTexture->GetView(), sampler.Get());
-
     ARDemo::MaterialRegistry materialRegistry;
-    materialRegistry.Register(materialIds.redChecker, redDescriptorSet);
-    materialRegistry.Register(materialIds.blueChecker, blueDescriptorSet);
+    const ARDemo::DemoMaterialIds materialIds = ARDemo::PopulateDemoMaterials(
+        assetManager, textureCache, descriptorSetLayout, descriptorPool, sampler, materialRegistry,
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue());
 
     Scene::Camera camera;
     camera.nearZ = 0.1f;
@@ -446,7 +434,8 @@ int main()
         if (loggedFrameCount == 0)
         {
             AR_LOG_INFO(std::format("Frame {}: {} renderable(s) extracted, {} view(s), {} planned draw(s) "
-                                     "(2 unique meshes, 2 unique materials, 2 texture uploads, 1 shared pipeline)",
+                                     "(2 unique meshes, 2 file-backed materials [checker_red.png, checker_blue.png], "
+                                     "2 GPU texture uploads, 1 shared pipeline)",
                                      loggedFrameCount + 1, renderables.size(), viewProjections.size(), plan.size()));
         }
         ++loggedFrameCount;

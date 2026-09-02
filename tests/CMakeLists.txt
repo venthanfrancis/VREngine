@@ -178,10 +178,18 @@ if(ARENGINE_ENABLE_VULKAN)
         RenderDrawPlanning.cpp
         MeshRegistry.cpp
         MaterialRegistry.cpp
+        TextureCache.cpp
+        PopulateDemoMaterials.cpp
     )
-    target_link_libraries(arengine_scene_render_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering Vulkan::Vulkan)
+    target_link_libraries(arengine_scene_render_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering AREngine::Assets Vulkan::Vulkan)
     target_include_directories(arengine_scene_render_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
     target_compile_features(arengine_scene_render_demo PRIVATE cxx_std_20)
+    # M14: same fixture root arengine_asset_tests already uses (tests/data/assets/),
+    # which now also holds the demo's own texture PNGs (tests/data/assets/textures/) -
+    # see docs/ARCHITECTURE.md, "M14 - Asset-Backed Texture & Material Loading Foundation".
+    target_compile_definitions(arengine_scene_render_demo PRIVATE
+        AR_DEMO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"
+    )
 
     # Pure-logic tests for ARDemo::MaterialRegistry (MaterialRegistry.hpp)
     # — M13. Gated under ARENGINE_ENABLE_VULKAN only because
@@ -380,12 +388,19 @@ if(ARENGINE_ENABLE_OPENXR)
             RenderDrawPlanning.cpp
             MeshRegistry.cpp
             MaterialRegistry.cpp
+            TextureCache.cpp
+            PopulateDemoMaterials.cpp
         )
-        target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input OpenXR::openxr_loader Vulkan::Vulkan)
+        target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input AREngine::Assets OpenXR::openxr_loader Vulkan::Vulkan)
         target_include_directories(arengine_xr_demo PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../engine/xr/src
             ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
         target_compile_features(arengine_xr_demo PRIVATE cxx_std_20)
+        # M14: same demo asset root as arengine_scene_render_demo - one
+        # scene, one material set, two presentation paths.
+        target_compile_definitions(arengine_xr_demo PRIVATE
+            AR_DEMO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"
+        )
     endif()
 endif()
 

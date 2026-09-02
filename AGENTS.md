@@ -887,6 +887,11 @@ values - or M8I+ (Scene integration, still pending within M8) — see
     C++ conventions when it improves correctness. Adding a new render-
     resource field must not silently change visibility/tint/material
     semantics.**
+27. **When Smart App Control blocks a freshly-built local executable, a
+    normal incremental relink may reproduce an identical hash and
+    remain blocked. If necessary, force a genuine full relink/rebuild
+    that produces a new executable hash before considering any
+    security-setting change.**
 
 ## Build
 

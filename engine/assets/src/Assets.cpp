@@ -1,5 +1,7 @@
 #include "AREngine/Assets/Assets.hpp"
 
+#include "ImageDecode.hpp"
+
 #include "AREngine/Core/Assert.hpp"
 #include "AREngine/Core/Log.hpp"
 
@@ -162,9 +164,57 @@ namespace AREngine::Assets
         return id;
     }
 
+    std::optional<AssetId> AssetManager::LoadTexture(const std::filesystem::path& relativePath)
+    {
+        const std::optional<std::filesystem::path> resolved = ResolvePath(relativePath);
+        if (!resolved.has_value())
+        {
+            return std::nullopt;
+        }
+
+        const std::string cacheKey = resolved->generic_string();
+        const auto cached = m_texturePathToId.find(cacheKey);
+        if (cached != m_texturePathToId.end())
+        {
+            return cached->second;
+        }
+
+        // Reads bytes independently here (via the same ReadBinaryFile
+        // helper LoadBinary itself uses) rather than calling the PUBLIC
+        // LoadBinary and decoding its result: routing through LoadBinary
+        // would mint a second, throwaway AssetId for what's really just
+        // a decode input, and would pollute the binary cache with large
+        // intermediate file content nothing else needs to reference by
+        // AssetId. This keeps LoadTexture structurally parallel to
+        // LoadText/LoadBinary (its own independent {path, type} cache),
+        // not a wrapper built on top of LoadBinary's own cache.
+        std::optional<std::vector<std::byte>> bytes = ReadBinaryFile(*resolved);
+        if (!bytes.has_value())
+        {
+            AR_LOG_WARNING(std::format("Failed to load texture asset: {}", relativePath.string()));
+            return std::nullopt;
+        }
+
+        std::optional<TextureAsset> decoded = DecodeImageRGBA8(*bytes);
+        if (!decoded.has_value())
+        {
+            AR_LOG_WARNING(std::format("Failed to decode texture asset (corrupt or unsupported image format): {}", relativePath.string()));
+            return std::nullopt;
+        }
+
+        const AssetId id{m_nextAssetId++};
+        decoded->id = id;
+        decoded->path = relativePath;
+
+        m_textureAssets.emplace(id, std::move(*decoded));
+        m_texturePathToId.emplace(cacheKey, id);
+
+        return id;
+    }
+
     bool AssetManager::IsValid(AssetId id) const
     {
-        return id.IsValid() && (m_textAssets.contains(id) || m_binaryAssets.contains(id));
+        return id.IsValid() && (m_textAssets.contains(id) || m_binaryAssets.contains(id) || m_textureAssets.contains(id));
     }
 
     const TextAsset& AssetManager::GetText(AssetId id) const
@@ -178,6 +228,13 @@ namespace AREngine::Assets
     {
         const auto it = m_binaryAssets.find(id);
         AR_ASSERT_MSG(it != m_binaryAssets.end(), "GetBinary called with an id that is not a known binary asset - check IsValid() first");
+        return it->second;
+    }
+
+    const TextureAsset& AssetManager::GetTexture(AssetId id) const
+    {
+        const auto it = m_textureAssets.find(id);
+        AR_ASSERT_MSG(it != m_textureAssets.end(), "GetTexture called with an id that is not a known texture asset - check IsValid() first");
         return it->second;
     }
 }
