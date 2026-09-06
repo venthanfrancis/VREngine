@@ -10,10 +10,11 @@
 // for camera movement (not the milestone's concern - already proven) and
 // the same window/device/swapchain/pipeline/texture bring-up
 // vulkan_present_demo.cpp already established; the only thing genuinely
-// new here is the Scene -> ExtractRenderables -> BuildDrawPlan ->
-// DrawPlannedInstances path (tests/RenderDrawPlanning.hpp,
-// tests/DrawPlannedInstances.hpp), shared unchanged with tests/xr_demo.cpp's own
-// per-view render loop. Scene content itself comes from
+// new here is the Scene -> ExtractRenderables -> BuildRenderItems ->
+// SubmitRenderItems path (tests/BuildRenderItems.hpp,
+// engine/rendering's Rendering::Vulkan::SubmitRenderItems), shared
+// unchanged with tests/xr_demo.cpp's own per-view render loop. Scene
+// content itself comes from
 // tests/PopulateDemoScene.hpp, the SAME function xr_demo.cpp calls - one
 // scene, two presentation paths, no duplicated world data. See
 // docs/ARCHITECTURE.md, "M12 - Renderable Scene Integration Foundation".
@@ -27,12 +28,11 @@
 #include "AREngine/Scene/Scene.hpp"
 #include "AREngine/Scene/Transform.hpp"
 
+#include "BuildRenderItems.hpp"
 #include "DemoCameraController.hpp"
-#include "DrawPlannedInstances.hpp"
 #include "PopulateDemoMaterials.hpp"
 #include "PopulateDemoMeshes.hpp"
 #include "PopulateDemoScene.hpp"
-#include "RenderDrawPlanning.hpp"
 
 #include "vulkan/VulkanClipSpace.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
@@ -46,6 +46,7 @@
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
+#include "vulkan/VulkanRenderItemSubmission.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
 #include "vulkan/VulkanRenderResourceContext.hpp"
 #include "vulkan/VulkanResult.hpp"
@@ -373,23 +374,23 @@ int main()
         // M13: pipeline bound once per frame (shared by every material -
         // see docs/ARCHITECTURE.md, "M13 - Material & Render Resource
         // Binding Foundation"), but the descriptor set is NOT bound here
-        // anymore - DrawPlannedInstances binds the correct material's
-        // descriptor set per draw now that different renderables can use
+        // anymore - SubmitRenderItems binds the correct material's
+        // descriptor set per item now that different renderables can use
         // different materials.
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
 
-        // M12's whole data-flow proof: Scene -> ExtractRenderables ->
-        // BuildDrawPlan (against this ONE desktop view) ->
-        // DrawPlannedInstances. Extracted exactly once per frame, not
-        // per anything else - there is only one view here, but the same
-        // call shape works unchanged for xr_demo.cpp's N eye views.
+        // M17's whole data-flow proof: Scene -> ExtractRenderables ->
+        // BuildRenderItems -> SubmitRenderItems (against this ONE
+        // desktop view). Extracted exactly once per frame, not per
+        // anything else - there is only one view here, but the same
+        // SubmitRenderItems call works unchanged for xr_demo.cpp's N
+        // eye views (called once per eye there, instead of once here).
         camera.SetAspectRatio(static_cast<float>(extent.width) / static_cast<float>(extent.height));
         const Core::Math::Mat4 viewProjection =
             ApplyVulkanYFlip(camera.GetProjectionMatrix()) * camera.GetViewMatrix(cameraTransform);
         const std::vector<Scene::RenderableInstance> renderables = scene.ExtractRenderables();
-        const std::array<Core::Math::Mat4, 1> viewProjections{viewProjection};
-        const std::vector<ARDemo::PlannedDraw> plan = ARDemo::BuildDrawPlan(renderables, viewProjections);
-        ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), context, plan);
+        const std::vector<Rendering::RenderItem> renderItems = ARDemo::BuildRenderItems(renderables);
+        SubmitRenderItems(commandBuffer, pipeline.GetLayout(), context, viewProjection, renderItems);
 
         vkCmdEndRenderPass(commandBuffer);
         CheckVkResult(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
@@ -430,11 +431,11 @@ int main()
 
         if (loggedFrameCount == 0)
         {
-            AR_LOG_INFO(std::format("Frame {}: {} renderable(s) extracted, {} view(s), {} planned draw(s) "
-                                     "(1 asset-backed mesh [pyramid.obj] + 1 procedural mesh [floor quad], "
-                                     "2 file-backed materials [checker_red.png, checker_blue.png], "
+            AR_LOG_INFO(std::format("Frame {}: {} renderable(s) extracted, {} render item(s) built, 1 view, "
+                                     "{} draw(s) expected (1 asset-backed mesh [pyramid.obj] + 1 procedural mesh "
+                                     "[floor quad], 2 file-backed materials [checker_red.png, checker_blue.png], "
                                      "2 GPU texture uploads, 1 shared pipeline)",
-                                     loggedFrameCount + 1, renderables.size(), viewProjections.size(), plan.size()));
+                                     loggedFrameCount + 1, renderables.size(), renderItems.size(), renderItems.size()));
         }
         ++loggedFrameCount;
 

@@ -59,11 +59,12 @@ all come after that chain is proven.
 | M14 | **Asset-Backed Texture & Material Loading Foundation: COMPLETE.** Real PNG files, loaded through `AssetManager` and decoded via a privately-isolated stb_image, become GPU textures deduplicated by `AssetId` through a render-side `TextureCache`, referenced by `MaterialId` exactly like M13's generated textures were. See the M14 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M14 - Asset-Backed Texture & Material Loading Foundation". |
 | M15 | **Asset-Backed Mesh Loading Foundation: COMPLETE.** Real OBJ mesh files, loaded through `AssetManager` and decoded via a privately-isolated tinyobjloader, become GPU meshes deduplicated by `AssetId` through a render-side `MeshCache`, referenced by `MeshId` exactly like M12's procedural meshes were. See the M15 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M15 - Asset-Backed Mesh Loading Foundation". |
 | M16 | **Render Resource Context Foundation: COMPLETE.** The proven M12-M15 render-resource ownership pattern promoted out of demo-local `MeshCache`/`TextureCache`/`MeshRegistry`/`MaterialRegistry` into one reusable `VulkanRenderResourceContext`, minting backend-neutral `MeshHandle`/`MaterialHandle` identities (kept distinct from `Scene::MeshId`/`MaterialId` - `Rendering` never depends on `Scene`). See the M16 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M16 - Render Resource Context Foundation". |
-| M17 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
-| M18 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
-| M19 | `Editor` skeleton | Deprioritized | After the core chain is proven |
-| M20 | Android/Linux `Platform` backend | Later | When actually needed |
-| M21 | Custom AR hardware bring-up | Long-term | The project's ultimate goal |
+| M17 | **Scene Render Submission Foundation: COMPLETE.** Backend-neutral `Rendering::RenderItem` (mesh/material handles, model matrix, tint) plus a reusable `SubmitRenderItems` Vulkan path, promoting resource lookup/MVP calculation/material+mesh binding/draw execution out of both demos - one `RenderItem` per world renderable regardless of view count. See the M17 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M17 - Scene Render Submission Foundation". |
+| M18 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
+| M19 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
+| M20 | `Editor` skeleton | Deprioritized | After the core chain is proven |
+| M21 | Android/Linux `Platform` backend | Later | When actually needed |
+| M22 | Custom AR hardware bring-up | Long-term | The project's ultimate goal |
 
 ### M11 closeout
 
@@ -246,6 +247,37 @@ Deferred:
 - eviction / residency
 - asset database / hot reload
 - pipeline/material variants
+```
+
+### M17 closeout
+
+```
+M17 — Scene Render Submission Foundation: COMPLETE
+
+Completed:
+- backend-neutral Rendering::RenderItem introduced
+- RenderItem contains MeshHandle, MaterialHandle, model matrix, and tint
+- Scene IDs remain isolated from Rendering handles
+- BuildRenderItems provides the Scene↔Rendering integration boundary
+- reusable Vulkan SubmitRenderItems path introduced
+- resource lookup, MVP calculation, material binding, mesh binding, and draw
+  execution moved out of demos
+- one RenderItem exists per world renderable regardless of view count
+- desktop and XR use the same scene-object submission algorithm
+- XR pose marker migrated to the shared submission path
+- obsolete PlannedDraw / DrawPlannedInstances path removed
+- Rendering remains independent from Scene and OpenXR
+- M4 RenderDevice / DrawCommand re-audited and deliberately left dormant
+- full OPENXR×VULKAN build matrix and CTest green
+
+Deferred:
+- frustum culling
+- draw sorting/batching
+- instancing
+- render queues
+- pipeline/material variants
+- render graph
+- generalized multi-backend submission
 ```
 
 ## Rules while working through the roadmap

@@ -910,6 +910,20 @@ values - or M8I+ (Scene integration, still pending within M8) — see
 34. **VulkanRenderResourceContext owns GPU-side resource identity and
     lifetime. Scene stores only logical scene-facing IDs and never
     owns or resolves Vulkan resources.**
+35. **Rendering::RenderItem is view-independent world render data. Do
+    not duplicate RenderItems per XR eye or other view.**
+36. **Scene IDs and Rendering handles remain intentionally distinct.
+    Conversion belongs in a higher-level integration layer that may
+    depend on both modules.**
+37. **Rendering owns reusable draw execution; desktop and XR own their
+    respective render-target lifecycle and presentation.**
+38. **Generic Rendering submission must not depend on Scene or
+    OpenXR.**
+39. **Do not revive M4 RenderDevice/DrawCommand without a concrete
+    requirement demonstrated by current architecture.**
+40. **Prefer one shared submission path for ordinary renderable
+    objects rather than adding demo-specific direct Vulkan draw
+    paths.**
 
 ## Build
 

@@ -61,12 +61,11 @@
 #include "AREngine/Rendering/ProceduralMesh.hpp"
 #include "AREngine/Scene/Scene.hpp"
 
-#include "DrawPlannedInstances.hpp"
+#include "BuildRenderItems.hpp"
 #include "PopulateDemoMaterials.hpp"
 #include "PopulateDemoMeshes.hpp"
 #include "OpenXRVulkanViewTarget.hpp"
 #include "PopulateDemoScene.hpp"
-#include "RenderDrawPlanning.hpp"
 #include "XRInteractionState.hpp"
 
 #include "openxr/OpenXRActionSystem.hpp"
@@ -89,14 +88,15 @@
 #include "vulkan/VulkanDepthFormat.hpp"
 #include "vulkan/VulkanDescriptorSetLayout.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
-#include "vulkan/VulkanMesh.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
+#include "vulkan/VulkanRenderItemSubmission.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
 #include "vulkan/VulkanRenderResourceContext.hpp"
 
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <span>
 #include <cstdint>
 #include <format>
 #include <iostream>
@@ -201,8 +201,8 @@ namespace
     // found). The pose marker alone stays outside Scene: its
     // transform/visibility are driven by live OpenXR aim-pose action
     // state recomputed every frame (ephemeral input visualization, not
-    // authored world data), so it's still drawn directly via
-    // DrawOpenXRViewObject below, exactly as before.
+    // authored world data), so it's built into a one-off RenderItem
+    // fresh every frame below (M17), rather than living in Scene.
 
     // M10.6 tint/scale constants - purely a visualization choice
     // (distinguishing "highlighted" from "neutral" by eye), not a
@@ -512,15 +512,6 @@ int main()
 
     const ARDemo::DemoMeshIds meshIds{pyramidMeshId, floorMeshId};
 
-    // The pose marker (outside Scene - see the boundary note below)
-    // still draws its mesh directly via DrawOpenXRViewObject, same
-    // shape M10.5 used for the old procedural cube - resolved through
-    // the context rather than a locally-named unique_ptr, since the
-    // pyramid's VulkanMesh is now owned by context, not by this
-    // function directly.
-    const VulkanMesh* poseMarkerMesh = context.GetMesh(Rendering::MeshHandle{pyramidMeshId.id});
-    AR_ASSERT_MSG(poseMarkerMesh != nullptr, "pyramidMeshId must resolve - it was just created above");
-
     // M14: two real PNG files, loaded through AssetManager, decoded to
     // RGBA8, and uploaded exactly once each via the context - replacing
     // M13's in-memory generated checkerboards. See docs/ARCHITECTURE.md,
@@ -701,7 +692,7 @@ int main()
                 // material as assigned in PopulateDemoScene, or this
                 // object would silently stop rendering (its MaterialId
                 // would default to invalid and resolve to VK_NULL_HANDLE,
-                // which DrawPlannedInstances skips without error). Caught
+                // which SubmitRenderItems skips without error). Caught
                 // during M13 design review - see docs/ARCHITECTURE.md,
                 // "M13 - Material Field Placement".
                 scene.SetRenderable(sceneEntities.referenceCube, Scene::Renderable{
@@ -715,6 +706,10 @@ int main()
             }
 
             const std::vector<Scene::RenderableInstance> renderables = scene.ExtractRenderables();
+            // Built once per frame, outside the per-eye loop below - a
+            // RenderItem is view-independent (world-space model matrix
+            // only), so there is no need to rebuild the scene per eye.
+            const std::vector<Rendering::RenderItem> renderItems = ARDemo::BuildRenderItems(renderables);
             std::vector<Math::Mat4> viewProjections;
             viewProjections.reserve(views.size());
             for (const Frame::ViewInfo& viewInfo : views)
@@ -722,7 +717,6 @@ int main()
                 viewProjections.push_back(
                     ApplyVulkanYFlip(viewInfo.projection) * Math::ViewMatrixFromPoseRH(viewInfo.position, viewInfo.orientation));
             }
-            const std::vector<ARDemo::PlannedDraw> plan = ARDemo::BuildDrawPlan(renderables, viewProjections);
 
             if (projectionLayer.Prepare(frameDriver.GetLastLocatedXrViews()) && views.size() == swapchains.size())
             {
@@ -744,62 +738,53 @@ int main()
                     CheckXrResult(instance.Get(), xrWaitSwapchainImage(swapchains[i]->Get(), &waitInfo), "xrWaitSwapchainImage");
                 }
 
-                // Pipeline + descriptor set bound once, before the first
-                // view's render pass - shared across every view/object
-                // this frame (Vulkan spec: bound state persists across
+                // Pipeline bound once, before the first view's render
+                // pass - shared across every view/item this frame
+                // (Vulkan spec: bound state persists across
                 // vkCmdEndRenderPass -> vkCmdBeginRenderPass within one
-                // command buffer). Per-object mesh binding happens
-                // inside DrawOpenXRViewObject instead - see
-                // OpenXRVulkanViewTarget.hpp.
-                // M13: pipeline bound once per frame (shared by every
-                // material), but the descriptor set is NOT bound here
-                // anymore - DrawPlannedInstances binds the correct
-                // material's descriptor set per draw now that different
-                // renderables can use different materials.
+                // command buffer). The descriptor set is NOT bound here
+                // - SubmitRenderItems binds the correct material's
+                // descriptor set per item, since different renderables
+                // can use different materials (M13).
                 vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.Get());
 
-                // M12: per-view draw loop - scene renderables come from
-                // the plan already built above (once per frame, sliced
-                // per view here since BuildDrawPlan produces its output
-                // grouped [view][renderable], contiguous per view - see
-                // RenderDrawPlanning.hpp/tests). The pose marker (never
-                // part of Scene/extraction - see the boundary note near
-                // PopulateDemoScene's call above) is still drawn
-                // directly via DrawOpenXRViewObject - M13: since the
-                // pipeline-wide upfront descriptor-set bind is gone, the
-                // pose marker now binds one of the two demo materials
-                // explicitly right before its own draw (a demo-only
-                // convenience reusing an existing material, not a
-                // material system of its own for the pose marker).
+                // M17: per-view draw loop - scene render items come
+                // from the list already built above (once per frame,
+                // view-independent - see BuildRenderItems.hpp/tests).
+                // The pose marker (never part of Scene/extraction - see
+                // the boundary note near PopulateDemoScene's call
+                // above) is converted into a one-off RenderItem fresh
+                // each frame and submitted through the SAME
+                // SubmitRenderItems path as the main scene - no more
+                // hand-rolled descriptor-set bind or direct
+                // DrawOpenXRViewObject call for it. Deliberate trade
+                // documented in docs/ARCHITECTURE.md: its mesh/material
+                // are now resolved fresh on every draw (via the same
+                // context lookups every other renderable already goes
+                // through) instead of once at setup, and an unresolved
+                // handle would now be silently skipped rather than
+                // trip the old setup-time fail-fast assert - matching
+                // every other renderable's treatment instead of a
+                // special case.
                 for (std::size_t i = 0; i < views.size(); ++i)
                 {
                     BeginOpenXRViewRenderPass(commandBuffer, renderPass.Get(), *viewTargets[i], acquiredIndices[i],
                                                kEyeClearColors[i % kEyeClearColors.size()]);
 
-                    const std::span<const ARDemo::PlannedDraw> viewPlan(
-                        plan.data() + i * renderables.size(), renderables.size());
-                    ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), context, viewPlan);
-                    diag.objectsRendered += viewPlan.size();
-                    diag.drawCalls += viewPlan.size();
+                    SubmitRenderItems(commandBuffer, pipeline.GetLayout(), context, viewProjections[i], renderItems);
+                    diag.objectsRendered += renderItems.size();
+                    diag.drawCalls += renderItems.size();
 
                     if (interactionState.poseMarkerVisible)
                     {
-                        // Resolved through the context, not a
-                        // locally-named descriptor set variable - M14
-                        // moved descriptor-set creation into
-                        // PopulateDemoMaterials, so this is the only way
-                        // demo code can still reach "the red material"
-                        // directly, matching M13's own "demo-only
-                        // convenience, not a material system of its own
-                        // for the pose marker" boundary.
-                        const VkDescriptorSet poseMarkerDescriptorSet = context.GetMaterial(Rendering::MaterialHandle{materialIds.redChecker.id});
-                        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
-                            0, 1, &poseMarkerDescriptorSet, 0, nullptr);
                         const Scene::Transform poseMarkerTransform{
                             interactionState.poseMarkerPosition, interactionState.poseMarkerOrientation,
                             Math::Vec3(0.15f, 0.15f, 0.15f)};
-                        const Math::Mat4 poseMarkerMvp = viewProjections[i] * poseMarkerTransform.ToMatrix();
-                        DrawOpenXRViewObject(commandBuffer, pipeline.GetLayout(), *poseMarkerMesh, poseMarkerMvp, kPoseMarkerTint);
+                        const Rendering::RenderItem poseMarkerItem{
+                            Rendering::MeshHandle{pyramidMeshId.id}, Rendering::MaterialHandle{materialIds.redChecker.id},
+                            poseMarkerTransform.ToMatrix(), kPoseMarkerTint};
+                        SubmitRenderItems(commandBuffer, pipeline.GetLayout(), context, viewProjections[i],
+                                           std::span(&poseMarkerItem, 1));
                         ++diag.objectsRendered;
                         ++diag.drawCalls;
                     }
@@ -844,8 +829,8 @@ int main()
             {
                 if (renderedThisFrame)
                 {
-                    const std::size_t visibleObjectCount = renderables.size() + (interactionState.poseMarkerVisible ? 1 : 0);
-                    const std::size_t totalDrawCalls = plan.size() + (interactionState.poseMarkerVisible ? views.size() : 0);
+                    const std::size_t visibleObjectCount = renderItems.size() + (interactionState.poseMarkerVisible ? 1 : 0);
+                    const std::size_t totalDrawCalls = renderItems.size() * views.size() + (interactionState.poseMarkerVisible ? views.size() : 0);
                     AR_LOG_INFO(std::format("  Rendered {} view(s) x {} visible object(s) = {} draw(s) this frame "
                                              "(highlight={}, scale={:.2f}, moveOffset=({:.2f},{:.2f}), poseMarkerVisible={})",
                                              views.size(), visibleObjectCount, totalDrawCalls,
@@ -944,8 +929,7 @@ int main()
     // (trivial) -> viewTargets (each destroys its own depth image +
     // framebuffers) -> moveOffsetCubeBasePosition/sceneEntities/scene/
     // materialIds (all trivial - Scene::Scene owns no GPU/OpenXR handle)
-    // -> poseMarkerMesh (trivial, non-owning raw pointer) -> meshIds/
-    // floorMeshId/pyramidMeshId (trivial) -> context (destroys, in its
+    // -> meshIds/floorMeshId/pyramidMeshId (trivial) -> context (destroys, in its
     // own internal member order: its material descriptor-set map
     // (trivial) -> its descriptor pool, freeing every descriptor set
     // implicitly -> its shared sampler -> its owned pyramid/floor

@@ -10390,3 +10390,211 @@ editor tooling, and any `Runtime`/`Scene` integration for the real
 Vulkan path (M4's `RenderDevice` stays exactly as dormant as it was
 before this milestone) - none of this was in scope, and none of it is
 needed by anything built so far.
+
+## M17 - Scene Render Submission Foundation
+
+### Goal
+
+Promote the final draw-execution step out of `tests/`-leaf demo helpers
+(`BuildDrawPlan`/`RenderDrawPlanning`, `DrawPlannedInstances`) into a
+reusable `engine/rendering`-owned submission path, so `Scene ->
+ExtractRenderables() -> resolved GPU draws` is genuinely shared between
+the desktop and XR demos rather than duplicated call-for-call. Not a
+full renderer: no render graph, no batching, no culling, no sorting, no
+pipeline variants.
+
+### Audit findings
+
+The full flow was duplicated **verbatim** in both
+`tests/scene_render_demo.cpp` and `tests/xr_demo.cpp`:
+`scene.ExtractRenderables()` -> per-view `ApplyVulkanYFlip(projection) *
+view` -> `BuildDrawPlan(renderables, viewProjections)` (view-outer loop,
+pre-baking `mvp = viewProjections[view] * worldTransform` into a
+`PlannedDraw` per (view, renderable) pair) -> `DrawPlannedInstances`
+(resolve material -> skip if `VK_NULL_HANDLE`; resolve mesh -> skip if
+`nullptr`; bind descriptor set; bind mesh; push `MvpPushConstants`;
+draw). `xr_demo.cpp` additionally sliced the flat plan per eye. A
+repo-wide search confirmed **nothing else consumed `PlannedDraw`** -
+free to delete outright.
+
+The XR pose marker bypassed both steps entirely: it built its own MVP
+inline (the same `viewProjection * worldMatrix` shape), manually bound
+a descriptor set via `context.GetMaterial(MaterialHandle{materialIds.redChecker.id})`,
+and called `DrawOpenXRViewObject` directly - its mesh was resolved once
+at setup time into a raw `const VulkanMesh*` and reused every frame.
+`OpenXRVulkanViewTarget.hpp` transitively includes OpenXR headers (via
+`OpenXRSwapchain.hpp`), so it can never be shared with the Vulkan-only
+desktop demo - render-pass begin/end stays presentation-specific by
+necessity, not by choice. `Frame::ViewInfo{position, orientation,
+projection}` stores a pose, not a view matrix; `ApplyVulkanYFlip`
+operates only on a projection matrix (confirmed at every call site);
+`Math::ViewMatrixFromPoseRH` is the existing, proven pose-to-view-matrix
+helper - all reused unchanged. M4's `DrawCommand` was re-confirmed to
+have no material identity, no per-instance transform, no tint, and
+still exactly one production call site (`Runtime.cpp`'s own
+explicitly-"TEMPORARY (M4 validation only)" loop) - left exactly as
+dormant as M16 found it.
+
+### The design: unexpanded `RenderItem` + per-view submission calls
+
+`RenderItem` (`engine/rendering/include/AREngine/Rendering/RenderItem.hpp`,
+new, public): `{MeshHandle mesh; MaterialHandle material; Mat4 model;
+Vec4 tint;}` - backend-neutral, zero Scene/Vulkan/OpenXR type. Stores
+the **world-space** model matrix, not a pre-baked per-view MVP - one
+`RenderItem` exists per renderable regardless of view count. This
+deliberately breaks from `PlannedDraw`'s pre-expansion shape: since a
+per-item 4x4 multiply at draw time is trivially cheap next to the
+Vulkan calls already happening per item, pre-expansion bought nothing
+but duplicated world data across views (directly answering the
+milestone's own "prefer the representation that keeps world data
+duplicated least" steer).
+
+`SubmitRenderItems` (`engine/rendering/src/vulkan/VulkanRenderItemSubmission.hpp/.cpp`,
+new, private, Vulkan-gated) - a free function, not a class, matching
+`VulkanClipSpace.hpp`'s own "noun-phrase file, one free function
+inside" shape:
+```cpp
+void SubmitRenderItems(
+    VkCommandBuffer commandBuffer, VkPipelineLayout pipelineLayout,
+    const VulkanRenderResourceContext& context,
+    const Core::Math::Mat4& viewProjection, std::span<const RenderItem> items);
+```
+Named for what it actually handles - deliberately **not** "...Scene...":
+"Scene" appears nowhere as an identifier under
+`engine/rendering/src/vulkan/` today, and this function has zero
+knowledge of Scene. Takes exactly **one** already-combined view matrix
+and one item span; the caller invokes it once per view (desktop: once;
+XR: once per eye, inside its existing `BeginOpenXRViewRenderPass`/
+`EndOpenXRViewRenderPass` pair). Per item: resolve material via
+`context.GetMaterial` (skip if unresolved); resolve mesh via
+`context.GetMesh` (skip if unresolved); bind descriptor set; bind mesh;
+compute `mvp = viewProjection * item.model` on the fly; push
+`MvpPushConstants`; draw. This directly replaces `DrawPlannedInstances`
+- the actual "promoted into Rendering" piece M16 didn't cover (M16
+promoted resource *ownership*; this promotes draw *execution*). "N
+items x M views = N x M draws" now falls out of the caller calling this
+function M times - there is no expansion data structure left to test in
+isolation.
+
+`BuildRenderItems` (`tests/BuildRenderItems.hpp/.cpp`, new, replaces
+`RenderDrawPlanning.hpp/.cpp`) - the Scene <-> Rendering integration
+conversion layer, pure and Vulkan-free:
+```cpp
+std::vector<Rendering::RenderItem> BuildRenderItems(std::span<const Scene::RenderableInstance> renderables);
+```
+Per renderable: `RenderItem{MeshHandle{r.mesh.id}, MaterialHandle{r.material.id},
+r.worldTransform, r.tint}` - the same trivial one-line `.id` wrap
+idiom already live twice in `PopulateDemoMeshes.cpp`/
+`PopulateDemoMaterials.cpp` (forward direction) and twice more in
+`xr_demo.cpp` (reverse direction, for the pose marker) before this
+milestone - not a novel conversion, just relocated into one shared,
+tested function. This is the **only** place `Scene::MeshId`/`MaterialId`
+and `Rendering::MeshHandle`/`MaterialHandle` are ever both mentioned -
+`Rendering` itself never references Scene, preserving the M16 boundary
+exactly (see `AGENTS.md` rule 33).
+
+### Desktop and XR migration
+
+`scene_render_demo.cpp`'s per-frame body collapsed to: compute
+`viewProjection` (unchanged one-liner) -> `ExtractRenderables()` ->
+`BuildRenderItems(renderables)` -> one `SubmitRenderItems(...)` call -
+no per-view loop needed (one view).
+
+`xr_demo.cpp` calls `BuildRenderItems` **once**, outside the per-eye
+loop (items are view-independent - no scene rebuild per eye). Inside
+the existing per-eye loop: `BeginOpenXRViewRenderPass` ->
+`SubmitRenderItems(..., viewProjections[i], renderItems)` -> if
+`poseMarkerVisible`, build one `RenderItem` fresh from
+`interactionState` this frame and submit it via a second
+`SubmitRenderItems` call with a one-element span ->
+`EndOpenXRViewRenderPass`. This removed the setup-time `poseMarkerMesh`
+lookup, the manual descriptor-set bind, and the direct
+`DrawOpenXRViewObject` call for the marker entirely - it now goes
+through the identical path as the main scene (the milestone's
+explicitly-preferred option). **Deliberate, documented behavior
+change**: the old setup-time `AR_ASSERT_MSG(poseMarkerMesh != nullptr,
+...)` fail-fast is gone, replaced by `SubmitRenderItems`'s standing
+skip-on-unresolved posture - consistency with every other renderable's
+treatment, traded for a now-redundant safety check.
+`OpenXRVulkanViewTarget.hpp/.cpp` and `DrawOpenXRViewObject` stay
+completely untouched (still used by the frozen `openxr_cube_demo.cpp`
+M9G baseline).
+
+### Deleted
+
+`tests/RenderDrawPlanning.hpp/.cpp`, `tests/render_draw_planning_tests.cpp`,
+`tests/DrawPlannedInstances.hpp/.cpp` - fully superseded.
+
+### Tests
+
+New pure-test target `arengine_build_render_items_tests`
+(`tests/build_render_items_tests.cpp` + `tests/BuildRenderItems.cpp`,
+links `AREngine::Core AREngine::Scene AREngine::Rendering` - a new but
+inbound-only edge that doesn't touch `Rendering`'s own dependency
+graph): conversion preserves model/tint/mesh-handle/material-handle
+from a synthetic `RenderableInstance`; a changed `worldTransform`
+between two calls produces a different `RenderItem::model` (no stale
+submission data); the source `RenderableInstance` is never mutated;
+multiple renderables convert independently, in order; zero renderables
+produce zero items. "No `ViewInfo` needed" is satisfied by the
+function's own signature (no view parameter at all) - noted in the
+file's header comment rather than a vacuous runtime test.
+"Unresolved mesh/material skipped" and "view multiplication" both
+require a real `VulkanRenderResourceContext`/caller loop respectively -
+neither is an isolable pure-logic unit under this design, verified
+manually via the demos' own existing draw-count diagnostics instead,
+exactly how M12-M16 already verify "renderables x views = draws".
+
+### Validation
+
+Full build matrix (all 4 `OPENXR`x`VULKAN` combinations, Debug and
+Release), zero compiler warnings, `ctest` green (19/17/14/13 -
+`RenderDrawPlanningTests` retired, `BuildRenderItemsTests` added in its
+place, net unchanged counts).
+
+`arengine_scene_render_demo`: screenshot visually identical to M16's
+baseline (4 pyramids + floor, correct red/blue materials). Log: `5
+renderable(s) extracted, 5 render item(s) built, 1 view, 5 draw(s)
+expected`.
+
+`arengine_xr_demo` (against SteamVR): 1000/1000 frames attempted,
+`objects rendered=10, draw calls=10` (1 rendered frame x 2 eyes x 5
+items this run - pose marker not visible, consistent with no active
+input on SteamVR's null driver). Full clean teardown trace confirmed
+line-for-line against the updated destruction-order comment:
+`viewTargets -> context -> assetManager -> commandPool -> ... ->
+instance` last. Only the already-documented `BlankEyeBuffer`/
+`VUID-vkDestroyDevice-device-05137` SteamVR-internal noise present -
+zero new AREngine-attributable errors.
+
+### Dependency graph (final)
+
+`Assets -> Core` only. `Scene -> Core` only. `Rendering`'s public
+headers (`include/`, now including `RenderItem.hpp`) -> `Core` only -
+zero Scene, zero OpenXR, zero new exposure. `Rendering`'s private
+Vulkan implementation (`src/`, now including
+`VulkanRenderItemSubmission`) -> `Core`, `Assets` (private, unchanged
+from M16), `Vulkan::Vulkan`, `Platform` - zero Scene, zero OpenXR. The
+only `Scene <-> Rendering` crossing point is `tests/BuildRenderItems.cpp`
+- unchanged in kind from `RenderDrawPlanning.cpp`'s own role before
+this milestone, just relocated to build `RenderItem` instead of
+`PlannedDraw`.
+
+### Roadmap numbering note
+
+`docs/ROADMAP.md` already had "M17" assigned to a `Physics`
+placeholder (from this session's own M16-approval renumbering of the
+deprioritized future-milestone rows). This milestone is documented here
+under the name given for it; the table-numbering collision is left for
+the user to resolve when giving exact `ROADMAP.md` wording, not
+resolved unilaterally in this section.
+
+### Deferred
+
+A render graph, frame graph, deferred renderer, batching/sorting/queue
+system, frustum/occlusion culling, instancing architecture,
+material/shader graph, pipeline variants, shader parameters beyond
+tint, PBR/lighting, editor rendering (viewport, gizmos, selection), and
+any `Runtime`/`Scene` integration for the real Vulkan path (M4's
+`RenderDevice` stays exactly as dormant as before) - none of this was
+in scope, and none of it is needed by anything built so far.

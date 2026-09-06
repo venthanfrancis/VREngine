@@ -103,19 +103,21 @@ target_link_libraries(arengine_demo_camera_controller_tests PRIVATE AREngine::Co
 target_compile_features(arengine_demo_camera_controller_tests PRIVATE cxx_std_20)
 add_test(NAME DemoCameraControllerTests COMMAND arengine_demo_camera_controller_tests)
 
-# Pure-logic tests for ARDemo::BuildDrawPlan (RenderDrawPlanning.hpp) —
-# M12's "extract once, render against N views" step. Built
-# unconditionally, not gated behind ARENGINE_ENABLE_VULKAN: this file
-# depends only on AREngine::Core/AREngine::Scene, no Vulkan/OpenXR type
-# anywhere. See docs/ARCHITECTURE.md, "M12 - Renderable Scene
-# Integration Foundation".
-add_executable(arengine_render_draw_planning_tests
-    render_draw_planning_tests.cpp
-    RenderDrawPlanning.cpp
+# Pure-logic tests for ARDemo::BuildRenderItems (BuildRenderItems.hpp) —
+# M17's Scene<->Rendering integration conversion step, replacing M12's
+# BuildDrawPlan/RenderDrawPlanning (deleted - nothing else consumed
+# PlannedDraw once SubmitRenderItems took over per-view draw execution).
+# Built unconditionally, not gated behind ARENGINE_ENABLE_VULKAN: this
+# file depends only on AREngine::Core/AREngine::Scene/AREngine::Rendering's
+# public headers, no Vulkan/OpenXR type anywhere. See
+# docs/ARCHITECTURE.md, "M17 - Scene Render Submission Foundation".
+add_executable(arengine_build_render_items_tests
+    build_render_items_tests.cpp
+    BuildRenderItems.cpp
 )
-target_link_libraries(arengine_render_draw_planning_tests PRIVATE AREngine::Core AREngine::Scene)
-target_compile_features(arengine_render_draw_planning_tests PRIVATE cxx_std_20)
-add_test(NAME RenderDrawPlanningTests COMMAND arengine_render_draw_planning_tests)
+target_link_libraries(arengine_build_render_items_tests PRIVATE AREngine::Core AREngine::Scene AREngine::Rendering)
+target_compile_features(arengine_build_render_items_tests PRIVATE cxx_std_20)
+add_test(NAME BuildRenderItemsTests COMMAND arengine_build_render_items_tests)
 
 # Pure-logic tests for VulkanRenderResourceContext's id-minting/caching
 # bookkeeping (engine/rendering/src/HandleAllocators.hpp/.cpp) — M16.
@@ -185,19 +187,20 @@ if(ARENGINE_ENABLE_VULKAN)
 
     # Manual-only, M12: AREngine's first desktop demo driven by real
     # AREngine::Scene::Scene data through Scene::ExtractRenderables ->
-    # ARDemo::BuildDrawPlan -> ARDemo::DrawPlannedInstances, instead of a
-    # hand-rolled per-demo object list. Requires a real Vulkan-capable
-    # GPU/driver and opens a real window. Built by CMake but deliberately
-    # NOT registered with add_test. Run it directly instead. Deliberately
-    # NOT gated behind ARENGINE_ENABLE_OPENXR - proves the desktop half
-    # of "one Scene, two presentation paths" independent of XR. See
-    # docs/ARCHITECTURE.md, "M12 - Renderable Scene Integration
+    # ARDemo::BuildRenderItems -> Rendering::Vulkan::SubmitRenderItems
+    # (M17 - previously ARDemo::BuildDrawPlan -> ARDemo::DrawPlannedInstances),
+    # instead of a hand-rolled per-demo object list. Requires a real
+    # Vulkan-capable GPU/driver and opens a real window. Built by CMake
+    # but deliberately NOT registered with add_test. Run it directly
+    # instead. Deliberately NOT gated behind ARENGINE_ENABLE_OPENXR -
+    # proves the desktop half of "one Scene, two presentation paths"
+    # independent of XR. See docs/ARCHITECTURE.md, "M12 - Renderable
+    # Scene Integration Foundation" and "M17 - Scene Render Submission
     # Foundation".
     add_executable(arengine_scene_render_demo
         scene_render_demo.cpp
         PopulateDemoScene.cpp
-        RenderDrawPlanning.cpp
-        DrawPlannedInstances.cpp
+        BuildRenderItems.cpp
         PopulateDemoMaterials.cpp
         PopulateDemoMeshes.cpp
     )
@@ -390,8 +393,7 @@ if(ARENGINE_ENABLE_OPENXR)
             OpenXRVulkanViewTarget.cpp
             XRInteractionState.cpp
             PopulateDemoScene.cpp
-            RenderDrawPlanning.cpp
-            DrawPlannedInstances.cpp
+            BuildRenderItems.cpp
             PopulateDemoMaterials.cpp
             PopulateDemoMeshes.cpp
         )

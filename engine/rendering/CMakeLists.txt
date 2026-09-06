@@ -21,6 +21,7 @@ target_sources(arengine_rendering
         include/AREngine/Rendering/NullRenderDevice.hpp
         include/AREngine/Rendering/MeshData.hpp
         include/AREngine/Rendering/ProceduralMesh.hpp
+        include/AREngine/Rendering/RenderItem.hpp
         src/HandleAllocators.hpp
 )
 
@@ -55,6 +56,7 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanDepthFormat.cpp
             src/vulkan/VulkanClipSpace.cpp
             src/vulkan/VulkanRenderResourceContext.cpp
+            src/vulkan/VulkanRenderItemSubmission.cpp
             src/vulkan/VulkanVersion.hpp
             src/vulkan/VulkanResult.hpp
             src/vulkan/VulkanPhysicalDevice.hpp
@@ -84,6 +86,7 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanClipSpace.hpp
             src/vulkan/VulkanPushConstants.hpp
             src/vulkan/VulkanRenderResourceContext.hpp
+            src/vulkan/VulkanRenderItemSubmission.hpp
     )
     target_link_libraries(arengine_rendering PRIVATE Vulkan::Vulkan AREngine::Platform)
 
