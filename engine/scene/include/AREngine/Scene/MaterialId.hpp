@@ -12,9 +12,9 @@ namespace AREngine::Scene
     // Vulkan/Rendering type is visible here). Resolving a MaterialId to
     // actual GPU resources (a texture + descriptor set, sharing one
     // engine-wide pipeline) is entirely the caller's responsibility
-    // (e.g. a small demo-owned MaterialRegistry) - see
+    // (e.g. the engine-owned VulkanRenderResourceContext, M16) - see
     // docs/ARCHITECTURE.md, "M13 - Material & Render Resource Binding
-    // Foundation".
+    // Foundation" and "M16 - Render Resource Context Foundation".
     struct MaterialId
     {
         std::uint64_t id = 0;

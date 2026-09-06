@@ -61,8 +61,7 @@
 #include "AREngine/Rendering/ProceduralMesh.hpp"
 #include "AREngine/Scene/Scene.hpp"
 
-#include "MeshCache.hpp"
-#include "MeshRegistry.hpp"
+#include "DrawPlannedInstances.hpp"
 #include "PopulateDemoMaterials.hpp"
 #include "PopulateDemoMeshes.hpp"
 #include "OpenXRVulkanViewTarget.hpp"
@@ -88,13 +87,12 @@
 #include "vulkan/VulkanClipSpace.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDepthFormat.hpp"
-#include "vulkan/VulkanDescriptorPool.hpp"
 #include "vulkan/VulkanDescriptorSetLayout.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanMesh.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
-#include "vulkan/VulkanSampler.hpp"
+#include "vulkan/VulkanRenderResourceContext.hpp"
 
 #include <array>
 #include <chrono>
@@ -491,62 +489,48 @@ int main()
     NameVulkanObject(bindingData.instance, bindingData.device, VK_OBJECT_TYPE_COMMAND_POOL,
         reinterpret_cast<std::uint64_t>(commandPool.Get()), "AREngine.xr_demo.commandPool");
 
-    // M15: AssetManager + MeshCache must exist before any asset-backed
-    // mesh can be uploaded - restructured from M10.5/M14's original
-    // ordering (which uploaded every mesh, all procedural, before
-    // AssetManager even existed) to support the file-backed pyramid
-    // mesh below. See docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh
-    // Loading Foundation".
+    // M16: AssetManager + one VulkanRenderResourceContext must exist
+    // before any mesh/texture can be created - replaces M15's separate
+    // MeshCache/MeshRegistry/TextureCache/MaterialRegistry/VulkanSampler/
+    // VulkanDescriptorPool (six hand-duplicated objects) with one
+    // engine-owned type. See docs/ARCHITECTURE.md, "M16 - Render
+    // Resource Context Foundation".
     Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
     const TeardownMarker teardownAssetManager("assetManager (trivial - CPU-only content cache, no GPU/OpenXR handle)");
-    ARDemo::MeshCache meshCache;
-    const TeardownMarker teardownMeshCache("meshCache (owns the pyramid mesh's VulkanMesh)");
-    ARDemo::MeshRegistry meshRegistry;
-    const TeardownMarker teardownMeshRegistry("meshRegistry (trivial, no owned handle)");
-    const Scene::MeshId pyramidMeshId = ARDemo::PopulateDemoMeshes(
-        assetManager, meshCache, meshRegistry,
-        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue());
+    VulkanRenderResourceContext context(
+        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
+        descriptorSetLayout.Get(), /*maxMaterials=*/2);
+    const TeardownMarker teardownContext("context (owns the pyramid/floor VulkanMesh objects, the two material VulkanImage textures, the shared sampler, and the descriptor pool)");
+
+    const Scene::MeshId pyramidMeshId = ARDemo::PopulateDemoMeshes(assetManager, context);
 
     // Floor stays fully procedural (M8D/ProceduralMesh) - proves
-    // procedural and asset-backed meshes coexist in one MeshRegistry.
-    auto floorMesh = CreateVulkanMesh(bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue(),
-                                       Rendering::CreateQuadMesh());
-    const TeardownMarker teardownFloorMesh("floorMesh (vertex+index VulkanBuffer)");
-    const Scene::MeshId floorMeshId{2};
-    meshRegistry.Register(floorMeshId, floorMesh.get());
-    AR_LOG_INFO("Uploaded 1 asset-backed mesh (pyramid.obj, via AssetManager+MeshCache) + 1 procedural mesh "
-                "(floor quad) - never re-uploaded per frame");
+    // procedural and asset-backed meshes coexist in one context.
+    const Scene::MeshId floorMeshId{context.CreateProceduralMesh(Rendering::CreateQuadMesh()).id};
+    AR_LOG_INFO(std::format("Uploaded {} GPU mesh resource(s) (1 asset-backed [pyramid.obj] + 1 procedural [floor "
+                             "quad]) - never re-uploaded per frame", context.MeshCount()));
 
     const ARDemo::DemoMeshIds meshIds{pyramidMeshId, floorMeshId};
 
     // The pose marker (outside Scene - see the boundary note below)
     // still draws its mesh directly via DrawOpenXRViewObject, same
     // shape M10.5 used for the old procedural cube - resolved through
-    // meshRegistry rather than a locally-named unique_ptr, since the
-    // pyramid's VulkanMesh is now owned by meshCache, not by this
+    // the context rather than a locally-named unique_ptr, since the
+    // pyramid's VulkanMesh is now owned by context, not by this
     // function directly.
-    const VulkanMesh* poseMarkerMesh = meshRegistry.Resolve(pyramidMeshId);
-    AR_ASSERT_MSG(poseMarkerMesh != nullptr, "pyramidMeshId must resolve - it was just registered above");
+    const VulkanMesh* poseMarkerMesh = context.GetMesh(Rendering::MeshHandle{pyramidMeshId.id});
+    AR_ASSERT_MSG(poseMarkerMesh != nullptr, "pyramidMeshId must resolve - it was just created above");
 
     // M14: two real PNG files, loaded through AssetManager, decoded to
-    // RGBA8, and uploaded exactly once each via TextureCache - replacing
+    // RGBA8, and uploaded exactly once each via the context - replacing
     // M13's in-memory generated checkerboards. See docs/ARCHITECTURE.md,
     // "M14 - Asset-Backed Texture & Material Loading Foundation" (and
     // "M13 - Material & Render Resource Binding Foundation" for the
     // single-pipeline/multiple-descriptor-set invariant this still
     // relies on, unchanged).
-    ARDemo::TextureCache textureCache;
-    const TeardownMarker teardownTextureCache("textureCache (owns redTexture/blueTexture's VulkanImage objects)");
-    VulkanSampler sampler(bindingData.device); // one sampler, shared by every material
-    const TeardownMarker teardownSampler("sampler (vkDestroySampler)");
-
-    VulkanDescriptorPool descriptorPool(bindingData.device, /*maxSets=*/2);
-    const TeardownMarker teardownDescriptorPool("descriptorPool (vkDestroyDescriptorPool, frees both descriptorSets implicitly)");
-    ARDemo::MaterialRegistry materialRegistry;
-    const TeardownMarker teardownMaterialRegistry("materialRegistry (trivial, no owned handle)");
-    const ARDemo::DemoMaterialIds materialIds = ARDemo::PopulateDemoMaterials(
-        assetManager, textureCache, descriptorSetLayout, descriptorPool, sampler, materialRegistry,
-        bindingData.physicalDevice, bindingData.device, commandPool.Get(), binding.GetQueue());
+    const ARDemo::DemoMaterialIds materialIds = ARDemo::PopulateDemoMaterials(assetManager, context);
+    AR_LOG_INFO(std::format("Created {} GPU texture resource(s), {} material(s)",
+                             context.TextureCount(), context.MaterialCount()));
 
     AR_ASSERT_MSG(binding.GetPhysicalDeviceProperties().limits.maxPushConstantsSize >= sizeof(MvpPushConstants),
         "Device's maxPushConstantsSize is smaller than MvpPushConstants - should be spec-impossible (guaranteed >= 128 bytes)");
@@ -794,13 +778,13 @@ int main()
 
                     const std::span<const ARDemo::PlannedDraw> viewPlan(
                         plan.data() + i * renderables.size(), renderables.size());
-                    ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, materialRegistry, viewPlan);
+                    ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), context, viewPlan);
                     diag.objectsRendered += viewPlan.size();
                     diag.drawCalls += viewPlan.size();
 
                     if (interactionState.poseMarkerVisible)
                     {
-                        // Resolved through materialRegistry, not a
+                        // Resolved through the context, not a
                         // locally-named descriptor set variable - M14
                         // moved descriptor-set creation into
                         // PopulateDemoMaterials, so this is the only way
@@ -808,7 +792,7 @@ int main()
                         // directly, matching M13's own "demo-only
                         // convenience, not a material system of its own
                         // for the pose marker" boundary.
-                        const VkDescriptorSet poseMarkerDescriptorSet = materialRegistry.Resolve(materialIds.redChecker);
+                        const VkDescriptorSet poseMarkerDescriptorSet = context.GetMaterial(Rendering::MaterialHandle{materialIds.redChecker.id});
                         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.GetLayout(),
                             0, 1, &poseMarkerDescriptorSet, 0, nullptr);
                         const Scene::Transform poseMarkerTransform{
@@ -960,25 +944,24 @@ int main()
     // (trivial) -> viewTargets (each destroys its own depth image +
     // framebuffers) -> moveOffsetCubeBasePosition/sceneEntities/scene/
     // materialIds (all trivial - Scene::Scene owns no GPU/OpenXR handle)
-    // -> materialRegistry (trivial, no owned handle) -> descriptorPool
-    // (frees both descriptor sets implicitly) -> sampler -> textureCache
-    // (destroys its owned redTexture/blueTexture VulkanImage objects) ->
-    // poseMarkerMesh (trivial, non-owning raw pointer) -> meshIds/
-    // floorMeshId (trivial) -> floorMesh (vertex+index VulkanBuffer) ->
-    // pyramidMeshId (trivial) -> meshRegistry (trivial, no owned handle
-    // - only non-owning pointers) -> meshCache (destroys its owned
-    // pyramid VulkanMesh - see "M15 - Asset-Backed Mesh Loading
-    // Foundation") -> assetManager (trivial - CPU-only content cache) ->
-    // commandPool (frees commandBuffer implicitly) -> pipeline ->
-    // descriptorSetLayout -> renderPass -> projectionLayer (trivial) ->
-    // swapchains (each xrDestroySwapchain, and its own cached AREngine-
-    // owned VkImageViews first) -> actionSystem (destroys both aim_pose
-    // action spaces, then all four actions, then the action set itself -
-    // all while `session` is still alive) -> localSpace (xrDestroySpace)
-    // -> session (xrDestroySession) -> binding (VkDevice, then
-    // VkInstance) -> instance (xrDestroyInstance) last. Every GPU/OpenXR
-    // resource this demo owns is destroyed while the handle it depends
-    // on (bindingData.device/session/instance) is still alive, a direct
+    // -> poseMarkerMesh (trivial, non-owning raw pointer) -> meshIds/
+    // floorMeshId/pyramidMeshId (trivial) -> context (destroys, in its
+    // own internal member order: its material descriptor-set map
+    // (trivial) -> its descriptor pool, freeing every descriptor set
+    // implicitly -> its shared sampler -> its owned pyramid/floor
+    // VulkanMesh and red/blue-checker VulkanImage GPU resources - see
+    // "M16 - Render Resource Context Foundation") -> assetManager
+    // (trivial - CPU-only content cache) -> commandPool (frees
+    // commandBuffer implicitly) -> pipeline -> descriptorSetLayout ->
+    // renderPass -> projectionLayer (trivial) -> swapchains (each
+    // xrDestroySwapchain, and its own cached AREngine-owned VkImageViews
+    // first) -> actionSystem (destroys both aim_pose action spaces, then
+    // all four actions, then the action set itself - all while `session`
+    // is still alive) -> localSpace (xrDestroySpace) -> session
+    // (xrDestroySession) -> binding (VkDevice, then VkInstance) ->
+    // instance (xrDestroyInstance) last. Every GPU/OpenXR resource this
+    // demo owns is destroyed while the handle it depends on
+    // (bindingData.device/session/instance) is still alive, a direct
     // consequence of declaration order - verified against the actual
     // order above, not assumed.
 }

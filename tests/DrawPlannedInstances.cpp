@@ -1,36 +1,28 @@
-#include "MeshRegistry.hpp"
+#include "DrawPlannedInstances.hpp"
 
+#include "vulkan/VulkanMesh.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
 
 namespace ARDemo
 {
-    void MeshRegistry::Register(AREngine::Scene::MeshId id, const AREngine::Rendering::Vulkan::VulkanMesh* mesh)
-    {
-        m_meshes[id] = mesh;
-    }
-
-    const AREngine::Rendering::Vulkan::VulkanMesh* MeshRegistry::Resolve(AREngine::Scene::MeshId id) const
-    {
-        const auto it = m_meshes.find(id);
-        return it != m_meshes.end() ? it->second : nullptr;
-    }
-
     void DrawPlannedInstances(
         VkCommandBuffer commandBuffer,
         VkPipelineLayout pipelineLayout,
-        const MeshRegistry& meshes,
-        const MaterialRegistry& materials,
+        const AREngine::Rendering::Vulkan::VulkanRenderResourceContext& context,
         std::span<const PlannedDraw> plan)
     {
+        using AREngine::Rendering::MaterialHandle;
+        using AREngine::Rendering::MeshHandle;
+
         for (const PlannedDraw& draw : plan)
         {
-            const VkDescriptorSet descriptorSet = materials.Resolve(draw.material);
+            const VkDescriptorSet descriptorSet = context.GetMaterial(MaterialHandle{draw.material.id});
             if (descriptorSet == VK_NULL_HANDLE)
             {
                 continue; // unresolvable material id - skip, not fatal (same posture as RenderDevice::SubmitDraw)
             }
 
-            const AREngine::Rendering::Vulkan::VulkanMesh* mesh = meshes.Resolve(draw.mesh);
+            const AREngine::Rendering::Vulkan::VulkanMesh* mesh = context.GetMesh(MeshHandle{draw.mesh.id});
             if (mesh == nullptr)
             {
                 continue; // unresolvable mesh id - skip, not fatal (same posture as RenderDevice::SubmitDraw)

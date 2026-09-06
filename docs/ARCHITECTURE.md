@@ -10103,3 +10103,290 @@ node hierarchy/multi-object OBJ import, morph targets, animation clips,
 LOD, an asset database, editor tooling, general axis/winding conversion
 (V-flip convention resolution) - none of this was in scope, and none of
 it is needed by anything built so far.
+
+## M16 - Render Resource Context Foundation
+
+### Goal
+
+Promote the proven M12-M15 render-resource ownership pattern (`AssetId`
+-> cached GPU mesh/texture -> `MeshId`/`MaterialId` -> `Scene::Renderable`)
+out of `tests/`-leaf demo helpers - `MeshCache`, `TextureCache`,
+`MeshRegistry`, `MaterialRegistry`, plus their `VulkanSampler`/
+`VulkanDescriptorPool` companions, six objects hand-duplicated in both
+demos - into one reusable `engine/rendering`-owned type. Deliberately
+not a general resource manager: no asset database, no hot reload, no
+render graph, no streaming, no global singleton.
+
+### Audit findings
+
+Every `MeshId{...}`/`MaterialId{...}` construction anywhere in the
+whole repo, before this milestone, was a hardcoded integer literal
+(`MeshId{1}`, `MaterialId{1}`, `MaterialId{2}`, the floor's `MeshId{2}`)
+- confirmed zero matches for either constructor under `engine/`. There
+was no monotonic-counter mechanism anywhere. `MeshCache`/`TextureCache`
+(M14/M15) were owning caches; `MeshRegistry`/`MaterialRegistry` (M12/M13)
+were non-owning lookup tables that also, incidentally, housed the free
+function `DrawPlannedInstances`. Both demos hand-duplicated
+constructing all six objects, the floor-mesh registration line, and
+`VulkanSampler`/`VulkanDescriptorPool(maxSets=2)` construction -
+`PopulateDemoMeshes`/`PopulateDemoMaterials` already factored out the
+load-cache-register sequence itself.
+
+`engine/rendering`'s public headers expose zero Vulkan types (every
+Vulkan type lives privately under `src/vulkan/`, `PRIVATE`-linked
+inside `if(ARENGINE_ENABLE_VULKAN)`). `VulkanDescriptorPool` has no
+per-set free (whole-pool destruction only); `VulkanSampler` takes no
+config; `VulkanGraphicsPipeline` already has exactly one shared
+instance per demo, constructed first - pipeline ownership was already
+clean and stayed out of scope. M4's `RenderDevice`/`NullRenderDevice`
+was confirmed fully dormant relative to the real Vulkan path - only
+used by `runtime/src/Runtime.cpp`'s placeholder desktop loop (one dummy
+buffer/triangle, no `AssetManager`/`Scene` instantiated at all) and its
+own unit tests; it never touches `VulkanMesh`/`VulkanImage`/the real
+demo path, and no `CreateVulkanRenderDevice()` was ever added.
+**Decision: left exactly as-is** - reviving it into a second backend
+nothing needs would be exactly the speculative abstraction layer this
+milestone forbids. `engine/rendering` <-> `engine/assets` and
+`engine/rendering` <-> `engine/scene` were confirmed to have zero
+dependency in either direction, both directions, both CMakeLists and
+`#include` graphs checked directly.
+
+### The core design tension: Rendering must mint ids Scene can use, without depending on Scene
+
+The milestone's own target diagram has the new context mint
+`MeshId`/`MaterialId` and flow them to `Scene::Renderable`. But those
+are `AREngine::Scene::MeshId`/`MaterialId` - if the new context lives
+in `engine/rendering` and returns them directly, that is a *new*
+`Rendering -> Scene` dependency, directly violating the simultaneously-
+required "Rendering generic API -> no Scene" and "Scene -> Core only"
+invariants. Moving the id types to satisfy one breaks the other,
+whichever module receives them.
+
+**Resolution**: `Scene::MeshId`/`MaterialId` were not moved (too
+invasive - stable types used since M12 across roughly 15 files), and
+Rendering does not reference them. Two new small, generic, backend-
+neutral handle types were added to the *existing*
+`engine/rendering/include/AREngine/Rendering/Handles.hpp` (which
+already held `BufferHandle`/`TextureHandle` in this exact shape):
+`Rendering::MeshHandle{uint64_t id=0; IsValid();}` and
+`Rendering::MaterialHandle` (same shape, each with a `std::hash`
+specialization, mirroring `MeshId.hpp`/`MaterialId.hpp` - `Handles.hpp`
+didn't need this before since `BufferHandle`/`TextureHandle` are never
+map keys). The new Vulkan context mints/returns *these*, never
+`Scene::MeshId`/`MaterialId` directly. The only place both are ever
+mentioned together is `tests/`-leaf demo-glue code
+(`PopulateDemoMeshes.cpp`, `PopulateDemoMaterials.cpp`,
+`scene_render_demo.cpp`, `xr_demo.cpp`, `DrawPlannedInstances.cpp`),
+which already imports both Scene and Rendering today - a zero-new-
+dependency crossing, via a one-line wrap: `Scene::MeshId{meshHandle.id}`
+(and the inverse, `Rendering::MeshHandle{sceneMeshId.id}`, at draw-time
+lookup). Result: `Rendering -> Scene` and `Scene -> Rendering` both
+stay at zero, exactly as before this milestone.
+
+A second, related decision: the context's `CreateMesh`/`CreateTexture`
+accept `const Assets::MeshAsset&`/`const Assets::TextureAsset&`
+directly, rather than a duplicate Rendering-native struct invented
+solely to avoid a dependency edge. This is a genuine new, one-
+directional `Rendering -> Assets` dependency (`Assets` never depends on
+`Rendering` - no cycle), confined to a `PRIVATE`
+`target_link_libraries(arengine_rendering PRIVATE AREngine::Assets)`
+and to `src/`-only files - `engine/rendering`'s public headers stay
+100% Assets-free. Chosen over the redundant-struct alternative because
+that struct would itself be a mini speculative-abstraction smell, and
+because the milestone's own suggested pseudocode
+(`RegisterMeshAsset(assetId, meshAsset)`) also implies accepting the
+Assets type directly.
+
+### `VulkanRenderResourceContext` (`engine/rendering/src/vulkan/`, new)
+
+Named with the directory's own established convention - every type
+under `src/vulkan/` is prefixed `Vulkan` (`VulkanMesh`, `VulkanImage`,
+`VulkanDescriptorPool`, ...) - and is honestly Vulkan-typed (its
+constructor and `GetMesh`/`GetMaterial` return real Vulkan types), not
+a fake-neutral wrapper:
+
+```cpp
+class VulkanRenderResourceContext {
+public:
+    VulkanRenderResourceContext(
+        VkPhysicalDevice, VkDevice, VkCommandPool, VkQueue,
+        VkDescriptorSetLayout descriptorSetLayout, std::uint32_t maxMaterials);
+
+    MeshHandle CreateMesh(AssetId, const MeshAsset&);       // idempotent per AssetId
+    MeshHandle CreateProceduralMesh(const MeshData&);        // always mints fresh - no AssetId to key by
+    const VulkanMesh* GetMesh(MeshHandle) const;             // nullptr if unknown
+
+    void CreateTexture(AssetId, const TextureAsset&);        // idempotent per AssetId; texture identity stays internal
+    MaterialHandle CreateMaterial(AssetId textureAssetId);   // NOT idempotent - asserts if CreateTexture wasn't called first
+    VkDescriptorSet GetMaterial(MaterialHandle) const;       // VK_NULL_HANDLE if unknown
+
+    std::size_t MeshCount() const; std::size_t TextureCount() const; std::size_t MaterialCount() const; // diagnostics only
+};
+```
+
+**Ownership decisions**, each the narrowest clean option: the shared
+**sampler** is owned internally with zero external config (nothing
+else ever needed direct access - `sampler.Get()` was only ever passed
+into descriptor-write calls). The **descriptor pool** is owned
+internally too (it's the only thing allocating from it), but its
+*capacity* (`maxMaterials`) stays an explicit caller-supplied
+constructor parameter, removing the caller's separate
+`VulkanDescriptorPool` object entirely without guessing an internal
+capacity. The **descriptor set layout** stays externally owned (by the
+unchanged pipeline-construction code), passed by value into the
+constructor - pipeline ownership itself is untouched. **Member
+declaration order** was chosen to reproduce the exact reverse-
+destruction sequence already proven validation-clean by the pre-M16
+demos (`materialRegistry -> descriptorPool -> sampler -> textureCache`)
+- i.e. the descriptor pool (and its implicit sets) is destroyed
+*before* the images/meshes those sets reference.
+
+**Idempotency asymmetry** (a real, deliberately-derived design point,
+not an oversight): `CreateMesh` is idempotent per `AssetId` - calling
+it twice with the same asset returns the identical `MeshHandle`, since
+a mesh's logical identity has no reason to diverge from its content.
+`CreateMaterial` is *not* idempotent - each call mints a fresh
+`MaterialHandle`, since the same texture asset must remain usable by
+multiple independent materials (a future per-material state would need
+this; nothing today exercises it, but the shape costs nothing extra).
+`CreateProceduralMesh` (for the floor, which has no `AssetId`) always
+mints fresh too, sharing the *same* monotonic counter as `CreateMesh`
+so asset-backed and procedural handles can never collide.
+
+### `MeshHandleAllocator`/`MaterialHandleAllocator` (`engine/rendering/src/HandleAllocators.hpp/.cpp`, new)
+
+The id-minting/caching bookkeeping, extracted into its own deliberately
+Vulkan-free type specifically so it is unit-testable without a GPU -
+real mesh/texture upload categorically isn't (the same limitation
+`MeshCache`/`TextureCache` always had), but the `AssetId -> handle`
+bookkeeping behind it has no such constraint. Added to
+`arengine_rendering`'s *unconditional* sources (builds and is tested
+under `ARENGINE_ENABLE_VULKAN=OFF` too). Deliberately two small,
+separately-named, ungeneralized classes rather than one templated
+allocator - the two have genuinely different semantics and there are
+only ever two call sites, so a template would be abstraction for its
+own sake.
+
+### Demo-glue simplification
+
+`PopulateDemoMeshes`/`PopulateDemoMaterials` keep their demo-specific
+knowledge (hardcoded content paths) but their signatures collapsed from
+3-7 Vulkan-object parameters down to `(AssetManager&,
+VulkanRenderResourceContext&)` each - `PopulateDemoMaterials` in
+particular dropped `descriptorSetLayout`, `descriptorPool`, and
+`sampler` entirely, since the context now owns all three internally.
+The free function `DrawPlannedInstances` (previously oddly co-located
+inside the now-deleted `MeshRegistry.hpp/.cpp`) moved to its own new
+`tests/DrawPlannedInstances.hpp/.cpp` - deliberately *not* merged into
+`tests/RenderDrawPlanning.hpp/.cpp`, which is Vulkan-free by design
+(built unconditionally for its own pure-logic test target) and had to
+stay that way. It now takes `const VulkanRenderResourceContext&`
+instead of separate `MeshRegistry&`/`MaterialRegistry&`, converting
+`Scene::MeshId`/`MaterialId` into `Rendering::MeshHandle`/
+`MaterialHandle` at the lookup call - otherwise unchanged (skip-not-
+fatal on unresolved ids, same posture as before).
+
+Both `scene_render_demo.cpp`/`xr_demo.cpp` replaced their six-object
+setup block with one `VulkanRenderResourceContext`. The floor became
+`context.CreateProceduralMesh(Rendering::CreateQuadMesh())` directly in
+`main()` - no more separately-owned `floorMesh` unique_ptr.
+`xr_demo.cpp`'s pose marker now resolves via
+`context.GetMesh(MeshHandle{pyramidMeshId.id})`; its `TeardownMarker`s
+and trailing destruction-order comment were updated (one context object
+instead of six) and verified against the actual teardown trace from
+the validation run below.
+
+`tests/MeshRegistry.hpp/.cpp`, `MeshCache.hpp/.cpp`,
+`TextureCache.hpp/.cpp`, `MaterialRegistry.hpp/.cpp`, and
+`material_registry_tests.cpp` (plus its CMake target) were deleted -
+fully superseded. `PopulateDemoScene.hpp/.cpp`, `RenderDrawPlanning.hpp/.cpp`,
+the `VulkanGraphicsPipeline`/`VulkanDescriptorSetLayout` ownership
+split, `RenderDevice`/`NullRenderDevice`, and `runtime/` (no
+Scene/Assets integration exists there yet) were deliberately left
+untouched - demo content and pure-logic planning stay out of `engine/`,
+per the milestone's own "don't move demo content into engine" rule.
+
+### Tests
+
+New unconditional pure-test target `arengine_render_resource_handle_tests`
+(`tests/render_resource_handle_tests.cpp`, links only `AREngine::Core
+AREngine::Assets AREngine::Rendering`, reaches `engine/rendering/src/`
+via the same established `PRIVATE` include-dir pattern
+`arengine_vulkan_tests` already used for other private-Rendering
+internals - no new `.cpp` source needed, since `HandleAllocators.cpp`
+is already compiled into `arengine_rendering` itself): a valid handle
+from `GetOrCreate`/`CreateNew`; the same `AssetId` twice returning an
+identical `MeshHandle`; two distinct `AssetId`s producing two distinct
+handles; `Count()` reflecting distinct-`AssetId` count regardless of
+call count (satisfying "2 AssetIds x 5 entities -> 2 resources");
+`MaterialHandleAllocator::CreateNew()` always fresh with `Count()`
+reflecting call count; `CreateNew()`/`GetOrCreate` never colliding
+across the shared counter; default-constructed handles reporting
+`IsValid()==false`. "Invalid AssetId fails" is already fully covered by
+M15's `AssetManager::LoadMesh`/`LoadTexture` failure-path tests - the
+context itself assumes a caller-validated `AssetId`, matching
+`AssetManager::GetText/GetTexture/GetMesh`'s existing assert-on-
+unknown-id philosophy, so it wasn't independently retested.
+`GetMesh`/`GetMaterial`'s null-on-unknown-handle behavior is an
+unchanged one-line fallback (identical in shape to the old `Resolve`
+methods, which also had no dedicated pure test) - verified manually
+through the demos only, same posture `MeshCache`/`TextureCache`
+already established.
+
+### Validation
+
+Full build matrix (all 4 `OPENXR`x`VULKAN` combinations, Debug and
+Release), zero compiler warnings, `ctest` green (19/17/14/13 - one more
+than M15's 19/16/14/12 baseline in the two non-Vulkan-only
+combinations, since `RenderResourceHandleTests` now runs there too;
+`MaterialRegistryTests` was retired alongside `MaterialRegistry` itself).
+
+`arengine_scene_render_demo`: `Uploaded 2 GPU mesh resource(s) (1
+asset-backed [pyramid.obj] + 1 procedural [floor quad])`, `Created 2
+GPU texture resource(s), 2 material(s)`, `Scene: 5 entities..., 2
+meshes, 2 materials`, `Frame 1: 5 renderable(s) extracted, 1 view(s), 5
+planned draw(s)`. A full-screen screenshot captured while running is
+visually identical to M15's own baseline - all 4 pyramids fully
+visible, correct red/blue checkerboard materials - now rendered
+entirely through the one `VulkanRenderResourceContext`.
+
+`arengine_xr_demo` (against SteamVR, freshly restarted via `vrstartup.exe`
+for this run): 1000/1000 frames attempted, `frames rendered=1` this
+particular run (SteamVR's null driver again exposing
+`shouldRender=true` on only a handful of frames - run-to-run variance
+in exactly how many, already documented as an environment limitation
+since M9H, not a regression), `objects rendered=10, draw calls=10`
+(1 rendered frame x 2 eyes x 5 renderables - confirms the context
+resolved the pyramid mesh and both materials correctly). Full clean
+teardown trace confirmed line-for-line against the updated destruction-
+order comment: `viewTargets -> context (destroys the pyramid/floor
+VulkanMesh objects, the two material VulkanImage textures, the shared
+sampler, and the descriptor pool) -> assetManager -> commandPool -> ...
+-> instance` last. Only the already-documented `BlankEyeBuffer`/
+`VUID-vkDestroyDevice-device-05137` SteamVR-internal noise present -
+zero new AREngine-attributable errors.
+
+### Dependency graph (final)
+
+`Assets -> Core` only (unchanged). `Scene -> Core` only (unchanged).
+`Rendering`'s public headers (`include/`) -> `Core` only (unchanged -
+still zero Vulkan/Assets/Scene exposure). `Rendering`'s private Vulkan
+implementation (`src/`) -> `Core`, `Assets` (new, `PRIVATE`, one-
+directional, no cycle), `Vulkan::Vulkan`, `Platform` (both `PRIVATE`,
+unchanged). No `Rendering -> Scene` or `Scene -> Rendering` edge exists
+anywhere - the `MeshHandle`/`MaterialHandle` <-> `Scene::MeshId`/
+`MaterialId` conversion happens only in `tests/`-leaf code that already
+depended on both modules.
+
+### Deferred
+
+A general resource manager, handle-pool framework, reference-counted
+universal resource system, asset dependency/lifetime graph, global or
+cross-device GPU cache, asset database (GUIDs, sidecars, cooked cache,
+import metadata), hot reload/file watchers, memory budgeting/eviction/
+streaming, pipeline variants/shader parameters/PBR/transparency, glTF/
+FBX or any model-format expansion beyond M15's narrow OBJ subset,
+editor tooling, and any `Runtime`/`Scene` integration for the real
+Vulkan path (M4's `RenderDevice` stays exactly as dormant as it was
+before this milestone) - none of this was in scope, and none of it is
+needed by anything built so far.

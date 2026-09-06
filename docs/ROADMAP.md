@@ -58,11 +58,12 @@ all come after that chain is proven.
 | M13 | **Material & Render Resource Binding Foundation: COMPLETE.** Backend-neutral `MaterialId` added alongside `MeshId`, resolved outside Scene by a demo-owned `MaterialRegistry`, with one shared Vulkan pipeline serving multiple materials. See the M13 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M13 - Material & Render Resource Binding Foundation". |
 | M14 | **Asset-Backed Texture & Material Loading Foundation: COMPLETE.** Real PNG files, loaded through `AssetManager` and decoded via a privately-isolated stb_image, become GPU textures deduplicated by `AssetId` through a render-side `TextureCache`, referenced by `MaterialId` exactly like M13's generated textures were. See the M14 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M14 - Asset-Backed Texture & Material Loading Foundation". |
 | M15 | **Asset-Backed Mesh Loading Foundation: COMPLETE.** Real OBJ mesh files, loaded through `AssetManager` and decoded via a privately-isolated tinyobjloader, become GPU meshes deduplicated by `AssetId` through a render-side `MeshCache`, referenced by `MeshId` exactly like M12's procedural meshes were. See the M15 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M15 - Asset-Backed Mesh Loading Foundation". |
-| M16 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
-| M17 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
-| M18 | `Editor` skeleton | Deprioritized | After the core chain is proven |
-| M19 | Android/Linux `Platform` backend | Later | When actually needed |
-| M20 | Custom AR hardware bring-up | Long-term | The project's ultimate goal |
+| M16 | **Render Resource Context Foundation: COMPLETE.** The proven M12-M15 render-resource ownership pattern promoted out of demo-local `MeshCache`/`TextureCache`/`MeshRegistry`/`MaterialRegistry` into one reusable `VulkanRenderResourceContext`, minting backend-neutral `MeshHandle`/`MaterialHandle` identities (kept distinct from `Scene::MeshId`/`MaterialId` - `Rendering` never depends on `Scene`). See the M16 closeout below. | **Complete** | See `docs/ARCHITECTURE.md`, "M16 - Render Resource Context Foundation". |
+| M17 | `Physics`: minimal implementation | Deprioritized | Starts only after M10.6 |
+| M18 | `Audio`: minimal implementation | Deprioritized | Starts only after M10.6 |
+| M19 | `Editor` skeleton | Deprioritized | After the core chain is proven |
+| M20 | Android/Linux `Platform` backend | Later | When actually needed |
+| M21 | Custom AR hardware bring-up | Long-term | The project's ultimate goal |
 
 ### M11 closeout
 
@@ -217,6 +218,34 @@ Deferred:
 - LOD/mesh optimization
 - asset database/cooked assets
 - editor model tooling
+```
+
+### M16 closeout
+
+```
+M16 — Render Resource Context Foundation: COMPLETE
+
+Completed:
+- reusable VulkanRenderResourceContext introduced in Rendering
+- duplicated demo-owned mesh/texture/material caches removed
+- context owns GPU mesh and texture resources
+- context owns shared sampler and descriptor pool
+- render-side MeshHandle / MaterialHandle identities introduced
+- handle allocation extracted into Vulkan-free pure-testable logic
+- Scene IDs remain distinct from Rendering handles
+- Rendering ↔ Scene dependency remains zero in both directions
+- desktop and XR demos migrated to the same resource-context API
+- no per-frame resource creation introduced
+- M4 RenderDevice audited and deliberately left dormant
+- full build matrix and CTest green
+
+Deferred:
+- backend-neutral render-resource context
+- generalized multi-backend resource interface
+- async loading / streaming
+- eviction / residency
+- asset database / hot reload
+- pipeline/material variants
 ```
 
 ## Rules while working through the roadmap

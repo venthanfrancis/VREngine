@@ -6,6 +6,7 @@ add_library(arengine_rendering STATIC
     src/Rendering.cpp
     src/NullRenderDevice.cpp
     src/ProceduralMesh.cpp
+    src/HandleAllocators.cpp
 )
 add_library(AREngine::Rendering ALIAS arengine_rendering)
 
@@ -20,6 +21,7 @@ target_sources(arengine_rendering
         include/AREngine/Rendering/NullRenderDevice.hpp
         include/AREngine/Rendering/MeshData.hpp
         include/AREngine/Rendering/ProceduralMesh.hpp
+        src/HandleAllocators.hpp
 )
 
 if(ARENGINE_ENABLE_VULKAN)
@@ -52,6 +54,7 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanDescriptorPool.cpp
             src/vulkan/VulkanDepthFormat.cpp
             src/vulkan/VulkanClipSpace.cpp
+            src/vulkan/VulkanRenderResourceContext.cpp
             src/vulkan/VulkanVersion.hpp
             src/vulkan/VulkanResult.hpp
             src/vulkan/VulkanPhysicalDevice.hpp
@@ -80,6 +83,7 @@ if(ARENGINE_ENABLE_VULKAN)
             src/vulkan/VulkanDepthFormat.hpp
             src/vulkan/VulkanClipSpace.hpp
             src/vulkan/VulkanPushConstants.hpp
+            src/vulkan/VulkanRenderResourceContext.hpp
     )
     target_link_libraries(arengine_rendering PRIVATE Vulkan::Vulkan AREngine::Platform)
 
@@ -149,6 +153,8 @@ target_include_directories(arengine_rendering
 target_link_libraries(arengine_rendering
     PUBLIC
         AREngine::Core
+    PRIVATE
+        AREngine::Assets
 )
 
 target_compile_features(arengine_rendering PUBLIC cxx_std_20)
@@ -180,3 +186,14 @@ target_compile_features(arengine_rendering PUBLIC cxx_std_20)
 # Vulkan SDK discovery (via the VULKAN_SDK environment variable the SDK
 # installer sets) — no vendored headers, no hard-coded machine-specific
 # path.
+#
+# M16: AREngine::Assets is linked PRIVATE, unconditionally (not gated
+# behind ARENGINE_ENABLE_VULKAN) - src/vulkan/VulkanRenderResourceContext
+# consumes Assets::MeshAsset/TextureAsset directly (a deliberate, one-
+# directional Rendering -> Assets edge; Assets never depends back on
+# Rendering, so this introduces no cycle), and the unconditional
+# src/HandleAllocators.{hpp,cpp} keys its bookkeeping by Assets::AssetId
+# so its pure tests run in every build configuration, Vulkan enabled or
+# not. Rendering's PUBLIC headers (include/) stay entirely Assets-free
+# either way - this dependency is confined to src/. See
+# docs/ARCHITECTURE.md, "M16 - Render Resource Context Foundation".

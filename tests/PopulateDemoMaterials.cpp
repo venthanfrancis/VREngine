@@ -7,61 +7,42 @@ namespace ARDemo
     namespace
     {
         // Loads+resolves one texture asset by relative path and
-        // registers it into `materialRegistry` under `materialId`.
-        // Returns false (does not register anything) if the asset
-        // fails to load - the caller decides how to react; M14's demos
-        // treat this as a setup-time hard failure (AR_ASSERT), since a
-        // missing committed test/demo fixture is a build/packaging bug,
-        // not a normal runtime condition.
-        bool LoadAndRegisterMaterial(
-            AREngine::Assets::AssetManager& assetManager, TextureCache& textureCache,
-            const AREngine::Rendering::Vulkan::VulkanDescriptorSetLayout& descriptorSetLayout,
-            AREngine::Rendering::Vulkan::VulkanDescriptorPool& descriptorPool,
-            const AREngine::Rendering::Vulkan::VulkanSampler& sampler,
-            MaterialRegistry& materialRegistry,
-            VkPhysicalDevice physicalDevice, VkDevice device, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& relativePath, AREngine::Scene::MaterialId materialId)
+        // creates a material for it via `context`. Returns std::nullopt
+        // if the asset fails to load - the caller decides how to react;
+        // M14's demos treat this as a setup-time hard failure
+        // (AR_ASSERT), since a missing committed test/demo fixture is a
+        // build/packaging bug, not a normal runtime condition.
+        std::optional<AREngine::Scene::MaterialId> LoadAndCreateMaterial(
+            AREngine::Assets::AssetManager& assetManager,
+            AREngine::Rendering::Vulkan::VulkanRenderResourceContext& context,
+            const std::filesystem::path& relativePath)
         {
             const std::optional<AREngine::Assets::AssetId> assetId = assetManager.LoadTexture(relativePath);
             if (!assetId.has_value())
             {
-                return false;
+                return std::nullopt;
             }
 
             const AREngine::Assets::TextureAsset& imageAsset = assetManager.GetTexture(*assetId);
-            const AREngine::Rendering::Vulkan::VulkanImage* texture = textureCache.GetOrCreate(
-                *assetId, imageAsset, physicalDevice, device, commandPool, queue);
+            context.CreateTexture(*assetId, imageAsset);
 
-            const VkDescriptorSet descriptorSet = descriptorPool.Allocate(descriptorSetLayout.Get());
-            AREngine::Rendering::Vulkan::WriteCombinedImageSamplerDescriptor(
-                device, descriptorSet, texture->GetView(), sampler.Get());
-
-            materialRegistry.Register(materialId, descriptorSet);
-            return true;
+            const AREngine::Rendering::MaterialHandle handle = context.CreateMaterial(*assetId);
+            return AREngine::Scene::MaterialId{handle.id};
         }
     }
 
     DemoMaterialIds PopulateDemoMaterials(
         AREngine::Assets::AssetManager& assetManager,
-        TextureCache& textureCache,
-        const AREngine::Rendering::Vulkan::VulkanDescriptorSetLayout& descriptorSetLayout,
-        AREngine::Rendering::Vulkan::VulkanDescriptorPool& descriptorPool,
-        const AREngine::Rendering::Vulkan::VulkanSampler& sampler,
-        MaterialRegistry& materialRegistry,
-        VkPhysicalDevice physicalDevice, VkDevice device, VkCommandPool commandPool, VkQueue queue)
+        AREngine::Rendering::Vulkan::VulkanRenderResourceContext& context)
     {
-        const DemoMaterialIds materialIds{AREngine::Scene::MaterialId{1}, AREngine::Scene::MaterialId{2}};
+        const std::optional<AREngine::Scene::MaterialId> redChecker =
+            LoadAndCreateMaterial(assetManager, context, "textures/checker_red.png");
+        AR_ASSERT_MSG(redChecker.has_value(), "Failed to load the committed demo texture asset textures/checker_red.png - packaging/asset-root bug");
 
-        const bool redOk = LoadAndRegisterMaterial(
-            assetManager, textureCache, descriptorSetLayout, descriptorPool, sampler, materialRegistry,
-            physicalDevice, device, commandPool, queue, "textures/checker_red.png", materialIds.redChecker);
-        AR_ASSERT_MSG(redOk, "Failed to load the committed demo texture asset textures/checker_red.png - packaging/asset-root bug");
+        const std::optional<AREngine::Scene::MaterialId> blueChecker =
+            LoadAndCreateMaterial(assetManager, context, "textures/checker_blue.png");
+        AR_ASSERT_MSG(blueChecker.has_value(), "Failed to load the committed demo texture asset textures/checker_blue.png - packaging/asset-root bug");
 
-        const bool blueOk = LoadAndRegisterMaterial(
-            assetManager, textureCache, descriptorSetLayout, descriptorPool, sampler, materialRegistry,
-            physicalDevice, device, commandPool, queue, "textures/checker_blue.png", materialIds.blueChecker);
-        AR_ASSERT_MSG(blueOk, "Failed to load the committed demo texture asset textures/checker_blue.png - packaging/asset-root bug");
-
-        return materialIds;
+        return DemoMaterialIds{*redChecker, *blueChecker};
     }
 }

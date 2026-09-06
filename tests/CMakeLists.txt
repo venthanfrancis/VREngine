@@ -117,6 +117,27 @@ target_link_libraries(arengine_render_draw_planning_tests PRIVATE AREngine::Core
 target_compile_features(arengine_render_draw_planning_tests PRIVATE cxx_std_20)
 add_test(NAME RenderDrawPlanningTests COMMAND arengine_render_draw_planning_tests)
 
+# Pure-logic tests for VulkanRenderResourceContext's id-minting/caching
+# bookkeeping (engine/rendering/src/HandleAllocators.hpp/.cpp) — M16.
+# Built unconditionally, not gated behind ARENGINE_ENABLE_VULKAN:
+# HandleAllocators.hpp/.cpp has no Vulkan dependency at all (real GPU
+# upload can't be pure-tested, but the AssetId -> handle bookkeeping
+# that upload sits behind can be, and is extracted specifically for
+# that reason). No new .cpp source needed here - HandleAllocators.cpp
+# is already compiled into AREngine::Rendering itself; this target just
+# needs to see its (private) header, the same
+# target_include_directories(... PRIVATE .../engine/rendering/src)
+# pattern arengine_vulkan_tests already uses for other private-Rendering
+# internals. See docs/ARCHITECTURE.md, "M16 - Render Resource Context
+# Foundation".
+add_executable(arengine_render_resource_handle_tests
+    render_resource_handle_tests.cpp
+)
+target_link_libraries(arengine_render_resource_handle_tests PRIVATE AREngine::Core AREngine::Assets AREngine::Rendering)
+target_include_directories(arengine_render_resource_handle_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+target_compile_features(arengine_render_resource_handle_tests PRIVATE cxx_std_20)
+add_test(NAME RenderResourceHandleTests COMMAND arengine_render_resource_handle_tests)
+
 # Everything Vulkan-specific is gated on ARENGINE_ENABLE_VULKAN (top-
 # level option, default ON) — when OFF, none of this is added: no
 # find_package(Vulkan) call, no Vulkan targets at all. See
@@ -176,11 +197,8 @@ if(ARENGINE_ENABLE_VULKAN)
         scene_render_demo.cpp
         PopulateDemoScene.cpp
         RenderDrawPlanning.cpp
-        MeshRegistry.cpp
-        MaterialRegistry.cpp
-        TextureCache.cpp
+        DrawPlannedInstances.cpp
         PopulateDemoMaterials.cpp
-        MeshCache.cpp
         PopulateDemoMeshes.cpp
     )
     target_link_libraries(arengine_scene_render_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering AREngine::Assets Vulkan::Vulkan)
@@ -192,21 +210,6 @@ if(ARENGINE_ENABLE_VULKAN)
     target_compile_definitions(arengine_scene_render_demo PRIVATE
         AR_DEMO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"
     )
-
-    # Pure-logic tests for ARDemo::MaterialRegistry (MaterialRegistry.hpp)
-    # — M13. Gated under ARENGINE_ENABLE_VULKAN only because
-    # VkDescriptorSet is a Vulkan type (mirrors arengine_vulkan_tests'
-    # own "no real Vulkan API call, but the loader must be resolvable"
-    # pattern) - no real device/GPU is required at runtime. See
-    # docs/ARCHITECTURE.md, "M13 - Material & Render Resource Binding
-    # Foundation".
-    add_executable(arengine_material_registry_tests
-        material_registry_tests.cpp
-        MaterialRegistry.cpp
-    )
-    target_link_libraries(arengine_material_registry_tests PRIVATE AREngine::Core AREngine::Scene Vulkan::Vulkan)
-    target_compile_features(arengine_material_registry_tests PRIVATE cxx_std_20)
-    add_test(NAME MaterialRegistryTests COMMAND arengine_material_registry_tests)
 endif()
 
 # Everything OpenXR-specific is gated on ARENGINE_ENABLE_OPENXR (top-
@@ -388,11 +391,8 @@ if(ARENGINE_ENABLE_OPENXR)
             XRInteractionState.cpp
             PopulateDemoScene.cpp
             RenderDrawPlanning.cpp
-            MeshRegistry.cpp
-            MaterialRegistry.cpp
-            TextureCache.cpp
+            DrawPlannedInstances.cpp
             PopulateDemoMaterials.cpp
-            MeshCache.cpp
             PopulateDemoMeshes.cpp
         )
         target_link_libraries(arengine_xr_demo PRIVATE AREngine::Core AREngine::XR AREngine::Frame AREngine::Rendering AREngine::Scene AREngine::Input AREngine::Assets OpenXR::openxr_loader Vulkan::Vulkan)

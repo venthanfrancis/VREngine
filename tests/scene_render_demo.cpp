@@ -12,7 +12,7 @@
 // vulkan_present_demo.cpp already established; the only thing genuinely
 // new here is the Scene -> ExtractRenderables -> BuildDrawPlan ->
 // DrawPlannedInstances path (tests/RenderDrawPlanning.hpp,
-// tests/MeshRegistry.hpp), shared unchanged with tests/xr_demo.cpp's own
+// tests/DrawPlannedInstances.hpp), shared unchanged with tests/xr_demo.cpp's own
 // per-view render loop. Scene content itself comes from
 // tests/PopulateDemoScene.hpp, the SAME function xr_demo.cpp calls - one
 // scene, two presentation paths, no duplicated world data. See
@@ -28,8 +28,7 @@
 #include "AREngine/Scene/Transform.hpp"
 
 #include "DemoCameraController.hpp"
-#include "MeshCache.hpp"
-#include "MeshRegistry.hpp"
+#include "DrawPlannedInstances.hpp"
 #include "PopulateDemoMaterials.hpp"
 #include "PopulateDemoMeshes.hpp"
 #include "PopulateDemoScene.hpp"
@@ -38,20 +37,18 @@
 #include "vulkan/VulkanClipSpace.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDepthFormat.hpp"
-#include "vulkan/VulkanDescriptorPool.hpp"
 #include "vulkan/VulkanDescriptorSetLayout.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanFramebuffers.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
-#include "vulkan/VulkanMesh.hpp"
 #include "vulkan/VulkanPhysicalDevice.hpp"
 #include "vulkan/VulkanPushConstants.hpp"
 #include "vulkan/VulkanQueueFamilies.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
+#include "vulkan/VulkanRenderResourceContext.hpp"
 #include "vulkan/VulkanResult.hpp"
-#include "vulkan/VulkanSampler.hpp"
 #include "vulkan/VulkanSurface.hpp"
 #include "vulkan/VulkanSwapchain.hpp"
 #include "vulkan/VulkanSwapchainSupport.hpp"
@@ -153,45 +150,35 @@ int main()
 
     VulkanCommandPool commandPool(device.Get(), physicalDevice.queueFamilies.graphicsFamily);
 
-    // M15: AssetManager + MeshCache must exist before any asset-backed
-    // mesh can be uploaded - restructured from M12/M14's original
-    // ordering (which uploaded every mesh, all procedural, before
-    // AssetManager even existed) to support the file-backed pyramid
-    // mesh below. See docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh
-    // Loading Foundation".
+    // M16: AssetManager + one VulkanRenderResourceContext must exist
+    // before any mesh/texture can be created - replaces M15's separate
+    // MeshCache/MeshRegistry/TextureCache/MaterialRegistry/VulkanSampler/
+    // VulkanDescriptorPool (six hand-duplicated objects) with one
+    // engine-owned type. See docs/ARCHITECTURE.md, "M16 - Render
+    // Resource Context Foundation".
     Assets::AssetManager assetManager(std::filesystem::path(AR_DEMO_ASSETS_ROOT));
-    ARDemo::MeshCache meshCache;
-    ARDemo::MeshRegistry meshRegistry;
-    const Scene::MeshId pyramidMeshId = ARDemo::PopulateDemoMeshes(
-        assetManager, meshCache, meshRegistry,
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue());
+    VulkanRenderResourceContext context(
+        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(),
+        descriptorSetLayout.Get(), /*maxMaterials=*/2);
+
+    const Scene::MeshId pyramidMeshId = ARDemo::PopulateDemoMeshes(assetManager, context);
 
     // Floor stays fully procedural (M8D/ProceduralMesh) - proves
-    // procedural and asset-backed meshes coexist in one MeshRegistry.
-    auto floorMesh = CreateVulkanMesh(
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue(), Rendering::CreateQuadMesh());
-    const Scene::MeshId floorMeshId{2};
-    meshRegistry.Register(floorMeshId, floorMesh.get());
-    AR_LOG_INFO("Uploaded 1 asset-backed mesh (pyramid.obj, via AssetManager+MeshCache) + 1 procedural mesh "
-                "(floor quad) - never re-uploaded per frame or per entity");
+    // procedural and asset-backed meshes coexist in one context.
+    const Scene::MeshId floorMeshId{context.CreateProceduralMesh(Rendering::CreateQuadMesh()).id};
+    AR_LOG_INFO(std::format("Uploaded {} GPU mesh resource(s) (1 asset-backed [pyramid.obj] + 1 procedural [floor "
+                             "quad]) - never re-uploaded per frame or per entity", context.MeshCount()));
 
     const ARDemo::DemoMeshIds meshIds{pyramidMeshId, floorMeshId};
 
     // M14: two real PNG files, loaded through AssetManager, decoded to
-    // RGBA8, and uploaded exactly once each via TextureCache - replacing
+    // RGBA8, and uploaded exactly once each via the context - replacing
     // M13's in-memory generated checkerboards. Red/blue are arbitrary;
     // the point is that they are visually distinguishable so "same
-    // mesh, different material" is actually observable. See
-    // docs/ARCHITECTURE.md, "M14 - Asset-Backed Texture & Material
-    // Loading Foundation".
-    ARDemo::TextureCache textureCache;
-    VulkanSampler sampler(device.Get()); // one sampler, shared by every material - describes filtering only, not a specific image
-
-    VulkanDescriptorPool descriptorPool(device.Get(), /*maxSets=*/2);
-    ARDemo::MaterialRegistry materialRegistry;
-    const ARDemo::DemoMaterialIds materialIds = ARDemo::PopulateDemoMaterials(
-        assetManager, textureCache, descriptorSetLayout, descriptorPool, sampler, materialRegistry,
-        physicalDevice.device, device.Get(), commandPool.Get(), device.GetGraphicsQueue());
+    // mesh, different material" is actually observable.
+    const ARDemo::DemoMaterialIds materialIds = ARDemo::PopulateDemoMaterials(assetManager, context);
+    AR_LOG_INFO(std::format("Created {} GPU texture resource(s), {} material(s)",
+                             context.TextureCount(), context.MaterialCount()));
 
     Scene::Camera camera;
     camera.nearZ = 0.1f;
@@ -402,7 +389,7 @@ int main()
         const std::vector<Scene::RenderableInstance> renderables = scene.ExtractRenderables();
         const std::array<Core::Math::Mat4, 1> viewProjections{viewProjection};
         const std::vector<ARDemo::PlannedDraw> plan = ARDemo::BuildDrawPlan(renderables, viewProjections);
-        ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), meshRegistry, materialRegistry, plan);
+        ARDemo::DrawPlannedInstances(commandBuffer, pipeline.GetLayout(), context, plan);
 
         vkCmdEndRenderPass(commandBuffer);
         CheckVkResult(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");

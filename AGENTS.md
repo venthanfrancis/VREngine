@@ -903,6 +903,13 @@ values - or M8I+ (Scene integration, still pending within M8) — see
 32. **If source asset extensions collide with generic build-artifact
     ignore patterns, add targeted exceptions rather than weakening
     ignore rules globally.**
+33. **Rendering resource handles and Scene logical IDs are intentionally
+    distinct. Do not make Rendering depend on Scene merely to reuse
+    MeshId/MaterialId types. Conversion belongs in a higher-level
+    integration layer that may depend on both.**
+34. **VulkanRenderResourceContext owns GPU-side resource identity and
+    lifetime. Scene stores only logical scene-facing IDs and never
+    owns or resolves Vulkan resources.**
 
 ## Build
 

@@ -22,16 +22,18 @@ namespace ARDemo
 {
     // Minted once by each demo's own main() (the single source of truth
     // for which MeshId means "pyramid" vs. "floor"), then passed to both
-    // PopulateDemoScene (to assign Renderables) and a MeshRegistry (to
-    // resolve them to actual uploaded VulkanMesh objects) - the two
-    // never need to independently agree on matching integers.
+    // PopulateDemoScene (to assign Renderables) and the engine-owned
+    // VulkanRenderResourceContext (M16 - to resolve them to actual
+    // uploaded VulkanMesh objects) - the two never need to independently
+    // agree on matching integers.
     //
     // M15: `pyramid` is now asset-backed (loaded from meshes/pyramid.obj
     // via AssetManager - see tests/PopulateDemoMeshes.hpp), replacing
     // the earlier procedural cube; `floor` stays fully procedural
     // (Rendering::CreateQuadMesh), proving the two coexist in one
-    // MeshRegistry. See docs/ARCHITECTURE.md, "M15 - Asset-Backed Mesh
-    // Loading Foundation".
+    // resource context. See docs/ARCHITECTURE.md, "M15 - Asset-Backed
+    // Mesh Loading Foundation" and "M16 - Render Resource Context
+    // Foundation".
     struct DemoMeshIds
     {
         AREngine::Scene::MeshId pyramid;
