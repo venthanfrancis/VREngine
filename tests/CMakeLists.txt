@@ -471,6 +471,23 @@ if(ARENGINE_ENABLE_PHYSICS)
     endif()
 endif()
 
+# WAV content stays available without the optional playback backend.
+add_executable(arengine_audio_asset_tests audio_asset_tests.cpp)
+target_link_libraries(arengine_audio_asset_tests PRIVATE AREngine::Assets)
+target_include_directories(arengine_audio_asset_tests PRIVATE ${PROJECT_SOURCE_DIR}/engine/assets/src)
+target_compile_definitions(arengine_audio_asset_tests PRIVATE AR_AUDIO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets")
+add_test(NAME AudioAssetTests COMMAND arengine_audio_asset_tests)
+
+if(ARENGINE_ENABLE_AUDIO)
+    add_executable(arengine_audio_tests audio_tests.cpp)
+    target_link_libraries(arengine_audio_tests PRIVATE AREngine::Audio AREngine::Assets)
+    target_compile_definitions(arengine_audio_tests PRIVATE AR_AUDIO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets")
+    add_test(NAME AudioTests COMMAND arengine_audio_tests)
+    add_executable(arengine_audio_demo audio_demo.cpp)
+    target_link_libraries(arengine_audio_demo PRIVATE AREngine::Audio AREngine::Assets)
+    target_compile_definitions(arengine_audio_demo PRIVATE AR_AUDIO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets")
+endif()
+
 # Manual-only: proves M2's Window works end-to-end with real user
 # interaction (opening a window, closing it via the close button). Built
 # by CMake but deliberately NOT registered with add_test — CTest must

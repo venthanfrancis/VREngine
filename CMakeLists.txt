@@ -21,7 +21,7 @@ option(ARENGINE_ENABLE_VULKAN "Build Vulkan support (requires the Vulkan SDK)" O
 option(ARENGINE_ENABLE_OPENXR "Build OpenXR bring-up support (fetches the Khronos OpenXR-SDK loader via CMake FetchContent if no system package is found; requires network access on first configure)" OFF)
 option(ARENGINE_ENABLE_PHYSICS "Build Physics support (fetches Jolt Physics via CMake FetchContent if no system package is found; requires network access on first configure)" OFF)
 
-
+option(ARENGINE_ENABLE_AUDIO "Build miniaudio playback support" OFF)
 
 # Engine modules (core, frame, platform, rendering, scene, assets, input, xr).
 add_subdirectory(engine)

@@ -928,6 +928,10 @@ values - or M8I+ (Scene integration, still pending within M8) — see
 41. **Physics steps use fixed application delta time, never XR predicted timestamps or view count. Synchronize dynamic poses through the explicit bridge after stepping; Scene stays Core-only.**
 42. **A fixed-step cap discards all excess time, including fractional remainder. Tests must probe the next nonzero frame to prove discarded time does not leak forward.**
 
+43. **Audio owns playback state and resident clip PCM; Assets owns source content. Keep AssetId, AudioClipId, and AudioSourceId distinct, and miniaudio private.**
+44. **Update one audio listener from the camera/head world pose outside all view loops. Never multiply source updates or playback by XR view count.**
+45. **Device-free audio tests must exercise the real mixer output. A successful device API call does not prove human audibility; distinguish signal/lifecycle evidence from listening evidence.**
+
 ## Build
 
 ```

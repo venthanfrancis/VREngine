@@ -1,5 +1,6 @@
 #include "AREngine/Assets/Assets.hpp"
 
+#include "AudioDecode.hpp"
 #include "ImageDecode.hpp"
 #include "MeshDecode.hpp"
 
@@ -250,11 +251,36 @@ namespace AREngine::Assets
         return id;
     }
 
+    std::optional<AssetId> AssetManager::LoadAudio(const std::filesystem::path& relativePath)
+    {
+        const auto resolved = ResolvePath(relativePath);
+        if (!resolved) return std::nullopt;
+        const auto key = resolved->generic_string();
+        if (const auto it = m_audioPathToId.find(key); it != m_audioPathToId.end()) return it->second;
+        const auto bytes = ReadBinaryFile(*resolved);
+        if (!bytes) return std::nullopt;
+        auto decoded = DecodeWav(*bytes);
+        if (!decoded) return std::nullopt;
+        const AssetId id{m_nextAssetId++};
+        decoded->id = id;
+        decoded->path = relativePath;
+        m_audioAssets.emplace(id, std::move(*decoded));
+        m_audioPathToId.emplace(key, id);
+        return id;
+    }
+
+    const AudioAsset& AssetManager::GetAudio(AssetId id) const
+    {
+        const auto it = m_audioAssets.find(id);
+        AR_ASSERT_MSG(it != m_audioAssets.end(), "GetAudio requires an audio asset id");
+        return it->second;
+    }
+
     bool AssetManager::IsValid(AssetId id) const
     {
         return id.IsValid() &&
             (m_textAssets.contains(id) || m_binaryAssets.contains(id) ||
-             m_textureAssets.contains(id) || m_meshAssets.contains(id));
+             m_textureAssets.contains(id) || m_meshAssets.contains(id) || m_audioAssets.contains(id));
     }
 
     const TextAsset& AssetManager::GetText(AssetId id) const

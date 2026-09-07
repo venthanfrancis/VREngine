@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AREngine/Assets/AssetId.hpp"
+#include "AREngine/Assets/AudioAsset.hpp"
 #include "AREngine/Assets/BinaryAsset.hpp"
 #include "AREngine/Assets/MeshAsset.hpp"
 #include "AREngine/Assets/TextAsset.hpp"
@@ -87,6 +88,12 @@ namespace AREngine::Assets
         // Foundation" for exactly what is and is not parsed.
         [[nodiscard]] std::optional<AssetId> LoadMesh(const std::filesystem::path& relativePath);
 
+        // Cached CPU-only WAV content, available even when playback is disabled.
+        // Supports RIFF PCM16 mono/stereo, 8-192 kHz. Unsupported/corrupt/missing
+        // files return nullopt. GetAudio requires an id returned by LoadAudio.
+        [[nodiscard]] std::optional<AssetId> LoadAudio(const std::filesystem::path& relativePath);
+        [[nodiscard]] const AudioAsset& GetAudio(AssetId id) const;
+
         [[nodiscard]] bool IsValid(AssetId id) const;
 
         [[nodiscard]] const TextAsset& GetText(AssetId id) const;
@@ -105,6 +112,8 @@ namespace AREngine::Assets
         // docs/ARCHITECTURE.md, "Root Traversal Handling".
         [[nodiscard]] std::optional<std::filesystem::path> ResolvePath(const std::filesystem::path& relativePath) const;
 
+        std::unordered_map<std::string, AssetId> m_audioPathToId;
+        std::unordered_map<AssetId, AudioAsset> m_audioAssets;
         std::filesystem::path m_root;
         std::uint64_t m_nextAssetId = 1;
 

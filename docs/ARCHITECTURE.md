@@ -10975,3 +10975,193 @@ preconditions now enforce finite valid inputs as promised by the public API.
 No change to module
 boundaries. The prior real Vulkan/physics visual and landing evidence remains
 applicable; headless collision/lifetime and fixed-step tests are rerun at closeout.
+
+## M19 - Audio Foundation
+
+### Audit and scope
+
+M19 was implemented on top of the existing, uncommitted M18 Physics work.
+Those changes were preserved. ROADMAP.md and AGENTS.md were not modified.
+The original architecture's Audio placeholder had no implementation to reuse.
+Assets already owns typed, path-normalized CPU content caches; Rendering's
+resource handles and Physics' optional backend establish the ownership and
+build conventions used here. Runtime's existing NullRenderDevice path is not
+changed or made responsible for an audio device without an application need.
+
+### Backend choice and dependency boundary
+
+The selected backend is miniaudio 0.11.23, vendored verbatim as a single header
+under third_party/miniaudio, following stb_image/tinyobjloader precedent. The
+upstream header supplies the MIT-0 license; README.md records its source URL
+and SHA-256. Evidence for selection: C++20/MSVC compilation, native Windows
+playback, independently positioned sounds, listener orientation, and a real
+no-device engine rendering path all exercised successfully here. A Windows-
+only playback API would require AREngine to implement its own mixing and
+spatial processing; a separate decoder dependency is unnecessary for the
+explicitly narrow PCM16 WAV requirement.
+
+ARENGINE_ENABLE_AUDIO defaults OFF. AREngine::Audio is a static module whose
+backend-neutral vocabulary compiles unconditionally; AudioContext's backend
+implementation and the private arengine_miniaudio target compile only when
+ON. Audio links Core publicly and miniaudio privately. Audio does not link or
+include Assets, Scene, Rendering, Physics, Platform, Frame, or OpenXR. Assets
+still depends only on Core. The leaf demo/tests may depend on both Assets
+and Audio and transfer PCM explicitly. Third-party platform access is private
+to miniaudio, following Vulkan/Jolt backend isolation; no new engine Win32
+calls were introduced. No global singleton, process-wide engine registry, or
+new Scene component exists.
+
+The miniaudio resource manager, decoding, encoding, generators, and null-device
+fallback are disabled. This prevents the playback module from doing content
+file I/O/decoding and prevents a failed physical-device initialization from
+silently reporting successful playback through a null device. Only the
+third-party implementation translation unit has warnings disabled; AREngine
+sources remain /W4 /WX. No upstream source edits or runtime-name branches.
+
+### Assets and content
+
+AudioAsset stores AssetId, path, sampleRate, channels, and interleaved float
+PCM samples. AssetManager::LoadAudio uses the existing root resolution and
+ReadBinaryFile path, then a private DecodeWav. It creates its own typed cache;
+it does not call LoadBinary or mint an intermediate binary asset. Repeated
+normalized paths return the same AssetId. The same path loaded as binary
+and audio has independent identities, matching the existing asset policy.
+GetAudio asserts for a wrong/missing audio id; LoadAudio returns nullopt for
+normal file/decode failures. WAV content remains available with AUDIO=OFF.
+
+Supported input is deliberately RIFF/WAVE little-endian PCM16, mono/stereo,
+8000-192000 Hz. The reader validates RIFF length, chunk boundaries and odd
+padding, PCM format, sample rate, byte rate, block alignment, and complete
+nonempty sample frames. Unknown chunks are skipped. Duplicate format/data
+chunks, truncations, compressed WAV, float WAV, RF64, and other encodings are
+rejected rather than guessed. Samples are converted to [-1,1) float PCM.
+The project-owned tone.wav is a mathematically generated 440 Hz sine, 48000
+Hz mono, 12000 frames / 0.25 seconds, PCM16 amplitude 6000. No recordings or
+copyrighted audio are included.
+
+### Identity, ownership, and playback
+
+AssetId != AudioClipId != AudioSourceId. Audio ids are distinct C++ types,
+context-local monotonic counters; zero is invalid and ids are never recycled.
+As with AssetManager, ids must not be passed between owning contexts.
+
+AudioContext::Create(Device) returns nullptr on initialization failure.
+Create(Offline) creates the same mixing engine without any hardware device.
+One explicit owner calls the API from one application thread. miniaudio owns
+the device callback thread; no application callback performs file I/O.
+
+CreateClip copies already-decoded PCM into immutable context-owned storage.
+The caller can destroy its AssetManager immediately afterward. Callers retain
+and reuse the returned clip id; repeated CreateClip calls deliberately create
+new clips, not an implicit AssetId/content cache inside Audio. CreateSource
+constructs an independent sound and playback cursor referencing that PCM.
+Multiple sources share one clip without sharing cursor, gain, pitch, position,
+or looping state. All address-sensitive miniaudio sounds/cursors are kept in
+stable heap allocations. Source creation and clip copying are setup operations,
+not frame-loop work.
+
+Play restarts at frame zero, including after natural completion. Stop stops
+playback; the reusable source remains explicitly owned until DestroySource.
+A nonlooping source ends naturally; looping continues until stopped. The
+context does not accumulate hidden fire-and-forget source objects. Gain is
+linear and nonnegative; pitch is a playback-rate multiplier in [0.125,8].
+Invalid/nonfinite parameters are rejected before any setter is applied.
+CreateClip validates finite normalized PCM and frame alignment. Unknown or
+stale resource ids fail predictably through zero/false. DestroyClip refuses
+while any live source references it, even a stopped source.
+
+Teardown stops the engine/device, destroys sounds before their cursor buffers,
+releases clip PCM after all cursors, then uninitializes the engine. Source
+initialization has RAII cleanup even when only its buffer initialized. Public
+context copying is disabled. No intentional leaks or delayed-teardown sleeps.
+
+### Spatial/world integration
+
+Exactly one listener is configured. ListenerState is position plus a unit
+Core quaternion (Hamilton w,x,y,z). Audio derives forward/up with Core::Rotate
+using -Z forward and +Y up; world units are meters, +X right, right-handed.
+SourceState holds a world position and an explicit spatial toggle. Spatial
+sources use inverse-distance attenuation with rolloff 1, reference distance
+1 m, maximum distance 1000 m, and are pinned to listener zero. This is basic
+stereo spatialization, not HRTF or a room/acoustics simulation.
+
+The owning integration code calls SetListener with the desktop camera's world
+pose or the user's head world pose once per world update. It must not feed
+an individual eye pose. Sources and Play calls belong outside all render-view
+loops. Audio itself has no view count, view index, or frame-driver dependency;
+two XR views cannot automatically cause two listeners or duplicate playback.
+No changes to the XR runtime path are required or introduced by this milestone.
+
+### Validation
+
+All three configurations used MSVC 19.44, C++20, Debug, /W4 /WX. All engine
+builds completed with zero compiler warnings/errors:
+
+| Build directory | Audio | Vulkan | OpenXR | Physics | Final CTest |
+| --- | --- | --- | --- | --- | --- |
+| build-m19-headless | ON | OFF | OFF | OFF | 16/16 |
+| build-m19-full | ON | ON | ON | ON | 23/23 |
+| build-m19-off | OFF | OFF | OFF | OFF | 15/15 |
+
+The full build includes previous desktop Vulkan, OpenXR, and Physics demos.
+The audio-disabled build contains no miniaudio compilation and still runs
+AudioAssetTests. The existing full configuration emitted Jolt's configure-time
+interprocedural-optimization availability notice; this is not an AREngine
+compiler warning. Build directories are ignored by a targeted .gitignore rule.
+
+AudioAssetTests covers real file loading, normalized-path cache reuse, typed
+identity, positive/negative sample conversion, mono/stereo metadata, missing/
+corrupt/escaping paths, every truncation of the 24044-byte fixture, unsupported
+encoding, invalid channel/block metadata, oversized chunks, and padded unknown
+chunks. AudioTests renders real miniaudio output at stereo 48000 Hz without a
+device. It verifies PCM ownership after Assets destruction, shared clips with
+independent sources, one-shot completion/replay, stop silence, looping beyond
+multiple clip durations, half gain producing quarter energy, double pitch
+producing approximately 880 Hz, correct left/right spatial energy, head
+rotation reversing pan, listener distance attenuation, invalid parameters and
+ids, destruction guards, empty final resource counts, and ten context lifetimes
+destroyed while actively looping. No ordinary test requires speakers or an XR
+runtime/GPU for the new audio functionality.
+
+The manual arengine_audio_demo opened the default physical playback device and
+completed twice (second run requested by the user): one-shot at the left, then
+180 timed updates of a looping source sweeping left to right while pitch rises
+from 1 to 2, followed by Stop and clean process exit code 0. Both runs reported
+one clip, one source, and one listener; no content loads/decoding/resource
+creation occur in the loop. Physical-device initialization and playback
+lifecycle are observed; perceptual audibility is not inferred from a successful
+API call. Human confirmation of the replay is pending at this writing.
+
+Several newly linked, existing regression binaries were rejected by Smart App
+Control before starting (CTest BAD_COMMAND, not assertion/test failures).
+Code Integrity events 3033/3077/3118 confirmed the cause. Following the existing
+M11.3A workaround, target-only rebuilds with BuildProjectReferences=false and
+LinkIncremental=false produced new executable hashes and restored all suites
+to green; some targets needed a second genuine relink. No security setting was
+changed. No AREngine audio functional failure was found during testing.
+
+### Limitations and deferred work
+
+PCM16 WAV only; resident PCM only (one Assets copy plus a context-owned copy),
+no streaming/eviction/hot reload. Explicit source lifetime and clip reuse;
+no automatic voice pool or source-content deduplication inside Audio. Basic
+stereo spatialization only; no HRTF, occlusion, reverb, DSP, mixer graph, music
+manager, gameplay/collision sounds, voice chat, editor tools, serialization,
+or device switching/recovery. Windows was built and exercised; other platform
+backends are not claimed validated. A future application may feed camera/head
+transforms at the established integration boundary; this milestone does not
+add audio calls to the existing desktop/XR rendering demos or advance M20.
+
+### Autonomous M19 closeout decision
+
+Status: COMPLETE WITH EXTERNAL LIMITATION. The source and tests were re-audited:
+PCM storage remains alive for every backend cursor, sound nodes are detached
+before PCM teardown, and source controls are independent of render views.
+The measured output tests prove signal production, gain, pitch, looping,
+spatial panning, and listener-relative behavior through the actual backend.
+Two successful physical-device runs additionally prove device initialization,
+playback progression, stop, and clean shutdown. Together these are sufficient
+technical evidence for this foundation. Human audibility remains unconfirmed;
+that perceptual observation is recorded honestly but is not a prerequisite for
+subsequent engine architecture work. No external review is required under the
+user's autonomous milestone authority. M18 is preserved in its own prior commit.

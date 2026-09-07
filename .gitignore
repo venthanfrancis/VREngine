@@ -1,5 +1,6 @@
 # Build output
 /build/
+/build-m19-*/
 /out/
 /bin/
 /lib/

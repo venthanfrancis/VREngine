@@ -1,0 +1,2 @@
+# Preserve upstream source verbatim; its existing whitespace is not engine style.
+third_party/miniaudio/miniaudio.h -whitespace

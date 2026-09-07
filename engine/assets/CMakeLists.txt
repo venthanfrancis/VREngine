@@ -61,3 +61,4 @@ target_include_directories(arengine_assets
     PRIVATE
         ${CMAKE_SOURCE_DIR}/third_party/tinyobjloader
 )
+target_sources(arengine_assets PRIVATE src/AudioDecode.cpp include/AREngine/Assets/AudioAsset.hpp)
