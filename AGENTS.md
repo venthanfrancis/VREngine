@@ -925,6 +925,9 @@ values - or M8I+ (Scene integration, still pending within M8) — see
     objects rather than adding demo-specific direct Vulkan draw
     paths.**
 
+41. **Physics steps use fixed application delta time, never XR predicted timestamps or view count. Synchronize dynamic poses through the explicit bridge after stepping; Scene stays Core-only.**
+42. **A fixed-step cap discards all excess time, including fractional remainder. Tests must probe the next nonzero frame to prove discarded time does not leak forward.**
+
 ## Build
 
 ```

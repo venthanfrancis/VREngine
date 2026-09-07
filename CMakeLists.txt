@@ -19,6 +19,9 @@ option(ARENGINE_BUILD_SANDBOX "Build the AREngine sandbox test application" ON)
 option(ARENGINE_BUILD_TESTS   "Build AREngine unit tests"                   ON)
 option(ARENGINE_ENABLE_VULKAN "Build Vulkan support (requires the Vulkan SDK)" ON)
 option(ARENGINE_ENABLE_OPENXR "Build OpenXR bring-up support (fetches the Khronos OpenXR-SDK loader via CMake FetchContent if no system package is found; requires network access on first configure)" OFF)
+option(ARENGINE_ENABLE_PHYSICS "Build Physics support (fetches Jolt Physics via CMake FetchContent if no system package is found; requires network access on first configure)" OFF)
+
+
 
 # Engine modules (core, frame, platform, rendering, scene, assets, input, xr).
 add_subdirectory(engine)

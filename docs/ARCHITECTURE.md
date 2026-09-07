@@ -10598,3 +10598,380 @@ tint, PBR/lighting, editor rendering (viewport, gizmos, selection), and
 any `Runtime`/`Scene` integration for the real Vulkan path (M4's
 `RenderDevice` stays exactly as dormant as before) - none of this was
 in scope, and none of it is needed by anything built so far.
+
+## M18 - Physics Foundation
+
+### Goal
+
+Add the first physics/simulation layer - rigid bodies, fixed-step
+simulation, explicit Scene synchronization - without building
+gameplay, a character controller, or a full physics framework. Every
+M12-M17 object motion was application-authored (a hand-written
+rotation, a hard-coded offset); M18 adds a `PhysicsWorld` that
+actually simulates gravity and collision and writes the result back
+into `Scene::Transform`.
+
+### Audit findings
+
+`Core::Math::Quaternion` is Hamilton `(w,x,y,z)` order; Jolt's
+`JPH::Quat` is `(x,y,z,w)` - confirmed by direct header read, not
+assumption. Both AREngine and Jolt are right-handed, +Y-up - no
+axis-flip conversion needed anywhere, only an explicit quaternion
+component reorder. `Scene::EntityId` is purely monotonic (never
+recycled after `DestroyEntity`); `Transform{position, rotation,
+scale{1,1,1}}` has no physics field, and none was added. Zero existing
+fixed-timestep/accumulator code anywhere in the codebase - genuinely
+new ground.
+
+`docs/ARCHITECTURE.md`'s own dependency-graph section already placed
+**Physics at the same layer as Scene** and pre-authorized a one-way
+`Physics -> Scene` dependency ("Physics ... reads/writes Scene's
+transform data through an interface. Scene never depends on Physics")
+- structurally identical to the already-implemented `XR -> Input`
+same-layer exception. This is **different** from `Rendering` (strictly
+below Scene, so `Rendering <-> Scene` has no legal direction and needs
+a `tests/`-leaf bridge, per M17's `BuildRenderItems.cpp`) - the
+Scene<->Physics bridge therefore belongs **inside `engine/physics`**
+itself, not `tests/`. This correction was caught by design review
+before any bridge code was written, having initially defaulted to
+copying M17's `tests/`-leaf pattern without re-checking whether the
+same constraint actually applied here.
+
+**Backend decision: Jolt Physics, `v5.6.0`, via CMake `FetchContent`.**
+Evaluated against Bullet on every stated criterion: Jolt is MIT
+licensed, requires only C++17 (fine under AREngine's C++20), is
+actively maintained (used by Horizon Forbidden West, Death Stranding
+2), and supports every one of AREngine's current and roadmapped
+platforms. Bullet is Zlib licensed but requires only C++03 and its
+issue tracker reads as maintenance-mode. Jolt is a full multi-file
+CMake project (its own `CMakeLists.txt` lives at `Build/CMakeLists.txt`,
+not the repo root, requiring `FetchContent_Declare(... SOURCE_SUBDIR
+Build)`), matching the OpenXR-SDK integration precedent
+(`FetchContent`, gated behind a default-OFF flag) rather than the
+stb_image/tinyobjloader precedent (direct single-header vendoring).
+
+### `engine/physics` module - unconditional vs. gated split
+
+Mirrors `engine/rendering`'s own precedent: generic types are always
+compiled; only the third-party-touching implementation is gated behind
+a build option.
+
+**Unconditional** (zero Jolt dependency - builds and is pure-tested
+even with `ARENGINE_ENABLE_PHYSICS=OFF`):
+
+- `PhysicsBodyId` (`PhysicsBodyId.hpp`) - `{uint64_t id = 0;
+  IsValid();}` + `std::hash` specialization. Minted by a local counter
+  inside `PhysicsWorld` itself (never a global counter), and never
+  numerically equal to any backend body handle - the same
+  "backend-neutral opaque id" pattern M16's `MeshHandle`/`MaterialHandle`
+  and M17's `RenderItem` conversion already established.
+- `PhysicsPose` (`PhysicsPose.hpp`) - `{Vec3 position; Quaternion
+  rotation;}`, deliberately **not** `Scene::Transform`: no scale, no
+  parent. Physics never needs either.
+- `ColliderDesc` (`ColliderDesc.hpp`) - `std::variant<BoxCollider,
+  SphereCollider>`. M18's narrow scope: box and sphere only, no
+  capsule (optional per spec, skipped to keep scope narrow), no convex
+  hull, no mesh, no heightfield.
+- `RigidBodyDesc` (`RigidBodyDesc.hpp`) - `{BodyType type; PhysicsPose
+  initialPose; ColliderDesc collider; float mass = 1.0f;}`. `BodyType`
+  is `{Static, Dynamic}` only - no `Kinematic` this milestone.
+- `FixedTimestepAccumulator` (`FixedTimestepAccumulator.hpp/.cpp`) -
+  the standard "Fix Your Timestep" accumulator:
+  `int Advance(float frameDeltaSeconds)` adds the (non-negative-clamped)
+  frame delta to an internal accumulator and returns how many fixed
+  steps of `FixedDeltaSeconds()` the caller should run this call, up to
+  `maxStepsPerFrame` (default 8). Backlog under the cap is retained
+  across calls; backlog at/beyond the cap is **discarded** (reset to
+  0), never carried forward - the standard spiral-of-death fix. Placed
+  in `engine/physics` (not `engine/frame`/`engine/core`) since nothing
+  else needs fixed-timestep logic today.
+
+  **Floating-point boundary bug found by its own test suite.**
+  `Test2point5xFixedStepProducesTwoStepsPlusRemainder` failed on first
+  run: after `Advance(2.5x)` leaves a `0.5x` remainder, a second
+  `Advance(0.5x)` call should cross exactly one more full step, but the
+  two floats summed to a value a few ULPs *below* `m_fixedDelta` (float
+  `1.0f/60.0f` arithmetic, confirmed by direct probe: the sum came out
+  `0.0166666657` against a `fixedDelta` of `0.0166666675`, a
+  `-1.86e-9` difference) - the strict `>=` comparison lost a real step
+  to ordinary rounding noise, not a logic error. Fixed by comparing
+  against `m_fixedDelta - kStepEpsilon` (`kStepEpsilon = 1e-5f`) in
+  both the step-loop condition and the cap-discard check - three to
+  four orders of magnitude smaller than any realistic fixed-step
+  duration, and roughly four orders of magnitude larger than the
+  observed rounding error, so it absorbs exactly this class of noise
+  without ever masking a genuinely-short frame.
+
+**Gated behind `ARENGINE_ENABLE_PHYSICS`** (new option, default OFF,
+matching `ARENGINE_ENABLE_OPENXR`'s exact pattern):
+
+- `PhysicsWorld` (`PhysicsWorld.hpp`, PIMPL - no Jolt type is ever named
+  in a public header): owns one independent simulation (the Jolt
+  `PhysicsSystem`, every body created through it, and Jolt's own worker
+  thread pool). `CreateBody(const RigidBodyDesc&) -> PhysicsBodyId`
+  validates collider positivity and dynamic-mass-positivity via
+  `AR_ASSERT_MSG` (a caller/content bug, not untrusted input) and
+  asserts if the backend itself fails (an exceeded capacity limit at
+  this foundation-milestone's modest 1024-body cap). `DestroyBody`/
+  `GetBodyPose`/`SetBodyPose` all assert on an unknown/already-destroyed
+  `PhysicsBodyId` - a **deliberate departure** from `Scene::DestroyEntity`'s
+  no-op-on-stale-id philosophy: `AssetManager`'s own `LoadText`
+  (predictable-nullopt) vs. `GetText` (assert) split is the precedent
+  - physics-body destruction is single-writer/caller-owns-the-id, with
+  none of Scene's cross-cutting hierarchy-cascade access pattern.
+  `Step(float fixedDeltaSeconds)` advances the simulation by exactly
+  the given duration - never an arbitrary render delta; the caller (a
+  `FixedTimestepAccumulator`-driven loop) is entirely responsible for
+  calling it the right number of times. Constructor takes an explicit
+  `workerThreads` parameter (0 = auto, `hardware_concurrency() - 1`
+  minimum 1) specifically so test code can pass `1` and avoid spinning
+  up a full thread pool per sequential `PhysicsWorld` in one test
+  binary.
+- Jolt process-global one-time initialization
+  (`RegisterDefaultAllocator()` -> `Factory::sInstance = new
+  Factory()` -> `RegisterTypes()`) is guarded by a function-local
+  `static std::once_flag`/`std::call_once` inside `PhysicsWorld.cpp`,
+  and is **never torn down** (`UnregisterTypes()`/`delete
+  Factory::sInstance` are never called) - intentionally
+  process-lifetime-scoped, the same category as never explicitly
+  unloading the Vulkan loader.
+- `src/jolt/JoltLayers.hpp/.cpp` (private): a minimal 2-layer
+  `NON_MOVING`/`MOVING` broad-phase/object-layer scheme, exactly per
+  Jolt's own `HelloWorld.cpp` reference pattern - `NON_MOVING` only
+  collides with `MOVING`; `MOVING` collides with everything.
+- `src/jolt/JoltConversions.hpp` (private, the only place any
+  AREngine<->Jolt type conversion happens): `ToJolt(Vec3)`,
+  `FromJolt(JPH::Vec3)`, `ToJolt(Quaternion)` (explicit
+  `JPH::Quat(q.x,q.y,q.z,q.w)` reorder), `FromJolt(JPH::Quat)`
+  (explicit `Quaternion(q.GetW(),q.GetX(),q.GetY(),q.GetZ())` reorder)
+  - never a memcpy/reinterpret_cast between the two quaternion layouts.
+
+  **Duplicate-overload build error found on first compile.**
+  `JPH::RVec3` (Jolt's "real"/world-space position type) is a type
+  alias for `JPH::Vec3`, not a distinct type, unless the build defines
+  `JPH_DOUBLE_PRECISION` (which this codebase never does - M18's scope
+  has no need for double-precision large-world coordinates). An
+  initial `FromJolt(const JPH::RVec3&)` overload, added believing it
+  was a distinct signature, was therefore a duplicate definition of
+  `FromJolt(const JPH::Vec3&)` - MSVC error C2084. Fixed by deleting
+  the `RVec3` overload; `bodyInterface.GetPosition()`'s `RVec3` return
+  binds to the plain `Vec3` overload directly, since they're the same
+  type in this build configuration.
+- `PhysicsSceneBridge` (`PhysicsSceneBridge.hpp/.cpp`, gated alongside
+  `PhysicsWorld`, in `engine/physics` per the audit correction above -
+  the one AREngine::Physics type permitted to depend on
+  `AREngine::Scene`): `RegisterBody(Scene&, EntityId, PhysicsWorld&,
+  BodyType, const ColliderDesc&, float mass)` asserts if
+  `scene.GetParent(entity).IsValid()` - **physics-controlled entities
+  must be Scene roots**, uniformly for both `Static` and `Dynamic` (no
+  special-cased exception for either); M18 does not build
+  parent-relative rigid-body synchronization. Builds a `RigidBodyDesc`
+  from the entity's *current* Transform position+rotation (scale is
+  never passed to physics) plus the given collider/mass, and creates
+  the body. This is the one-time Scene -> Physics transfer for both
+  body types: for `Static` bodies it is the *only* synchronization
+  that ever happens; for `Dynamic` bodies, Physics becomes
+  authoritative from this point on. `SyncDynamicBodiesToScene(Scene&,
+  const PhysicsWorld&)` reads each registered *dynamic* body's current
+  pose and writes position+rotation into the mapped entity's Transform
+  (scale untouched) - called once per rendered frame, after that
+  frame's fixed steps have all run, never once per substep and never
+  once per view. `Unregister(EntityId)` drops the mapping only (does
+  not destroy the underlying body).
+
+### CMake integration
+
+Top-level `CMakeLists.txt`: `option(ARENGINE_ENABLE_PHYSICS ... OFF)`,
+worded identically in spirit to `ARENGINE_ENABLE_OPENXR`.
+`engine/CMakeLists.txt`: `add_subdirectory(physics)` unconditionally,
+after `xr`. `engine/physics/CMakeLists.txt`: unconditional
+`arengine_physics` target (`FixedTimestepAccumulator.cpp` +
+unconditional public headers, `PUBLIC AREngine::Core`). Inside
+`if(ARENGINE_ENABLE_PHYSICS)`: five `TARGET_* CACHE BOOL "" FORCE`
+suppressions (unit tests, hello-world, performance test, samples,
+viewer - none of Jolt's own demo/test targets are wanted here),
+`FetchContent_Declare(Jolt ... GIT_TAG v5.6.0 ... SOURCE_SUBDIR
+Build)`, `FetchContent_MakeAvailable(Jolt)`, then the gated sources
+linking `PRIVATE Jolt AREngine::Scene`.
+
+**Real MSVC runtime-library mismatch caught by design review before
+implementation.** Jolt's own `Build/CMakeLists.txt` defaults
+`USE_STATIC_MSVC_RUNTIME_LIBRARY` to `ON` (`/MT`), while AREngine and
+its Vulkan SDK import libraries build with the ordinary dynamic CRT
+(`/MD`). Left unset, this would have produced a genuine `LNK2038`
+runtime-library-mismatch link error the first time `arengine_physics`
+linked against `Jolt.lib`. Fixed by forcing
+`set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)`
+alongside the other suppressed Jolt options, before
+`FetchContent_MakeAvailable`. Caught and fixed before this ever became
+a real build failure, not discovered by hitting it.
+
+### Collider axes follow body rotation, not just mesh rotation
+
+**Real bug found by manual visual validation, not by any unit test.**
+The physics demo's floor entity reuses the exact `-90 degree` rotation
+about X that `PopulateDemoScene.cpp`'s own M12 floor already
+established, needed because `Rendering::CreateQuadMesh()` faces local
++Z by default and must be laid flat to serve as a horizontal render
+surface. `PhysicsSceneBridge::RegisterBody` builds the physics body's
+initial pose from that **same** entity `Transform` (there is only one
+Transform per entity, shared by rendering and physics) - so the
+physics body inherited that same `-90 degree` X rotation. A `BoxShape`
+is already axis-aligned volumetric geometry; it needs no face-orientation
+fix the way a flat quad mesh does. Authoring the floor's collider as
+the natural, world-intended half-extents `(5, 0.5, 5)` (wide floor,
+thin in Y) therefore produced, after that inherited rotation, an actual
+world shape of half-extents `(5, 5, 0.5)` - a **tall thin wall standing
+on its edge**, not a floor. Visually, this meant: the two dynamic
+pyramids (spawned at Y=3/4, below the wall's accidental Y-span of
+roughly -5.5 to +4.5) started already embedded in solid collider and
+fell straight through to the bottom, settling around Y=-70; the two
+dynamic cubes (spawned at Y=5/6, just above +4.5) landed almost
+immediately on the wall's flat top face, barely falling at all. Fixed
+at the call site (not in `PhysicsSceneBridge` or `PhysicsWorld`, which
+behaved exactly as designed) by authoring the floor's `BoxCollider`
+half-extents in the entity's *local* frame, pre-compensating for the
+known `-90 degree` X rotation's axis swap (`worldX=localX`,
+`worldY=localZ`, `worldZ=localY`): `BoxCollider{Vec3(5.0f, 5.0f,
+0.5f)}` produces the intended world-flat floor. Documented here as a
+durable gotcha: **any entity whose rotation exists only to orient its
+render mesh will apply that same rotation to its physics collider**,
+since both draw from the one shared `Transform` - box/sphere colliders
+need no mesh-face-orientation fix, so their half-extents must be
+authored in the entity's local frame with that in mind, not assumed to
+equal the intended world-space shape.
+
+### Tests
+
+`tests/fixed_timestep_accumulator_tests.cpp` (new, **unconditional**,
+no `ARENGINE_ENABLE_PHYSICS` gate - matches `arengine_mesh_tests`'s own
+precedent of testing pure logic regardless of backend flags): 11 cases
+covering below-one-step, exactly-one-step, the `2.5x` boundary case
+that caught the epsilon bug above, multi-frame accumulation, the
+substep cap, the cap boundary exactly (natural loop termination, not
+the discard branch), cap-plus-remainder (the actual discard branch),
+zero delta, negative delta clamping, a sustained-huge-delta
+never-exceeds-cap stress case, and the `FixedDeltaSeconds()` accessor.
+
+`tests/physics_tests.cpp` (new, gated behind `ARENGINE_ENABLE_PHYSICS`,
+links `AREngine::Core AREngine::Scene AREngine::Physics`, fully
+headless - no GPU, no window, no OpenXR; every `PhysicsWorld`
+constructed with `workerThreads=1`): body lifetime (create static +
+dynamic, distinct valid ids, destroy, `BodyCount` tracks both);
+world-destruction cleanliness (proven by process survival into a later
+test, confirming repeated Jolt global-state construct/destroy cycles
+in one process are tolerated); gravity (a falling dynamic body's Y
+decreases over many steps); static-body stability (position unchanged
+after 120 steps); collision/landing for **both** required collider
+shapes (a dynamic box and a dynamic sphere each settle near their
+expected resting height on a static floor, without tunneling -
+`SphereCollider` is proven only here, not in the visual demo, keeping
+the demo's own scope narrow); a known 90-degree-about-Y quaternion
+round-tripping through `CreateBody -> GetBodyPose` with no accidental
+axis flip or component misordering; and the full `PhysicsSceneBridge`
+contract (initial-transform transfer, dynamic-body sync after
+stepping, `Unregister` leaving no stale sync entry - the
+parented-entity-rejection precondition is confirmed reachable by
+inspection and a sanity check, not by triggering the
+`AR_ASSERT_MSG` itself, matching this codebase's standing convention
+of never unit-testing its own assertions firing).
+
+### Demo (`tests/physics_demo.cpp`, new, desktop-only)
+
+Modeled closely on `scene_render_demo.cpp`'s Vulkan bring-up (window,
+instance, device, swapchain, render pass, pipeline,
+`VulkanRenderResourceContext`) - self-contained, no shared bring-up
+helper extracted, matching this codebase's established per-demo
+convention. Scene: one static floor (a box collider under the existing
+procedural quad, laid flat, top surface at world Y=0) plus four
+dynamic bodies - two asset-backed pyramids (`pyramid.obj`, M15) and two
+procedural cubes, matching box colliders sized to each mesh's already-
+known bounds, dropped from varying heights (Y=3 to Y=6), reusing the
+existing red/blue checker materials (M14). No new assets or
+mesh-generation work needed. Per-frame: `accumulator.Advance(deltaTimeSeconds)`
+-> a loop calling `physicsWorld.Step(accumulator.FixedDeltaSeconds())`
+up to that many times -> `bridge.SyncDynamicBodiesToScene(scene,
+physicsWorld)` once, only if at least one step ran -> the unchanged
+M17 `scene.ExtractRenderables() -> BuildRenderItems ->
+SubmitRenderItems` path. Uses the real per-frame `deltaTimeSeconds`
+from `Platform::SteadyClock`, never a synthetic value. No debug
+collider renderer (none built - the milestone spec preferred none);
+instead, a one-shot console log of every dynamic body's position and
+rotation once ~4 simulated seconds have elapsed, as a correctness
+signal distinct from "it looks plausible."
+
+No XR integration this milestone (optional per the spec, and would
+duplicate the desktop proof). Documented policy for a future XR
+integration: never advance the accumulator during an idle/no-frame XR
+state (no synthetic substitute delta), and never use a predicted
+display timestamp as physics delta - `deltaTimeSeconds` only.
+
+### Validation
+
+`ARENGINE_ENABLE_PHYSICS=OFF`: all four `OPENXR`x`VULKAN` combinations
+green (20/18/15/14 tests respectively, including the new unconditional
+`FixedTimestepAccumulatorTests`) - the M17 baseline is unaffected by
+this milestone when the flag is off.
+
+`ARENGINE_ENABLE_PHYSICS=ON`, `VULKAN=OFF`/`OPENXR=OFF`: Jolt fetched
+and built cleanly via `FetchContent`; headless `PhysicsTests` green
+(15/15 total including the unconditional tests) - body lifetime,
+gravity, both collider shapes landing without tunneling, static-body
+stability, quaternion round-trip, and the full Scene bridge all pass.
+
+`ARENGINE_ENABLE_PHYSICS=ON`, `VULKAN=ON`: `arengine_physics_demo`
+builds and runs (16/16 tests green in this configuration). First run
+surfaced the collider-rotation bug above (pyramids tunneled through to
+Y≈-70/-71; cubes barely fell, landing near Y≈5 on the accidental
+"wall" instead of the real floor) - after the fix, a fresh run's log
+confirms all four bodies settle within centimeters of the expected
+Y≈0.5 resting height (floor top at Y=0 plus each collider's 0.5
+half-extent): pyramids at Y=0.480/0.486, cubes at Y=0.489/0.494, with
+one cube (`FallingCubeB`) visibly tipped onto its side
+(`rotation.z≈-0.998`) after apparently clipping a neighboring pyramid
+during the fall - expected, realistic collision behavior for bodies
+dropped in close proximity, not a bug. Screenshot confirms all four
+shapes (2 pyramids, 2 cubes, correct red/blue materials) resting at a
+common visual height with no tunneling. Full `/W4` rebuild (including
+the fetched Jolt sources) produced zero warnings.
+
+### Dependency graph (final)
+
+`Physics`'s unconditional headers (`PhysicsBodyId`, `PhysicsPose`,
+`ColliderDesc`, `RigidBodyDesc`, `FixedTimestepAccumulator`) ->
+`Core` only. `Physics`'s gated implementation (`PhysicsWorld`,
+`PhysicsSceneBridge`, the private `jolt/` conversion/layer helpers) ->
+`Core`, Jolt (private), `Scene` (private - the one pre-authorized
+`Physics -> Scene` edge, exercised only by `PhysicsSceneBridge.cpp`).
+`Scene` itself is completely unchanged: still `Core` only, zero
+reference to `Physics` in either direction, zero new field on
+`Transform` or `EntityRecord`. No cycle.
+
+### Deferred
+
+A player/character controller, weapons/abilities/damage, AI,
+networking, ragdolls, vehicles, soft bodies, destructibles, kinematic
+bodies, a velocity/force API beyond what `CreateBody`'s mass needs,
+collision events/callbacks, a query system (raycasts/overlaps), custom
+continuous collision handling, sleeping-state APIs, a
+`PhysicsMaterial` system (friction/restitution stay at Jolt's
+defaults), physics serialization, an editor, a debug collider
+renderer, and any XR/physics integration - none of this was in scope,
+and M18's own explicit "do not implement" list named most of it
+directly.
+
+### Autonomous M18 closeout review
+
+Source review found that the step-cap implementation retained fractional excess
+contrary to its public contract. The existing zero-delta test could not detect
+that retained half-step. The cap now clears all remainder; a following half-step
+regression check proves discarded time does not advance the next frame. Tiny
+negative rounding residue is clamped to zero, invalid accumulator configuration
+asserts, and nonfinite frame deltas are ignored. Duplicate bridge registration
+now asserts before creating an unreachable extra body. Registration now returns its
+PhysicsBodyId so the caller can exercise the documented explicit destruction
+path; a regression test verifies this. Body pose, shape, mass, and timestep
+preconditions now enforce finite valid inputs as promised by the public API.
+No change to module
+boundaries. The prior real Vulkan/physics visual and landing evidence remains
+applicable; headless collision/lifetime and fixed-step tests are rerun at closeout.

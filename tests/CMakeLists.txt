@@ -140,6 +140,18 @@ target_include_directories(arengine_render_resource_handle_tests PRIVATE ${CMAKE
 target_compile_features(arengine_render_resource_handle_tests PRIVATE cxx_std_20)
 add_test(NAME RenderResourceHandleTests COMMAND arengine_render_resource_handle_tests)
 
+# Pure-logic tests for AREngine::Physics::FixedTimestepAccumulator
+# (engine/physics/include/AREngine/Physics/FixedTimestepAccumulator.hpp)
+# — M18. Built unconditionally, not gated behind ARENGINE_ENABLE_PHYSICS:
+# this class has zero Jolt/physics-backend dependency, only Core. See
+# docs/ARCHITECTURE.md, "M18 - Physics Foundation".
+add_executable(arengine_fixed_timestep_accumulator_tests
+    fixed_timestep_accumulator_tests.cpp
+)
+target_link_libraries(arengine_fixed_timestep_accumulator_tests PRIVATE AREngine::Core AREngine::Physics)
+target_compile_features(arengine_fixed_timestep_accumulator_tests PRIVATE cxx_std_20)
+add_test(NAME FixedTimestepAccumulatorTests COMMAND arengine_fixed_timestep_accumulator_tests)
+
 # Everything Vulkan-specific is gated on ARENGINE_ENABLE_VULKAN (top-
 # level option, default ON) — when OFF, none of this is added: no
 # find_package(Vulkan) call, no Vulkan targets at all. See
@@ -405,6 +417,55 @@ if(ARENGINE_ENABLE_OPENXR)
         # M14: same demo asset root as arengine_scene_render_demo - one
         # scene, one material set, two presentation paths.
         target_compile_definitions(arengine_xr_demo PRIVATE
+            AR_DEMO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"
+        )
+    endif()
+endif()
+
+# Everything Physics-specific is gated on ARENGINE_ENABLE_PHYSICS (top-
+# level option, default OFF) — when OFF, none of this is added: no Jolt
+# fetch/build at all. Deliberately its own independent if-block (not
+# nested inside the Vulkan block above) — the headless PhysicsTests below
+# need no GPU and must build/run whether or not Vulkan is enabled. See
+# docs/ARCHITECTURE.md, "M18 - Physics Foundation".
+if(ARENGINE_ENABLE_PHYSICS)
+    # Headless physics tests: body lifetime, gravity, collision/landing,
+    # static-body stability, coordinate/quaternion conversion, and the
+    # Scene<->Physics bridge. No GPU, no window, no OpenXR — see
+    # physics_tests.cpp.
+    add_executable(arengine_physics_tests
+        physics_tests.cpp
+    )
+    target_link_libraries(arengine_physics_tests PRIVATE AREngine::Core AREngine::Scene AREngine::Physics)
+    target_compile_features(arengine_physics_tests PRIVATE cxx_std_20)
+    add_test(NAME PhysicsTests COMMAND arengine_physics_tests)
+
+    # The visual physics demo additionally needs Vulkan to render
+    # anything — nested here (not its own top-level block) so
+    # PHYSICS=ON/VULKAN=OFF still builds and runs PhysicsTests above,
+    # matching the OpenXR+Vulkan nesting precedent (M9C) above.
+    if(ARENGINE_ENABLE_VULKAN)
+        find_package(Vulkan REQUIRED)
+
+        # Manual-only, M18: requires a real Vulkan-capable GPU/driver and
+        # opens a real window — CTest must never wait on a human or a
+        # GPU. Built by CMake but deliberately NOT registered with
+        # add_test. Run it directly instead. Desktop-only, no XR
+        # integration this milestone. See docs/ARCHITECTURE.md, "M18 -
+        # Physics Foundation".
+        add_executable(arengine_physics_demo
+            physics_demo.cpp
+            PopulateDemoMaterials.cpp
+            PopulateDemoMeshes.cpp
+            BuildRenderItems.cpp
+        )
+        target_link_libraries(arengine_physics_demo PRIVATE AREngine::Core AREngine::Platform AREngine::Scene AREngine::Input AREngine::Rendering AREngine::Assets AREngine::Physics Vulkan::Vulkan)
+        target_include_directories(arengine_physics_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../engine/rendering/src)
+        target_compile_features(arengine_physics_demo PRIVATE cxx_std_20)
+        # Same demo asset root arengine_scene_render_demo/arengine_xr_demo
+        # already use (tests/data/assets/) - reuses pyramid.obj and the
+        # checker_red/blue.png materials, no new fixtures needed.
+        target_compile_definitions(arengine_physics_demo PRIVATE
             AR_DEMO_ASSETS_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/data/assets"
         )
     endif()
